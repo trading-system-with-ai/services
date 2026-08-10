@@ -5,7 +5,46 @@ decisions, test/audit status, and what's next.
 
 ---
 
-## 2026-08-10 — Iteration 4: Backtest Engine V1 + backtest API + watchlist overview (Phase 3)
+## 2026-08-10 — Iteration 5: Independent Risk Engine v0 + portfolio state + order-preview gate chain (Phase 4)
+
+**Built (risk lib → gateway chain + parallel UI, 2 adversarial verifiers):**
+- `libs/trading_core/risk/engine.py` — pure, strategy-independent (§17):
+  `assess(request, snapshot, limits)` pipeline in spec order: kill switch (§18)
+  → heat reject gate (§12.5) → |edge|→strength tier→risk budget hard-capped by
+  abs_max_trade_risk (§12.2 "no confidence may override") → base sizing
+  floor(nav·budget/stop) (§12.1) → quantity clamps for single-name risk/capital
+  (§12.3), correlation bucket (§12.4), strict heat headroom, regime cash floor
+  (§13) → APPROVE / APPROVE_WITH_RESIZE / REJECT with machine reason codes +
+  §36-style numeric explanations. `portfolio_heat`/`heat_state` helpers
+  (NORMAL/ELEVATED/HIGH/BLOCKED at 4/6/8%). All limits in frozen `RiskLimits`.
+- 33-test suite incl. hand-computed binders for every cap, regime-dependent
+  cash-floor flip (same request: APPROVE in STRONG_BULL → REJECT in
+  STRONG_BEAR), and a 200-case seeded property test of the §42 invariants.
+- Portfolio singleton (paper cash 100k configurable) + Position ORM +
+  `migrations/004_portfolio.sql`; `GET /api/portfolio/risk` (§36 contract:
+  NAV/cash/floor/heat/max-new-risk/buckets/limits, honest nulls for bar-less
+  positions; read-only, no audit).
+- `POST /api/orders/preview` — the §10 gate chain in exact order (pool
+  authorization incl. per-symbol + global kill switch → data quality → regime
+  (TRANSITION/bear veto for long stock) → directional signal → volatility/
+  liquidity SKIPPED with explicit V1 details → instrument → contract-selection
+  SKIPPED → risk approval via assess() with stop = 2.0·ATR14). First FAIL
+  skips the rest; exactly ONE SYSTEM RISK_DECISION audit event per preview,
+  veto or not (§38). why_trade / why_not_trade always both present (§33).
+
+**Verified:** 164/164 green. Independent fuzz (600 seeded cases): approved
+risk never exceeded the 1.5% NAV absolute cap nor the tier budget; heat_after
+strictly < 8% on every approval; regime cash floors respected; kill switch
+always wins; every REJECT carries reason codes. Live boot walked the
+watchlist-only → veto, authorized → full chain, paused → gate-1 veto paths.
+
+**Next (iteration 6 — Phase 6 paper execution start):**
+1. Order state machine: `POST /api/orders/approve` (from a preview) → paper
+   fill at last close, position open/close, cash movement, duplicate-order
+   guard; ORDER_* audit chain.
+2. Position monitor + Exit Engine v0 wiring for open paper positions
+   (signal-decay / ATR-trail / time-stop checks over stored bars, §11).
+3. UI Positions page v1 (§37) + order approve flow from Trade Plan.
 
 **Built (engine → gateway chain + parallel UI, 2 adversarial verifiers):**
 - `libs/trading_core/backtest/engine.py` — pure replay engine, LONG STOCK only

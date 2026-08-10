@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     # Global safety switches
     trading_enabled: bool = False  # kill switch default: OFF until explicitly enabled
 
+    # Paper trading account (plan §11): starting cash seeded into the singleton
+    # portfolio row on first access. A parameter, never a hardcoded truth.
+    paper_initial_cash: float = 100_000.0
+
 
 @lru_cache
 def get_settings() -> Settings:

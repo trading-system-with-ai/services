@@ -32,6 +32,7 @@ from libs.trading_core.signals import (
     DirectionalParams,
     DirectionalResult,
     RegimeParams,
+    RegimeResult,
     classify_regime,
     score_direction,
 )
@@ -116,6 +117,30 @@ async def ensure_daily_bars(
     )
     await session.commit()
     return orm_bars
+
+
+# The Market Regime Engine reads the broad-market index (plan §6.1). SPY is a
+# system reference symbol, exempt from the watchlist-only data rule (ADR-005).
+REGIME_REFERENCE_SYMBOL = "SPY"
+
+
+async def market_regime_from_spy(session: AsyncSession) -> RegimeResult:
+    """Current broad-market regime from stored SPY daily bars (plan §6.1).
+
+    Shared helper so the market overview, portfolio risk and order preview
+    paths all see the SAME regime read. SPY bars lazily backfill via
+    :func:`ensure_daily_bars` (ADR-005 exemption), so the first caller also
+    writes the SYSTEM DATA_BACKFILL audit event; later calls are read-only.
+    """
+    settings = get_settings()
+    bars = await ensure_daily_bars(
+        session, REGIME_REFERENCE_SYMBOL, settings.market_data_provider
+    )
+    return classify_regime(
+        [b.close for b in bars],
+        [b.high for b in bars],
+        [b.low for b in bars],
+    )
 
 
 # Regimes that agree with each directional bias (plan §31 v0 mapping).

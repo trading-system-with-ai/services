@@ -144,6 +144,66 @@ async def get_or_create_system_state(session: AsyncSession) -> SystemState:
     return state
 
 
+class Portfolio(Base):
+    """Singleton row (id=1) holding the paper account's cash (plan §11).
+
+    V1 runs one paper account, so exactly one portfolio row exists; cash is
+    seeded from ``settings.paper_initial_cash`` on first access (a parameter,
+    never a truth). NAV is always DERIVED as cash + open-position market
+    value — it is deliberately not stored, so it can never go stale.
+    """
+
+    __tablename__ = "portfolio"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cash: Mapped[float] = mapped_column(Float)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+# One paper account in V1, so exactly one portfolio row exists.
+PORTFOLIO_ID = 1
+
+
+async def get_or_create_portfolio(session: AsyncSession) -> Portfolio:
+    """Lazily get-or-create the singleton portfolio row (id=1, plan §11).
+
+    Cash seeds from ``settings.paper_initial_cash``. Flushes (never commits)
+    so callers control the transaction — same pattern as
+    :func:`get_or_create_system_state`.
+    """
+    portfolio = await session.get(Portfolio, PORTFOLIO_ID)
+    if portfolio is None:
+        portfolio = Portfolio(id=PORTFOLIO_ID, cash=get_settings().paper_initial_cash)
+        session.add(portfolio)
+        await session.flush()
+    return portfolio
+
+
+class Position(Base):
+    """One paper position (plan §11, §12.5).
+
+    ``max_loss`` is the position-level maximum loss in dollars, fixed at open
+    as ``quantity * stop_distance`` — the unit portfolio heat is measured in
+    (plan §12.5). ``status`` is OPEN | CLOSED; only OPEN positions count
+    toward NAV and heat.
+    """
+
+    __tablename__ = "positions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticker: Mapped[str] = mapped_column(String(16), index=True)
+    instrument: Mapped[str] = mapped_column(String(16), default="LONG_STOCK")
+    quantity: Mapped[int] = mapped_column(Integer)
+    avg_price: Mapped[float] = mapped_column(Float)
+    max_loss: Mapped[float] = mapped_column(Float)  # dollars = quantity * stop_distance at open
+    status: Mapped[str] = mapped_column(String(8), default="OPEN", index=True)
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    closed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+
+
 class AuditEvent(Base):
     __tablename__ = "audit_events"
     __table_args__ = (Index("ix_audit_entity", "entity_type", "entity_id"),)
