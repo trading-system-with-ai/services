@@ -5,7 +5,41 @@ decisions, test/audit status, and what's next.
 
 ---
 
-## 2026-08-10 — Iteration 2: Feature engine slice, market-data stub, global kill switch
+## 2026-08-10 — Iteration 3: Regime engine v0, directional signals v0, daily bars + analysis API
+
+**Built (signals lib → gateway chain + parallel UI, 2 adversarial verifiers, zero fixes):**
+- `libs/trading_core/signals/regime.py` — Market Regime Engine v0 (§6.1):
+  `classify_regime` with frozen `RegimeParams` (all thresholds backtest parameters).
+  Rules ordered: insufficient history → TRANSITION (no-trade posture); ATR/close
+  dislocation → TRANSITION; stacked SMAs + fast-slope → STRONG_BULL/BEAR;
+  above/below both major SMAs → MILD_*; else NEUTRAL_RANGE. Full explainability
+  features dict on every result.
+- `libs/trading_core/signals/directional.py` — Directional Signal Engine v0 (§6.2):
+  `score_direction` evaluating 8 mirrored bull/bear feature pairs (SMAs, MACD
+  cross/zero, RSI continuation zones, pivot HH+HL/LH+LL structure) + optional
+  volume expansion. Weighted parameterized scores 0–100, edge = bull − bear,
+  bias by threshold; every component listed with numeric human-readable detail.
+- Daily bars: `Bar` + `get_daily_bars` in the provider Protocol; StubProvider
+  emits deterministic crc32-seeded weekend-skipping walks. `StockBarDaily` table.
+- `GET /api/watchlist/{ticker}/analysis` — 404 off-watchlist (§4.2), lazy 600-bar
+  backfill with SYSTEM `DATA_BACKFILL` audit (once only), indicators + regime +
+  signal + 250-bar chart series in one contract.
+- `/api/market/overview` regime now computed from SPY bars. ADR-005: SPY/QQQ/VIX
+  are system reference symbols exempt from the watchlist-only data rule.
+
+**Verified:** 85/85 tests green (was 51). Independent verifier booted the app:
+contract keys, enum validity, single-backfill audit invariant, 404 path, and
+monotonic-series sanity (uptrend → STRONG_BULL/BULL, downtrend → STRONG_BEAR/BEAR)
+all confirmed live.
+
+**Next (iteration 4 — Phase 3 start):**
+1. Backtest engine v1: bar-by-bar replay over stored daily bars using the SAME
+   signals lib (§21); Long Stock entries/exits from directional bias + regime
+   gates; explicit fill model (next-bar open) + transaction costs; equity curve,
+   drawdown, win rate, profit factor outputs.
+2. `POST /api/backtests` + `GET /api/backtests/{id}` with stored results + audit.
+3. UI Backtests page v1: config form + results (§35 metrics, IS/OOS split label).
+4. Watchlist rows enriched with regime/scores/status from analysis cache.
 
 **Built (via 3 parallel implementation agents + 2 adversarial verify agents):**
 - `libs/trading_core/features/indicators.py` — pure, dependency-free, deterministic:

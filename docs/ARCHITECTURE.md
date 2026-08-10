@@ -44,3 +44,19 @@ the DB row remains the source of truth.
 - Docker/prod: PostgreSQL + TimescaleDB; schema in `migrations/*.sql`.
 - Time-series (OHLCV, chains, features) will be Timescale hypertables managed by raw
   SQL migrations only — deliberately not ORM-mapped.
+
+## ADR-005: System reference symbols bypass the watchlist-only data rule (2026-08-10)
+
+Plan §4.2 restricts stored historical data to Watchlist symbols —
+`GET /api/watchlist/{ticker}/analysis` 404s for anything else. The Market Regime
+Engine (plan §6.1), however, must read broad-market index data (SPY daily bars today;
+QQQ/VIX as further inputs later) regardless of what the user watches.
+
+**Decision:** SPY, QQQ and VIX are *system reference symbols*, exempt from the
+watchlist-only rule for exactly that reason: `GET /api/market/overview` may lazily
+backfill and store their daily bars without Watchlist membership. The exemption is
+limited to this fixed list (`INDEX_SYMBOLS` in `routers/market.py`); every other
+symbol's history remains watchlist-gated. Reference backfills go through the same
+`ensure_daily_bars` path as watchlist analysis, so they are SYSTEM-attributed
+`DATA_BACKFILL` audit events committed in the same transaction as the inserted bars
+(ADR-003).

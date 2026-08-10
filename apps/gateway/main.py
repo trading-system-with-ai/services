@@ -13,7 +13,15 @@ from libs.common.config import get_settings
 from libs.common.logging import setup_logging
 
 from .db import init_db
-from .routers import audit_log, health, market, trading_control, trading_pool, watchlist
+from .routers import (
+    analysis,
+    audit_log,
+    health,
+    market,
+    trading_control,
+    trading_pool,
+    watchlist,
+)
 
 
 @asynccontextmanager
@@ -34,6 +42,7 @@ def create_app() -> FastAPI:
     )
     app.include_router(health.router)
     app.include_router(watchlist.router)
+    app.include_router(analysis.router)
     app.include_router(trading_pool.router)
     app.include_router(market.router)
     app.include_router(trading_control.router)

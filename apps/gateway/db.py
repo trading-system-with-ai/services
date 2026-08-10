@@ -1,11 +1,25 @@
 """Async SQLAlchemy setup and ORM models for the gateway (Phase 0/1 scope).
 
-Time-series tables (OHLCV, option chains, features) live in Timescale and are
-managed by raw SQL migrations — they are intentionally NOT ORM-mapped here.
+High-volume time-series tables (option chains, features) live in Timescale and
+are managed by raw SQL migrations — they are intentionally NOT ORM-mapped here.
+Exception: daily stock bars (stock_bars_daily) ARE ORM-mapped, because the lazy
+backfill path (plan §4.2) writes them in the same transaction as its audit
+event and daily granularity stays small at V1 scale.
 """
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
-from sqlalchemy import JSON, Boolean, DateTime, Index, Integer, String, Text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Date,
+    DateTime,
+    Float,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -39,6 +53,32 @@ class TradingPoolItem(Base):
     allowed_strategies: Mapped[list] = mapped_column(JSON, default=list)  # e.g. ["LONG_STOCK","LONG_CALL"]
     promoted_by: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class StockBarDaily(Base):
+    """One stored daily OHLCV bar (plan §4.2).
+
+    Historical bars are stored only for Watchlist symbols (plan §4.2) plus the
+    system reference indices SPY/QQQ/VIX (ADR-005). Rows are written by the
+    lazy backfill path together with a SYSTEM DATA_BACKFILL audit event in the
+    same transaction; (ticker, ts) is unique so a backfill can never duplicate
+    a bar.
+    """
+
+    __tablename__ = "stock_bars_daily"
+    __table_args__ = (
+        UniqueConstraint("ticker", "ts", name="uq_stock_bars_daily_ticker_ts"),
+        Index("ix_stock_bars_daily_ticker", "ticker"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticker: Mapped[str] = mapped_column(String(16))
+    ts: Mapped[date] = mapped_column(Date)
+    open: Mapped[float] = mapped_column(Float)
+    high: Mapped[float] = mapped_column(Float)
+    low: Mapped[float] = mapped_column(Float)
+    close: Mapped[float] = mapped_column(Float)
+    volume: Mapped[float] = mapped_column(Float)
 
 
 class SystemState(Base):
