@@ -14,7 +14,7 @@ code (plan §21).
 """
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -45,6 +45,8 @@ router = APIRouter(prefix="/api/watchlist", tags=["analysis"])
 # Tunable parameters (plan §6.2: parameters, never hardcoded truths).
 BACKFILL_DAYS = 600  # bars fetched on first request; > sma_slow(200) + warmup
 SERIES_BARS = 250  # chart series length (~one trading year)
+BARS_LIMIT_MIN = 10  # /bars: fewer is not a chart
+BARS_LIMIT_MAX = 600  # /bars: capped at the backfill depth — no more exists
 SMA_FAST = 20
 SMA_MID = 50
 SMA_SLOW = 200
@@ -341,4 +343,50 @@ async def get_symbol_analysis(
             "sma20": sma_fast_series[offset:],
             "sma50": sma_mid_series[offset:],
         },
+    }
+
+
+@router.get("/{ticker}/bars")
+async def get_symbol_bars(
+    ticker: str,
+    limit: int = Query(default=SERIES_BARS, ge=BARS_LIMIT_MIN, le=BARS_LIMIT_MAX),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Raw daily OHLCV bars for one Watchlist symbol (plan §33, Price tab).
+
+    Returns the most recent `limit` stored bars, oldest first. Watchlist-gated
+    exactly like the analysis endpoint — historical data may exist only for
+    Watchlist symbols (plan §4.2) — and shares the same lazy-backfill path, so
+    the first request for a fresh symbol writes its one DATA_BACKFILL audit
+    event and later requests are read-only.
+    """
+    ticker = ticker.upper()
+    row = await session.execute(
+        select(WatchlistItem).where(WatchlistItem.ticker == ticker)
+    )
+    if row.scalar_one_or_none() is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"{ticker} is not on the watchlist; historical data exists "
+                "only for Watchlist symbols"
+            ),
+        )
+
+    settings = get_settings()
+    bars = await ensure_daily_bars(session, ticker, settings.market_data_provider)
+    return {
+        "ticker": ticker,
+        "source": settings.market_data_provider,
+        "bars": [
+            {
+                "date": b.ts.isoformat(),
+                "open": b.open,
+                "high": b.high,
+                "low": b.low,
+                "close": b.close,
+                "volume": b.volume,
+            }
+            for b in bars[-limit:]
+        ],
     }

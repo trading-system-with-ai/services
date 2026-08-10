@@ -9,7 +9,18 @@ services:
       - "5432:5432"
     volumes:
       - db-data:/var/lib/postgresql/data
-      - ./migrations:/docker-entrypoint-initdb.d:ro
+      # Migrations are mounted as INDIVIDUAL files (not the whole directory):
+      # a directory mount over /docker-entrypoint-initdb.d would shadow the
+      # timescale image's own 000_install_timescaledb.sh (CREATE EXTENSION)
+      # and 001_timescaledb_tune.sh, and 002's create_hypertable() would fail.
+      # When adding migrations/00X_*.sql, add a matching line here.
+      - ./migrations/001_initial.sql:/docker-entrypoint-initdb.d/001_initial.sql:ro
+      - ./migrations/002_system_state_and_bars.sql:/docker-entrypoint-initdb.d/002_system_state_and_bars.sql:ro
+      - ./migrations/003_backtests.sql:/docker-entrypoint-initdb.d/003_backtests.sql:ro
+      - ./migrations/004_portfolio.sql:/docker-entrypoint-initdb.d/004_portfolio.sql:ro
+      - ./migrations/005_orders.sql:/docker-entrypoint-initdb.d/005_orders.sql:ro
+      - ./migrations/006_recommendations_evidence.sql:/docker-entrypoint-initdb.d/006_recommendations_evidence.sql:ro
+      - ./migrations/007_stock_bars_daily.sql:/docker-entrypoint-initdb.d/007_stock_bars_daily.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U trading"]
       interval: 5s

@@ -42,6 +42,22 @@ make up        # full stack: timescaledb + redis + gateway via docker compose
 
 Copy `.env.example` to `.env` for configuration. Never commit `.env`.
 
+## Migrations
+
+`migrations/*.sql` own the production schema and run automatically the first
+time the `db` container initializes its volume (to re-run them from scratch:
+`docker compose down -v`). Two rules:
+
+- **Compose mounts each migration file individually** into
+  `/docker-entrypoint-initdb.d/` — never the whole directory, which would
+  shadow the timescale image's own init scripts (`CREATE EXTENSION
+  timescaledb` + tuning) and break `create_hypertable()` in 002. When adding
+  `migrations/00X_*.sql`, add the matching volume line in `docker-compose.yml`.
+- `007_stock_bars_daily.sql` mirrors the ORM model
+  `apps/gateway/db.py::StockBarDaily` exactly (the gateway's `init_db()`
+  `create_all` is a dev convenience only). If the model changes, change the
+  migration in the same commit.
+
 ## Development log
 
 See [docs/DEVLOG.md](docs/DEVLOG.md) — every iteration records what was built, decisions

@@ -5,7 +5,45 @@ decisions, test/audit status, and what's next.
 
 ---
 
-## 2026-08-10 — Iteration 7: LLM Recommendation Pool + Strategy Health Monitor v0 (Phase 8 slice)
+## 2026-08-10 — Iteration 8: Phase 0 acceptance (Docker E2E), CI, bars API + audit filters
+
+**PHASE 0 ACCEPTANCE: PASS.** `docker compose up --build` boots the real stack
+(TimescaleDB pg16 + Redis + gateway) and the smoke test ran end to end through
+it: healthz/readyz, watchlist add, full analysis (migrations 001–007 +
+Timescale storage + lazy backfill + signals), market overview, portfolio risk
+(NAV 100k), audit trail. Stack torn down with `down -v`, nothing left running.
+
+**Two real defects found and fixed by the E2E agent:**
+1. docker-compose.yml mounted the whole migrations directory over
+   `/docker-entrypoint-initdb.d`, shadowing the timescale image's own init
+   scripts (`CREATE EXTENSION timescaledb`) — migration 002's
+   `create_hypertable()` would have aborted initdb on a fresh volume. Fixed by
+   mounting each migration file individually (rule documented in README).
+2. `stock_bars_daily` existed only via ORM `create_all` — added
+   `migrations/007_stock_bars_daily.sql` mirroring the ORM exactly, with the
+   mirror-in-same-commit rule documented.
+
+**Environmental note:** host port 8000 was occupied by an unrelated container
+(roboxai-optimizer) — smoke test used a scratchpad-only override on :8010;
+the repo compose keeps the canonical 8000:8000. Free the port to run locally.
+
+**Also built:**
+- GitHub Actions CI for both repos (services: py3.12 + pytest; ui: node22 +
+  typecheck + build), YAML-validated; `make ci` target.
+- `GET /api/watchlist/{ticker}/bars` (watchlist-gated OHLCV series, limit
+  10–600) + OHLC-sanity tests.
+- Audit filters: `GET /api/audit?action=&actor_type=` (AND semantics, typed
+  422 on bad values) + `GET /api/audit/actions` distinct-values endpoint.
+
+**Verified:** 259/259 green before and after Docker work.
+
+**Next (iteration 9):**
+1. Option-chain scaffolding (§34): stub chain provider (deterministic strikes/
+   expiries/greeks around spot), `GET /api/watchlist/{ticker}/options`,
+   Options tab with eligibility highlighting groundwork.
+2. Contract Selector v0 (§9): candidate filters + risk-adjusted ranking over
+   the stub chain (research-only until real chain data).
+3. Docker compose entry for the UI container (frontend joins the stack).
 
 **Built (llm+health libs → gateway chain + parallel UI, 2 adversarial verifiers, zero fixes):**
 - `libs/llm/` — provider abstraction mirroring libs/market_data:
