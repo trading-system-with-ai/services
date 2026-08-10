@@ -5,7 +5,44 @@ decisions, test/audit status, and what's next.
 
 ---
 
-## 2026-08-10 — Iteration 6: Paper execution + Exit Engine v0 + position monitor (Phase 6/7 slice)
+## 2026-08-10 — Iteration 7: LLM Recommendation Pool + Strategy Health Monitor v0 (Phase 8 slice)
+
+**Built (llm+health libs → gateway chain + parallel UI, 2 adversarial verifiers, zero fixes):**
+- `libs/llm/` — provider abstraction mirroring libs/market_data:
+  `RecommendationDraft` validates the §4.1 score schema; deterministic stub
+  provider (day-seeded, exclusions honored, evidence timestamps strictly
+  before as_of — §20.3 news-timestamp integrity); real Anthropic provider
+  (written against the claude-api skill: Messages API structured outputs,
+  malformed model output logged-and-skipped, never fires without a key).
+  Default provider switched to "stub" — keyless-safe.
+- Recommendations API: refresh (LLM-attributed audits, skips watchlisted/
+  already-PENDING tickers, **performs zero watchlist/pool/order writes**),
+  list by status, dismiss (USER), promote — THE only rec→watchlist path,
+  implemented by refactoring watchlist insertion into a shared
+  `add_ticker_to_watchlist` helper used by both POST /api/watchlist and
+  promote so the paths cannot diverge; WATCHLIST_ADD audited USER with the
+  rec id in the note. `migrations/006`. RECOMMENDATION_PROMOTED enum added.
+- `libs/trading_core/health.py` — Strategy Health Monitor v0 (§19):
+  win rate / profit factor / expectancy / drawdowns over closed-trade PnLs;
+  status ladder INSUFFICIENT_DATA (judgement withheld below min sample) /
+  HEALTHY / WARNING / PAUSE_RECOMMENDED with numeric explanations;
+  `GET /api/health/strategy` read-only report (no pause automation yet).
+
+**Verified:** 249/249 green. Authority-boundary audit (the point of Phase 8):
+static — recommendations router's only insert is the Recommendation row,
+libs/llm has zero DB references, promote/watchlist share one helper with
+hardcoded USER attribution; live — refresh left watchlist/pool/positions
+untouched, promote added exactly the approved ticker, double-promote 409'd,
+promoted tickers excluded from later drafts. Health math independently
+recomputed. UI verifier grep-confirmed no trade action exists on the page.
+
+**Next (iteration 8 — hardening + Phase 0 completion):**
+1. Docker Compose end-to-end check (build gateway image, full stack up,
+   healthz through the compose network) — Phase 0 acceptance still unproven.
+2. CI: GitHub Actions for both repos (pytest / typecheck+build).
+3. Watchlist symbol page Price tab (candlestick/volume from stored bars) and
+   Activity page action-type filter chips.
+4. Begin §34 option-chain scaffolding if time allows (stub chain provider).
 
 **Built (exits lib → gateway chain + parallel UI, 2 adversarial verifiers):**
 - `libs/trading_core/exits/engine.py` — pure Exit Engine v0 (§11): evaluates

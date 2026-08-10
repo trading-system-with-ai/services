@@ -246,6 +246,40 @@ class Order(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class Recommendation(Base):
+    """One LLM-proposed candidate (plan §4.1) — an INFORMATION row only.
+
+    CENTRAL SAFETY RULE (plan §4.1, §44 rule 5, §46): the LLM proposes, the
+    user curates. A recommendation row carries zero execution authority —
+    nothing may move it into the Watchlist, Trading Pool, or orders except an
+    explicit USER API action (POST /api/recommendations/{id}/promote).
+
+    Scores follow the §4.1 schema: sentiment in [-1, 1]; impact, novelty and
+    source_reliability in [0, 1]. ``evidence`` is a list of citation dicts
+    ({"source", "published_at", "snippet"}), each published strictly before
+    the generation as-of time (news timestamp integrity, plan §20.3).
+    ``status`` is PENDING | DISMISSED | PROMOTED.
+    """
+
+    __tablename__ = "recommendations"
+    __table_args__ = (Index("ix_recommendations_status_ts", "status", "ts"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    ticker: Mapped[str] = mapped_column(String(16))
+    company: Mapped[str | None] = mapped_column(String(128), nullable=True, default=None)
+    sentiment: Mapped[float] = mapped_column(Float)
+    impact: Mapped[float] = mapped_column(Float)
+    novelty: Mapped[float] = mapped_column(Float)
+    source_reliability: Mapped[float] = mapped_column(Float)
+    horizon: Mapped[str] = mapped_column(String(16))
+    catalyst_type: Mapped[str] = mapped_column(String(64))
+    reason_codes: Mapped[list] = mapped_column(JSON, default=list)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    evidence: Mapped[list] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(String(16), default="PENDING")
+
+
 class AuditEvent(Base):
     __tablename__ = "audit_events"
     __table_args__ = (Index("ix_audit_entity", "entity_type", "entity_id"),)

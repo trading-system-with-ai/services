@@ -22,6 +22,7 @@ from .routers import (
     orders,
     portfolio,
     positions,
+    recommendations,
     trading_control,
     trading_pool,
     watchlist,
@@ -54,6 +55,7 @@ def create_app() -> FastAPI:
     app.include_router(portfolio.router)
     app.include_router(orders.router)
     app.include_router(positions.router)
+    app.include_router(recommendations.router)
     app.include_router(audit_log.router)
     return app
 

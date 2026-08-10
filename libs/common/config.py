@@ -17,7 +17,9 @@ class Settings(BaseSettings):
     # External providers (empty by default; required only when the relevant service starts)
     massive_api_key: str = ""
     market_data_provider: str = "stub"  # "stub" until the MASSIVE integration lands (plan §22.1)
-    llm_provider: str = "anthropic"
+    # Safe default: the deterministic stub works without any API key (plan
+    # §4.1); switch to "anthropic" once llm_api_key is configured.
+    llm_provider: str = "stub"
     llm_api_key: str = ""
     llm_model: str = "claude-sonnet-5"
 

@@ -26,13 +26,23 @@ async def list_watchlist(session: AsyncSession = Depends(get_session)):
     return rows.scalars().all()
 
 
-@router.post("", response_model=WatchlistItemOut, status_code=201)
-async def add_to_watchlist(req: TickerRequest, session: AsyncSession = Depends(get_session)):
-    existing = await session.execute(select(WatchlistItem).where(WatchlistItem.ticker == req.ticker))
-    if existing.scalar_one_or_none():
-        raise HTTPException(status_code=409, detail=f"{req.ticker} already on watchlist")
+async def add_ticker_to_watchlist(
+    session: AsyncSession, ticker: str, note: str = ""
+) -> WatchlistItem:
+    """Shared USER watchlist-insertion semantics (plan §4.2, rule 5).
 
-    item = WatchlistItem(ticker=req.ticker, added_by=CURRENT_USER, note=req.note)
+    The single code path by which a ticker enters the Watchlist: used by both
+    POST /api/watchlist and the recommendation promote endpoint, so the two
+    can never diverge. Raises 409 when the ticker is already listed; audits
+    WATCHLIST_ADD as ActorType.USER in the caller's transaction. Flushes,
+    never commits — the caller controls the transaction so the insertion can
+    be grouped with its own state changes + audit events (rule 12).
+    """
+    existing = await session.execute(select(WatchlistItem).where(WatchlistItem.ticker == ticker))
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail=f"{ticker} already on watchlist")
+
+    item = WatchlistItem(ticker=ticker, added_by=CURRENT_USER, note=note)
     session.add(item)
     await audit.record(
         session,
@@ -40,9 +50,16 @@ async def add_to_watchlist(req: TickerRequest, session: AsyncSession = Depends(g
         actor_id=CURRENT_USER,
         action=AuditAction.WATCHLIST_ADD,
         entity_type="watchlist",
-        entity_id=req.ticker,
-        details={"note": req.note},
+        entity_id=ticker,
+        details={"note": note},
     )
+    await session.flush()
+    return item
+
+
+@router.post("", response_model=WatchlistItemOut, status_code=201)
+async def add_to_watchlist(req: TickerRequest, session: AsyncSession = Depends(get_session)):
+    item = await add_ticker_to_watchlist(session, req.ticker, req.note)
     await session.commit()
     await session.refresh(item)
     return item
