@@ -5,6 +5,41 @@ decisions, test/audit status, and what's next.
 
 ---
 
+## 2026-08-10 — Iteration 2: Feature engine slice, market-data stub, global kill switch
+
+**Built (via 3 parallel implementation agents + 2 adversarial verify agents):**
+- `libs/trading_core/features/indicators.py` — pure, dependency-free, deterministic:
+  SMA, EMA (SMA-seeded), RSI (Wilder), True Range/ATR (Wilder), MACD (12/26/9,
+  parameterized), realized vol (close-to-close log returns, annualization param),
+  pivot highs/lows (§6.3; final `window` bars always unconfirmed — no look-ahead,
+  §20.3). All outputs input-length with None warmup padding; all periods parameters.
+  34 new tests including hand-computed reference values with arithmetic in comments
+  and a backtest/live parity check for pivot stability.
+- `libs/market_data/` — provider abstraction (Quote + MarketDataProvider Protocol,
+  name-based registry) with deterministic StubProvider (SPY/QQQ/VIX, minute-keyed
+  wiggle) until the Massive integration lands. `GET /api/market/overview` returns
+  provider/as_of/stale/market_regime (NEUTRAL_RANGE placeholder)/indices.
+- Global kill switch (§18): persistent `system_state` singleton row (default:
+  trading disabled), `GET /api/trading/status`, `POST /api/trading/pause` (reason
+  required), `POST /api/trading/resume`; both mutations USER-attributed and audited
+  (TRADING_PAUSED/TRADING_RESUMED) in the same transaction.
+- `migrations/002_system_state_and_bars.sql` — system_state seed + `stock_bars_1m`
+  Timescale hypertable (Phase 1 groundwork).
+
+**Verified:** full suite 51/51 green (was 11); independent verify agent booted the
+app and confirmed overview/status/pause flows + audit records via curl; indicator
+spot checks passed. Zero fixes needed.
+
+**Next (iteration 3):**
+1. Historical OHLCV ingestion into stock_bars (stub-generated series for dev) and
+   `GET /api/watchlist/{ticker}/analysis` computing indicators over stored bars.
+2. Market Regime Engine v0 (§6.1) using SPY/QQQ features — replace the
+   NEUTRAL_RANGE placeholder in /api/market/overview.
+3. Directional signal engine v0 (§6.2): parameterized bull/bear scores over features.
+4. UI: symbol analysis page skeleton (tabs per §33) showing computed indicators.
+
+---
+
 ## 2026-08-10 — Iteration 1: Phase 0 skeleton + Watchlist/Trading Pool core
 
 **Built:**

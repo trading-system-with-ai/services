@@ -41,6 +41,42 @@ class TradingPoolItem(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class SystemState(Base):
+    """Singleton row (id=1) backing the global kill switch (plan §18).
+
+    Persisted so the pause/resume state survives restarts; trading is
+    disabled by default and only an explicit USER resume enables it.
+    """
+
+    __tablename__ = "system_state"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    trading_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    reason: Mapped[str] = mapped_column(Text, default="startup default: trading disabled")
+    updated_by: Mapped[str] = mapped_column(String(64), default="")
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+
+
+# The kill switch is global, so exactly one system_state row exists.
+SYSTEM_STATE_ID = 1
+
+
+async def get_or_create_system_state(session: AsyncSession) -> SystemState:
+    """Lazily get-or-create the singleton system_state row (id=1).
+
+    Flushes (never commits) so callers control the transaction and can group
+    the row with their audit event, per the audit-in-same-transaction rule.
+    """
+    state = await session.get(SystemState, SYSTEM_STATE_ID)
+    if state is None:
+        state = SystemState(id=SYSTEM_STATE_ID)
+        session.add(state)
+        await session.flush()
+    return state
+
+
 class AuditEvent(Base):
     __tablename__ = "audit_events"
     __table_args__ = (Index("ix_audit_entity", "entity_type", "entity_id"),)
