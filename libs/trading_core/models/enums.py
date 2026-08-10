@@ -1,0 +1,79 @@
+"""Domain enums shared by backtest and live code (single source of truth)."""
+from enum import StrEnum
+
+
+class ActorType(StrEnum):
+    """Who performed an action. Central to the authorization model:
+    only USER actors may mutate Watchlist / Trading Pool membership."""
+
+    USER = "USER"
+    SYSTEM = "SYSTEM"
+    LLM = "LLM"
+
+
+class AuditAction(StrEnum):
+    WATCHLIST_ADD = "WATCHLIST_ADD"
+    WATCHLIST_REMOVE = "WATCHLIST_REMOVE"
+    TRADING_POOL_ADD = "TRADING_POOL_ADD"
+    TRADING_POOL_REMOVE = "TRADING_POOL_REMOVE"
+    TRADING_POOL_TOGGLE = "TRADING_POOL_TOGGLE"
+    RECOMMENDATION_CREATED = "RECOMMENDATION_CREATED"
+    RECOMMENDATION_DISMISSED = "RECOMMENDATION_DISMISSED"
+    SIGNAL_GENERATED = "SIGNAL_GENERATED"
+    RISK_DECISION = "RISK_DECISION"
+    ORDER_REQUESTED = "ORDER_REQUESTED"
+    ORDER_SUBMITTED = "ORDER_SUBMITTED"
+    ORDER_FILLED = "ORDER_FILLED"
+    ORDER_REJECTED = "ORDER_REJECTED"
+    EXIT_GENERATED = "EXIT_GENERATED"
+    KILL_SWITCH_TRIGGERED = "KILL_SWITCH_TRIGGERED"
+    TRADING_PAUSED = "TRADING_PAUSED"
+    TRADING_RESUMED = "TRADING_RESUMED"
+
+
+class MarketRegime(StrEnum):
+    STRONG_BULL = "STRONG_BULL"
+    MILD_BULL = "MILD_BULL"
+    NEUTRAL_RANGE = "NEUTRAL_RANGE"
+    MILD_BEAR = "MILD_BEAR"
+    STRONG_BEAR = "STRONG_BEAR"
+    TRANSITION = "TRANSITION"  # defaults to NO TRADE
+
+
+class DirectionalBias(StrEnum):
+    BULL = "BULL"
+    BEAR = "BEAR"
+    NEUTRAL = "NEUTRAL"
+
+
+class IVRegime(StrEnum):
+    LOW = "LOW"
+    NORMAL = "NORMAL"
+    HIGH = "HIGH"
+    EXTREME = "EXTREME"
+
+
+class InstrumentType(StrEnum):
+    """V1 account constraints: long-only instruments. No short stock, no naked shorts."""
+
+    LONG_STOCK = "LONG_STOCK"
+    LONG_CALL = "LONG_CALL"
+    LONG_PUT = "LONG_PUT"
+    NO_TRADE = "NO_TRADE"
+
+
+class OpportunityStatus(StrEnum):
+    NO_SIGNAL = "NO_SIGNAL"
+    WATCH = "WATCH"
+    SETUP_FORMING = "SETUP_FORMING"
+    ENTRY_READY = "ENTRY_READY"
+    DATA_ISSUE = "DATA_ISSUE"
+    BACKTEST_FAILED = "BACKTEST_FAILED"
+
+
+class RiskDecision(StrEnum):
+    APPROVE = "APPROVE"
+    APPROVE_WITH_RESIZE = "APPROVE_WITH_RESIZE"
+    REJECT = "REJECT"
+    PAUSE_STRATEGY = "PAUSE_STRATEGY"
+    EMERGENCY_EXIT = "EMERGENCY_EXIT"
