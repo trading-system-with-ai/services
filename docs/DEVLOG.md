@@ -5,7 +5,49 @@ decisions, test/audit status, and what's next.
 
 ---
 
-## 2026-08-10 — Iteration 5: Independent Risk Engine v0 + portfolio state + order-preview gate chain (Phase 4)
+## 2026-08-10 — Iteration 6: Paper execution + Exit Engine v0 + position monitor (Phase 6/7 slice)
+
+**Built (exits lib → gateway chain + parallel UI, 2 adversarial verifiers):**
+- `libs/trading_core/exits/engine.py` — pure Exit Engine v0 (§11): evaluates
+  ALL five rules every call (HARD_STOP → SIGNAL_FLIP → SIGNAL_DECAY →
+  ATR_TRAIL → TIME_STOP, backtest-priority order) with numeric reasons; holds
+  report "OK:"-prefixed reasons so the user always sees why a position is kept
+  (§37). Signal rules degrade to "insufficient data" on short history but a
+  data gap can NEVER disable the hard stop. Reuses score_direction (§21).
+- Paper execution: `POST /api/orders/approve` re-runs the FULL §10 gate chain
+  server-side (client previews never trusted); BUY_TO_OPEN /
+  SELL_TO_CLOSE are the only sides (§5, DB CHECK constraint); idempotent
+  client_order_id (§42); 409 no-pyramiding; fills at last close ± slippage +
+  commission (same model as backtest for comparability); ORDER_REQUESTED →
+  ORDER_SUBMITTED → ORDER_FILLED + RISK_DECISION audited in one transaction.
+- `POST /api/orders/close`: partial/full, realized-PnL arithmetic, allowed
+  while trading is paused (closing reduces risk — §18 risk-priority).
+- `GET /api/positions` (§37 contract: stop/trail/edge-decay/time-stop
+  countdown/exit status + full reasons) and `POST /api/positions/check-exits`:
+  mechanical exits audit EXIT_GENERATED and execute SYSTEM sell-to-close,
+  unblocked by the kill switch. `migrations/005_orders.sql`.
+
+**Race conditions found & fixed by the adversarial verifier (live-reproduced):**
+concurrent same-client_order_id approves returned [200, 500] via UNIQUE
+IntegrityError, and concurrent different-key approves double-filled into two
+positions with a double cash decrement. Fixed with a shared per-event-loop
+execution lock serializing approve / close / check-exits; two regression
+tests added. Cash conservation verified to the cent (partial + full closes).
+
+**Verified:** 202/202 green. Live lifecycle: preview → approve → position
+(with hold reasons) → check-exits → forced HARD_STOP exit → cash credited;
+watchlist-only approve rejected with zero Order rows; SELL_TO_OPEN absent
+from the codebase.
+
+**Next (iteration 7 — Phase 8 + hardening):**
+1. LLM Recommendation Pool (§4.1, §30): provider-abstracted llm service (stub
+   provider first), recommendations API (PENDING/DISMISSED/PROMOTED lifecycle,
+   LLM actor audited, zero execution authority), news-free v0 using
+   watchlist-adjacent discovery heuristics as stub input.
+2. UI Recommendations page (§30 cards: no Trade Now action; View Evidence /
+   Dismiss / Add to Watchlist which routes through the normal USER watchlist
+   API).
+3. Strategy Health Monitor v0 (§19): rolling stats over closed paper trades.
 
 **Built (risk lib → gateway chain + parallel UI, 2 adversarial verifiers):**
 - `libs/trading_core/risk/engine.py` — pure, strategy-independent (§17):

@@ -28,6 +28,13 @@ class Settings(BaseSettings):
     # portfolio row on first access. A parameter, never a hardcoded truth.
     paper_initial_cash: float = 100_000.0
 
+    # Paper fill model (plan §11): fills are simulated off the last STORED
+    # daily close, moved AGAINST the trader by paper_slippage_bps (buys fill
+    # higher, sells fill lower) plus a flat per-share commission both ways.
+    # Parameters, never hardcoded truths (plan §6.2).
+    paper_slippage_bps: float = 5.0
+    paper_commission_per_share: float = 0.005
+
 
 @lru_cache
 def get_settings() -> Settings:

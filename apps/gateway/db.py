@@ -187,6 +187,14 @@ class Position(Base):
     as ``quantity * stop_distance`` — the unit portfolio heat is measured in
     (plan §12.5). ``status`` is OPEN | CLOSED; only OPEN positions count
     toward NAV and heat.
+
+    Exit-engine state (plan §11): ``stop_distance`` is the per-share dollar
+    risk fixed at open (2 * ATR14 via the §10 chain), ``entry_edge`` the
+    directional edge at entry, and ``entry_bar_date`` the last stored bar
+    date at entry (YYYY-MM-DD) — the entry bar is bar 0 when counting
+    ``bars_held``. ``realized_pnl`` accumulates over partial closes and
+    holds the final figure once CLOSED (null until any close happens —
+    honest nulls, plan §44 rule 18).
     """
 
     __tablename__ = "positions"
@@ -202,6 +210,40 @@ class Position(Base):
     closed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, default=None
     )
+    entry_edge: Mapped[float] = mapped_column(Float, default=0.0)
+    stop_distance: Mapped[float] = mapped_column(Float, default=0.0)
+    entry_bar_date: Mapped[str | None] = mapped_column(
+        String(10), nullable=True, default=None
+    )  # YYYY-MM-DD of the last stored bar at entry (bars_held anchor)
+    realized_pnl: Mapped[float | None] = mapped_column(
+        Float, nullable=True, default=None
+    )
+
+
+class Order(Base):
+    """One executed paper order (plan §11, §42).
+
+    ``side`` is ``BUY_TO_OPEN`` or ``SELL_TO_CLOSE`` ONLY — Sell-to-Open does
+    not exist anywhere in this system, for options or stock (plan §5).
+    ``client_order_id`` is the caller's optional idempotency key (§42):
+    UNIQUE when present, so replaying the same key can only ever return the
+    existing order — a duplicate request can never fill twice. V1 paper
+    orders fill instantly, so ``status`` defaults to FILLED.
+    """
+
+    __tablename__ = "orders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    client_order_id: Mapped[str | None] = mapped_column(
+        String(64), unique=True, nullable=True, default=None
+    )
+    ticker: Mapped[str] = mapped_column(String(16), index=True)
+    side: Mapped[str] = mapped_column(String(16))  # BUY_TO_OPEN | SELL_TO_CLOSE (§5)
+    quantity: Mapped[int] = mapped_column(Integer)
+    fill_price: Mapped[float] = mapped_column(Float)
+    commission: Mapped[float] = mapped_column(Float)
+    status: Mapped[str] = mapped_column(String(16), default="FILLED")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class AuditEvent(Base):

@@ -1,4 +1,5 @@
-"""Order preview API — the §10 entry gate chain, fully explainable (§33, §36).
+"""Order preview + paper execution API — the §10 entry gate chain, fully
+explainable (§33, §36), and the V1 paper fill model (plan §11).
 
 ``POST /api/orders/preview`` walks a proposed LONG_STOCK entry through the
 nine §10 gates in their exact order and answers with per-gate PASS / FAIL /
@@ -7,16 +8,32 @@ always present). Evaluation stops populating later gates after the first FAIL
 ("no rejected ticker may produce an order", §42): the remaining gates report
 SKIPPED with "not evaluated: earlier gate failed".
 
+``POST /api/orders/approve`` ALWAYS re-runs that same chain server-side —
+client previews are never trusted (§42) — and only a fully passing chain may
+fill. ``POST /api/orders/close`` sells an open position to close; closing is
+allowed even while global trading is paused, because closing REDUCES risk and
+risk protection outranks the pause (§18 risk-priority).
+
+Paper fill model (plan §11; parameters live on Settings, §6.2): fills simulate
+off the last STORED daily close, moved AGAINST the trader by
+``paper_slippage_bps`` — BUY fills at ``close * (1 + bps/10000)``, SELL at
+``close * (1 - bps/10000)`` — plus ``paper_commission_per_share * quantity``
+commission charged on BOTH sides. The only order sides are BUY_TO_OPEN and
+SELL_TO_CLOSE — Sell-to-Open does not exist in this system (§5).
+
 V1 scope: VOLATILITY and LIQUIDITY are SKIPPED (no option/quote data until the
 Massive integration lands, plan §22.1) and CONTRACT_SELECTION is SKIPPED for a
 stock order — the gates still appear so the chain's shape never changes.
 
 Risk approval calls ``libs.trading_core.risk.assess`` — the risk engine is
 never reimplemented here, and risk limits have PRIORITY over strategy
-confidence (§44 rule 20). Every preview writes exactly ONE SYSTEM-attributed
+confidence (§44 rule 20). Every chain run writes exactly ONE SYSTEM-attributed
 RISK_DECISION audit event — even when vetoed at gate one — in the same
 transaction, so every decision is auditable (§38, rule 12).
 """
+import asyncio
+import weakref
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -46,16 +63,63 @@ from libs.trading_core.signals import RegimeParams, classify_regime, score_direc
 
 from .. import audit
 from ..db import (
+    Order,
+    Position,
+    StockBarDaily,
     TradingPoolItem,
     get_or_create_portfolio,
     get_or_create_system_state,
     get_session,
+    utcnow,
 )
 from ..schemas import TickerRequest
 from .analysis import ensure_daily_bars, market_regime_from_spy
 from .portfolio import open_positions_with_prices
 
 router = APIRouter(prefix="/api/orders", tags=["orders"])
+
+# The only order sides that exist in this system (§5): a long-only account
+# BUYS to open and SELLS to close. Sell-to-Open does not exist, ever.
+BUY_TO_OPEN = "BUY_TO_OPEN"
+SELL_TO_CLOSE = "SELL_TO_CLOSE"
+
+# Position lifecycle states (positions.status column).
+POSITION_OPEN = "OPEN"
+POSITION_CLOSED = "CLOSED"
+
+# Single-user V1: fixed user identity until auth-service lands (matches
+# routers/trading_control.py).
+CURRENT_USER = "local-user"
+
+# ---------------------------------------------------------------------------
+# Execution serialization (§42 duplicate protection; V1 no-pyramiding).
+#
+# Every paper-execution mutation (approve, close, check-exits) runs its
+# check-then-act sequence — idempotency lookup, open-position check, cash
+# guard — and its fill inside ONE critical section. Without it, two rapid
+# approves can BOTH pass the open-position check before either commits and
+# double-fill (pyramiding, forbidden in V1), or a duplicate client_order_id
+# can crash into the UNIQUE constraint with a 500 instead of replaying the
+# existing order (§42). V1 runs a single process, so an in-process asyncio
+# lock closes the race completely; the UNIQUE constraint on
+# orders.client_order_id stays as the multi-process backstop.
+#
+# The lock is per event loop (test suites create one loop per test; asyncio
+# primitives may not be shared across loops).
+# ---------------------------------------------------------------------------
+_EXECUTION_LOCKS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def execution_lock() -> asyncio.Lock:
+    """The current event loop's paper-execution lock (see block comment)."""
+    loop = asyncio.get_running_loop()
+    lock = _EXECUTION_LOCKS.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _EXECUTION_LOCKS[loop] = lock
+    return lock
 
 # --- V1 parameters (plan §6.2: parameters, never hardcoded truths) ----------
 # Stop distance for a LONG_STOCK entry = ATR_STOP_MULTIPLE * ATR14 (plan §12.1).
@@ -96,16 +160,45 @@ class OrderPreviewRequest(TickerRequest):
     quantity: int | None = Field(default=None, ge=1)
 
 
-@router.post("/preview")
-async def preview_order(
-    req: OrderPreviewRequest, session: AsyncSession = Depends(get_session)
-) -> dict:
+@dataclass
+class GateChainResult:
+    """One full §10 gate-chain evaluation, shared by preview and approve.
+
+    ``preview`` is the exact dict ``POST /api/orders/preview`` responds with;
+    ``veto_gate`` names the first FAILing gate (``None`` when the chain fully
+    passes — only then may an approval fill, §42). ``entry_price`` is the last
+    stored close, ``stop_distance`` the §12.1 stop (2 * ATR14), ``edge`` the
+    directional edge at evaluation, and ``last_bar_date`` the last stored bar
+    date (YYYY-MM-DD) — the entry-bar anchor for ``bars_held`` (plan §11).
+
+    The chain has already recorded its SYSTEM RISK_DECISION audit event on
+    the session but NOT committed — the caller owns the transaction, so the
+    audit lands atomically with whatever state change follows (rule 12).
+    """
+
+    preview: dict
+    assessment: RiskAssessment | None
+    entry_price: float | None
+    stop_distance: float | None
+    edge: float | None
+    last_bar_date: str | None
+    veto_gate: str | None
+
+    @property
+    def failed(self) -> bool:
+        """True when any gate FAILed — no order may be produced (§42)."""
+        return self.veto_gate is not None
+
+
+async def run_gate_chain(
+    session: AsyncSession, ticker: str, quantity: int | None
+) -> GateChainResult:
     """Evaluate the §10 gate chain for a proposed LONG_STOCK entry (§33, §42).
 
-    Places no order. Writes exactly one SYSTEM RISK_DECISION audit event —
-    veto or approval — committed in the same transaction (§38, rule 12).
+    Places no order and never commits. Records exactly one SYSTEM
+    RISK_DECISION audit event — veto or approval — on the session; the caller
+    commits it in the same transaction as any state change (§38, rule 12).
     """
-    ticker = req.ticker
     settings = get_settings()
     limits = RiskLimits()
     regime_params = RegimeParams()
@@ -310,7 +403,7 @@ async def preview_order(
                 entry_price=entry_price,
                 stop_distance=stop_distance,
                 edge=signal_edge,
-                quantity_requested=req.quantity,
+                quantity_requested=quantity,
             ),
             snapshot,
             limits,
@@ -349,9 +442,10 @@ async def preview_order(
         else:
             why_trade.extend(assessment.explanations)
 
-    # Exactly ONE RISK_DECISION audit event per preview — even an early veto
-    # is a decision and must be auditable (§38, rule 12); committed here in
-    # the same transaction as this (read-mostly) request.
+    # Exactly ONE RISK_DECISION audit event per chain run — even an early veto
+    # is a decision and must be auditable (§38, rule 12). Recorded on the
+    # session only; the CALLER commits, so the event shares one transaction
+    # with any state change (preview: none; approve: the fill).
     veto_gate = next((g["name"] for g in gates if g["status"] == FAIL), None)
     await audit.record(
         session,
@@ -370,7 +464,6 @@ async def preview_order(
             ),
         },
     )
-    await session.commit()
 
     risk_out = None
     if assessment is not None:
@@ -387,7 +480,7 @@ async def preview_order(
             "cash_after_pct": assessment.cash_after_pct,
         }
 
-    return {
+    preview = {
         "ticker": ticker,
         "as_of": datetime.now(timezone.utc).isoformat(),
         "gates": gates,
@@ -400,9 +493,485 @@ async def preview_order(
             "instrument": InstrumentType.LONG_STOCK.value,
             "entry_price": entry_price,
             "stop_distance": stop_distance,
-            "quantity_requested": req.quantity,
+            "quantity_requested": quantity,
         },
         "risk": risk_out,
         "why_trade": why_trade,
         "why_not_trade": why_not_trade,
+    }
+    return GateChainResult(
+        preview=preview,
+        assessment=assessment,
+        entry_price=entry_price,
+        stop_distance=stop_distance,
+        edge=signal_edge,
+        last_bar_date=bars[-1].ts.isoformat() if bars else None,
+        veto_gate=veto_gate,
+    )
+
+
+@router.post("/preview")
+async def preview_order(
+    req: OrderPreviewRequest, session: AsyncSession = Depends(get_session)
+) -> dict:
+    """Evaluate the §10 gate chain for a proposed LONG_STOCK entry (§33, §42).
+
+    Places no order. Writes exactly one SYSTEM RISK_DECISION audit event —
+    veto or approval — committed in the same transaction (§38, rule 12).
+    """
+    result = await run_gate_chain(session, req.ticker, req.quantity)
+    await session.commit()
+    return result.preview
+
+
+# ---------------------------------------------------------------------------
+# Paper execution (plan §11, §42)
+# ---------------------------------------------------------------------------
+
+
+class OrderApproveRequest(TickerRequest):
+    quantity: int | None = Field(default=None, ge=1)
+    # Idempotency key (§42): replaying the same key returns the existing
+    # order — a duplicate request can never fill twice.
+    client_order_id: str | None = Field(default=None, min_length=1, max_length=64)
+
+
+class OrderCloseRequest(TickerRequest):
+    quantity: int | None = Field(default=None, ge=1)  # default: close in full
+    reason: str | None = None
+
+
+def _order_payload(order: Order) -> dict:
+    return {
+        "id": order.id,
+        "client_order_id": order.client_order_id,
+        "ticker": order.ticker,
+        "side": order.side,
+        "quantity": order.quantity,
+        "fill_price": order.fill_price,
+        "commission": order.commission,
+        "status": order.status,
+        "created_at": order.created_at.isoformat(),
+    }
+
+
+def _position_payload(position: Position) -> dict:
+    return {
+        "id": position.id,
+        "ticker": position.ticker,
+        "status": position.status,
+        "quantity": position.quantity,
+        "avg_price": position.avg_price,
+        "stop_price": (
+            position.avg_price - position.stop_distance
+            if position.stop_distance > 0
+            else None
+        ),
+        "max_loss": position.max_loss,
+        "realized_pnl": position.realized_pnl,
+        "closed_at": position.closed_at.isoformat() if position.closed_at else None,
+    }
+
+
+async def _open_position(session: AsyncSession, ticker: str) -> Position | None:
+    """The OPEN position in `ticker`, if any (at most one — no pyramiding, V1)."""
+    return (
+        (
+            await session.execute(
+                select(Position)
+                .where(Position.ticker == ticker, Position.status == POSITION_OPEN)
+                .order_by(Position.id)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+
+async def _last_stored_close(session: AsyncSession, ticker: str) -> float | None:
+    """Last stored daily close for `ticker` — the paper fill reference price."""
+    return (
+        (
+            await session.execute(
+                select(StockBarDaily.close)
+                .where(StockBarDaily.ticker == ticker)
+                .order_by(StockBarDaily.ts.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+
+async def execute_sell_to_close(
+    session: AsyncSession,
+    position: Position,
+    quantity: int,
+    last_close: float,
+    *,
+    reason: str | None = None,
+    system_generated: bool = False,
+) -> tuple[Order, float]:
+    """Fill a SELL_TO_CLOSE against `position` at the paper fill model (§11).
+
+    SELL fill = ``last_close * (1 - paper_slippage_bps/10000)`` (slippage
+    always moves AGAINST the trader); commission =
+    ``paper_commission_per_share * quantity``, charged on this side too.
+    ``realized_pnl = (fill - avg_price) * quantity - commission`` — the
+    buy-side commission is NOT re-charged here because it already left cash
+    at open. Cash is credited the net proceeds; the position shrinks (its
+    ``max_loss`` scales down proportionally so portfolio heat, plan §12.5,
+    reflects only the risk still open) and flips to CLOSED with ``closed_at``
+    when quantity reaches 0. Records the full ORDER_REQUESTED (SYSTEM when
+    ``system_generated``, else USER, plan §11) -> ORDER_SUBMITTED ->
+    ORDER_FILLED audit chain on the session and NEVER commits — the caller
+    owns the transaction (rule 12).
+
+    Deliberately checks NEITHER the kill switch nor the §10 gates: closing
+    REDUCES risk, and risk protection outranks the pause (§18 risk-priority).
+    The side is SELL_TO_CLOSE — Sell-to-Open does not exist in this
+    system (§5).
+    """
+    settings = get_settings()
+    fill = last_close * (1.0 - settings.paper_slippage_bps / 10000.0)
+    commission = settings.paper_commission_per_share * quantity
+    proceeds = quantity * fill - commission
+    realized = (fill - position.avg_price) * quantity - commission
+
+    portfolio = await get_or_create_portfolio(session)
+    portfolio.cash += proceeds
+    portfolio.updated_at = utcnow()
+
+    order = Order(
+        ticker=position.ticker,
+        side=SELL_TO_CLOSE,
+        quantity=quantity,
+        fill_price=fill,
+        commission=commission,
+        status="FILLED",
+    )
+    session.add(order)
+    await session.flush()
+
+    remaining = position.quantity - quantity
+    position.max_loss = (
+        position.max_loss * remaining / position.quantity
+        if position.quantity > 0
+        else 0.0
+    )
+    position.quantity = remaining
+    position.realized_pnl = (position.realized_pnl or 0.0) + realized
+    if remaining <= 0:
+        position.status = POSITION_CLOSED
+        position.closed_at = utcnow()
+        position.max_loss = 0.0
+
+    await audit.record(
+        session,
+        actor_type=ActorType.SYSTEM if system_generated else ActorType.USER,
+        actor_id="" if system_generated else CURRENT_USER,
+        action=AuditAction.ORDER_REQUESTED,
+        entity_type="order",
+        entity_id=str(order.id),
+        details={
+            "ticker": position.ticker,
+            "side": SELL_TO_CLOSE,
+            "quantity": quantity,
+            "reason": reason,
+            "system_generated": system_generated,
+        },
+    )
+    await audit.record(
+        session,
+        actor_type=ActorType.SYSTEM,
+        action=AuditAction.ORDER_SUBMITTED,
+        entity_type="order",
+        entity_id=str(order.id),
+        details={
+            "fill_model": "paper: last stored close * (1 - slippage_bps/10000)",
+            "last_close": last_close,
+            "slippage_bps": settings.paper_slippage_bps,
+            "commission_per_share": settings.paper_commission_per_share,
+        },
+    )
+    await audit.record(
+        session,
+        actor_type=ActorType.SYSTEM,
+        action=AuditAction.ORDER_FILLED,
+        entity_type="order",
+        entity_id=str(order.id),
+        details={
+            "fill_price": fill,
+            "commission": commission,
+            "position_id": position.id,
+            "realized_pnl": realized,
+        },
+    )
+    return order, realized
+
+
+@router.post("/approve")
+async def approve_order(
+    req: OrderApproveRequest, session: AsyncSession = Depends(get_session)
+) -> dict:
+    """Approve and paper-fill a BUY_TO_OPEN entry — ONE transaction (§11, §42).
+
+    The server ALWAYS re-runs the full §10 gate chain at approval time —
+    client previews are never trusted (§42); any FAILing gate answers 422
+    with the fresh preview embedded, and no order row may exist for a
+    rejected ticker. Flow: idempotency lookup (a duplicate
+    ``client_order_id`` returns the EXISTING order, 200, no second fill,
+    §42) -> open-position check (an existing OPEN position in the ticker is
+    409 — no pyramiding in V1) -> gate chain -> fill.
+
+    Fill model (§11): BUY fill = last stored close *
+    ``(1 + paper_slippage_bps/10000)`` plus
+    ``paper_commission_per_share * quantity`` commission; quantity =
+    min(requested, risk-approved) — risk limits outrank strategy confidence
+    (§44 rule 20). Cash is guarded again at fill time (INSUFFICIENT_CASH ->
+    422) even though the risk chain already enforced the cash floor (§13).
+    The Order + Position + cash decrement + audit chain ORDER_REQUESTED
+    (USER) -> ORDER_SUBMITTED -> ORDER_FILLED (+ the chain's RISK_DECISION)
+    all commit atomically (rule 12). The whole flow runs under the
+    paper-execution lock so two rapid approves can never double-fill (§42;
+    V1 no-pyramiding).
+    """
+    async with execution_lock():
+        return await _approve_order_locked(req, session)
+
+
+async def _approve_order_locked(
+    req: OrderApproveRequest, session: AsyncSession
+) -> dict:
+    """The approve flow proper — caller holds the paper-execution lock."""
+    ticker = req.ticker
+
+    # --- Idempotency (§42): same client_order_id -> the EXISTING order. ----
+    if req.client_order_id is not None:
+        existing = (
+            (
+                await session.execute(
+                    select(Order).where(Order.client_order_id == req.client_order_id)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if existing is not None:
+            # Replay: no re-evaluation, no second fill, no new audit events.
+            # The position reflects its CURRENT state; preview is an honest
+            # null (§44 rule 18) — nothing was re-evaluated on this call.
+            position = (
+                (
+                    await session.execute(
+                        select(Position)
+                        .where(Position.ticker == existing.ticker)
+                        .order_by(Position.id.desc())
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            return {
+                "order": _order_payload(existing),
+                "position": _position_payload(position) if position else None,
+                "preview": None,
+            }
+
+    # --- No pyramiding in V1: one OPEN position per ticker. ---------------
+    if await _open_position(session, ticker) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{ticker} already has an OPEN position — pyramiding is not "
+                "supported in V1; close it before opening again"
+            ),
+        )
+
+    # --- Re-run the FULL §10 chain (§42: client previews are never trusted).
+    chain = await run_gate_chain(session, ticker, req.quantity)
+    if chain.failed or chain.assessment is None:
+        # The chain already recorded its RISK_DECISION; commit it so the veto
+        # stays auditable (rule 12), then answer 422 with the fresh preview.
+        await session.commit()
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": (
+                    f"approval denied: gate {chain.veto_gate} failed — no "
+                    "rejected ticker may produce an order (§42)"
+                ),
+                "preview": chain.preview,
+            },
+        )
+
+    approved = chain.assessment.approved_quantity
+    quantity = min(req.quantity, approved) if req.quantity is not None else approved
+
+    # --- Paper fill (§11): slippage against the trader + commission. -------
+    settings = get_settings()
+    fill = chain.entry_price * (1.0 + settings.paper_slippage_bps / 10000.0)
+    commission = settings.paper_commission_per_share * quantity
+    cost = quantity * fill + commission
+
+    portfolio = await get_or_create_portfolio(session)
+    if cost > portfolio.cash:
+        # The §13 cash floor was already enforced by RISK_APPROVAL, but the
+        # fill adds slippage + commission — guard anyway (risk outranks all).
+        await session.commit()  # keep the RISK_DECISION auditable (rule 12)
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": (
+                    f"INSUFFICIENT_CASH: cost ${cost:,.2f} exceeds cash "
+                    f"${portfolio.cash:,.2f}"
+                ),
+                "preview": chain.preview,
+            },
+        )
+
+    order = Order(
+        client_order_id=req.client_order_id,
+        ticker=ticker,
+        side=BUY_TO_OPEN,
+        quantity=quantity,
+        fill_price=fill,
+        commission=commission,
+        status="FILLED",
+    )
+    session.add(order)
+    portfolio.cash -= cost
+    portfolio.updated_at = utcnow()
+    position = Position(
+        ticker=ticker,
+        quantity=quantity,
+        avg_price=fill,
+        max_loss=quantity * chain.stop_distance,
+        stop_distance=chain.stop_distance,
+        entry_edge=chain.edge,
+        entry_bar_date=chain.last_bar_date,
+        status=POSITION_OPEN,
+    )
+    session.add(position)
+    await session.flush()
+
+    await audit.record(
+        session,
+        actor_type=ActorType.USER,
+        actor_id=CURRENT_USER,
+        action=AuditAction.ORDER_REQUESTED,
+        entity_type="order",
+        entity_id=str(order.id),
+        details={
+            "ticker": ticker,
+            "side": BUY_TO_OPEN,
+            "quantity_requested": req.quantity,
+            "client_order_id": req.client_order_id,
+        },
+    )
+    await audit.record(
+        session,
+        actor_type=ActorType.SYSTEM,
+        action=AuditAction.ORDER_SUBMITTED,
+        entity_type="order",
+        entity_id=str(order.id),
+        details={
+            "fill_model": "paper: last stored close * (1 + slippage_bps/10000)",
+            "last_close": chain.entry_price,
+            "slippage_bps": settings.paper_slippage_bps,
+            "commission_per_share": settings.paper_commission_per_share,
+        },
+    )
+    await audit.record(
+        session,
+        actor_type=ActorType.SYSTEM,
+        action=AuditAction.ORDER_FILLED,
+        entity_type="order",
+        entity_id=str(order.id),
+        details={
+            "fill_price": fill,
+            "commission": commission,
+            "quantity": quantity,
+            "position_id": position.id,
+        },
+    )
+    await session.commit()
+
+    return {
+        "order": _order_payload(order),
+        "position": {
+            "id": position.id,
+            "ticker": position.ticker,
+            "quantity": position.quantity,
+            "avg_price": position.avg_price,
+            "stop_price": position.avg_price - position.stop_distance,
+            "max_loss": position.max_loss,
+        },
+        "preview": chain.preview,
+    }
+
+
+@router.post("/close")
+async def close_position(
+    req: OrderCloseRequest, session: AsyncSession = Depends(get_session)
+) -> dict:
+    """Sell-to-close an OPEN paper position, fully or partially (§11).
+
+    Closing is ALLOWED while global trading is paused: the §18 kill switch
+    blocks NEW risk, and closing REDUCES risk — risk protection has priority
+    (§18 risk-priority), so no gate chain and no kill-switch check runs here.
+    404 when no OPEN position exists in the ticker; 422 when the requested
+    quantity exceeds the open quantity. Fill, cash credit, position update
+    and the ORDER_REQUESTED (USER) -> ORDER_SUBMITTED -> ORDER_FILLED audit
+    chain commit in ONE transaction (rule 12), under the paper-execution
+    lock so two rapid closes can never double-credit cash (§42 analogue).
+    """
+    async with execution_lock():
+        return await _close_position_locked(req, session)
+
+
+async def _close_position_locked(
+    req: OrderCloseRequest, session: AsyncSession
+) -> dict:
+    """The close flow proper — caller holds the paper-execution lock."""
+    ticker = req.ticker
+    position = await _open_position(session, ticker)
+    if position is None:
+        raise HTTPException(status_code=404, detail=f"no OPEN position in {ticker}")
+
+    quantity = req.quantity if req.quantity is not None else position.quantity
+    if quantity > position.quantity:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"cannot close {quantity} shares of {ticker}: only "
+                f"{position.quantity} open"
+            ),
+        )
+
+    last_close = await _last_stored_close(session, ticker)
+    if last_close is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"no stored bars for {ticker} — the paper fill model has no "
+                "reference price (honest error, §44 rule 18)"
+            ),
+        )
+
+    order, realized = await execute_sell_to_close(
+        session,
+        position,
+        quantity,
+        last_close,
+        reason=req.reason,
+        system_generated=False,
+    )
+    await session.commit()
+
+    return {
+        "order": _order_payload(order),
+        "position": _position_payload(position),
+        "realized_pnl": realized,
     }
