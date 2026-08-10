@@ -58,6 +58,16 @@ time the `db` container initializes its volume (to re-run them from scratch:
   `create_all` is a dev convenience only). If the model changes, change the
   migration in the same commit.
 
+### Frontend container
+
+The `frontend` compose service builds the Next.js UI from `../ui`
+(`docker compose build frontend`) and serves it on
+[http://localhost:3000](http://localhost:3000), depending on `gateway`. It
+bakes `NEXT_PUBLIC_API_BASE=http://localhost:8000` into the page — the
+browser, not the container, calls the API, so the base URL points at the
+host-published gateway port. No migrations run in this container; it is
+stateless.
+
 ## Development log
 
 See [docs/DEVLOG.md](docs/DEVLOG.md) — every iteration records what was built, decisions

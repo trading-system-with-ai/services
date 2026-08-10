@@ -5,7 +5,43 @@ decisions, test/audit status, and what's next.
 
 ---
 
-## 2026-08-10 — Iteration 8: Phase 0 acceptance (Docker E2E), CI, bars API + audit filters
+## 2026-08-10 — Iteration 9: Black-Scholes lib, stub option chain, Contract Selector v0, Options API
+
+**Built (bs+selector libs → chain+API chain + parallel UI, 2 adversarial verifiers):**
+- `libs/trading_core/options/bs.py` — pure-stdlib Black-Scholes-Merton
+  (math.erf normal CDF): price + Greeks with documented conventions (theta per
+  calendar day, vega per IV point, signed delta); intrinsic-value expiry edge.
+- `libs/trading_core/contracts/selector.py` — Contract Selector v0 (§9):
+  side gate (BULL→calls, BEAR→puts, long-only §5), §9.1 filters (DTE 30–90,
+  |Δ| 0.40–0.75, OI/volume/spread/theta-burden — every threshold a parameter,
+  every failure a numeric reason), §9.2 v0 heuristic ranking
+  (liquidity − theta burden + delta fit, components exposed; Phase 10 upgrades
+  to EV-based). All contracts returned with verdicts for the §34 view toggles.
+- Stub option chain in libs/market_data: deterministic (crc32-seeded) — weekly
+  + monthly expiries, tiered strike grid ±25%, seeded IV smile + term
+  structure, BS theoretical mids, moneyness/DTE-dependent spreads, ATM-decaying
+  volume/OI. Same-IV-both-rights documented as v0 (no skew yet).
+- `GET /api/watchlist/{ticker}/options?direction=AUTO|BULL|BEAR` (§34):
+  AUTO resolves via score_direction; NEUTRAL → no candidates ("NO TRADE is a
+  valid output"); summary with ATM IV, straddle expected move, RV20, IV−RV
+  spread, and iv_rank **honestly null** until real IV history exists.
+- Compose: frontend service added (context ../ui, :3000), image built OK.
+
+**Verified:** 319/319 green (259 → +60). Independent quant audit: put-call
+parity worst error 2.27e-13 over a 500-point grid; bs_price vs an independent
+Simpson risk-neutral integrator agrees to 1.56e-8; finite-difference delta
+check passed; no crossed markets; every live API candidate re-satisfies the
+§9.1 filters from its own row values.
+
+**Next (iteration 10):**
+1. Instrument Selection matrix (§8): direction×strength×IV-regime →
+   LONG_STOCK/LONG_CALL/LONG_PUT/NO_TRADE in trading_core; wire into the §10
+   INSTRUMENT gate + Trade Plan (show chosen instrument + §9 contract when
+   options are selected).
+2. Volatility regime classification (§7 LOW/NORMAL/HIGH/EXTREME from stub
+   chain IV vs RV) feeding the matrix.
+3. Order approve path for LONG_CALL/LONG_PUT paper fills (chain mid ± slippage)
+   with per-contract max-loss = premium (§12.1 options sizing in risk engine).
 
 **PHASE 0 ACCEPTANCE: PASS.** `docker compose up --build` boots the real stack
 (TimescaleDB pg16 + Redis + gateway) and the smoke test ran end to end through

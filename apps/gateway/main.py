@@ -19,6 +19,7 @@ from .routers import (
     backtests,
     health,
     market,
+    options,
     orders,
     portfolio,
     positions,
@@ -48,6 +49,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(watchlist.router)
     app.include_router(analysis.router)
+    app.include_router(options.router)
     app.include_router(backtests.router)
     app.include_router(trading_pool.router)
     app.include_router(market.router)

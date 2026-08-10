@@ -52,5 +52,18 @@ services:
       redis:
         condition: service_healthy
 
+  frontend:
+    build:
+      context: ../ui
+      dockerfile: Dockerfile
+    environment:
+      # The browser (not the container) calls the API, so the base URL is the
+      # host-published gateway port, baked in at page load via NEXT_PUBLIC_*.
+      NEXT_PUBLIC_API_BASE: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - gateway
+
 volumes:
   db-data:
