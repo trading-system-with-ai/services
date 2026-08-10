@@ -21,7 +21,7 @@ Direction resolution:
 All analytics come exclusively from libs.trading_core (options, contracts,
 features, signals), so backtest and live share this exact code (plan §21).
 """
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -79,9 +79,32 @@ def _neutral_verdicts(chain: list[ContractQuote]) -> list[ScoredContract]:
     return verdicts
 
 
-def _summary(chain: list[ContractQuote], spot: float, closes: list[float]) -> dict:
+def build_option_chain(ticker: str, spot: float) -> tuple[date, list[ContractQuote]]:
+    """Today's option chain snapshot for `ticker` around `spot` (plan §9).
+
+    The SHARED chain-build helper: this options view, the §10 order gate
+    chain (routers/orders.py) and the position monitor's option reads
+    (routers/positions.py) all regenerate the chain through this one
+    function, so every consumer sees the identical snapshot — the stub chain
+    is keyed by (symbol, day), so two calls on the same day are
+    byte-identical (deterministic by construction). Returns ``(as_of,
+    chain)`` where ``as_of`` is the snapshot DATE.
+    """
+    settings = get_settings()
+    as_of = datetime.now(timezone.utc).date()
+    provider = get_provider(settings.market_data_provider)
+    return as_of, provider.get_option_chain(ticker, spot, as_of)
+
+
+def chain_iv_summary(
+    chain: list[ContractQuote], spot: float, closes: list[float]
+) -> dict:
     """IV summary block (plan §9): ATM IV, straddle-implied expected move,
     realized vol and the IV-RV spread — honest nulls when undefined.
+
+    SHARED with the §10 order gate chain (routers/orders.py), whose
+    VOLATILITY gate classifies the §7 regime off this block's ``atm_iv`` +
+    ``rv20`` — one summary implementation, never duplicated (plan §21).
 
     ``atm_iv`` reads the closest-to-spot strike CALL on the nearest expiry
     with dte >= :data:`ATM_MIN_DTE`; ``expected_move_pct`` is the ATM
@@ -155,7 +178,6 @@ async def get_symbol_options(
     bars = await ensure_daily_bars(session, ticker, settings.market_data_provider)
     closes = [b.close for b in bars]
     spot = closes[-1]  # spot = last stored close (plan §9 v0)
-    as_of = datetime.now(timezone.utc).date()
 
     # Resolve the direction (plan §9): explicit param wins; AUTO defers to
     # the Directional Signal Engine over the same stored bars.
@@ -172,8 +194,7 @@ async def get_symbol_options(
     else:
         direction_used = direction
 
-    provider = get_provider(settings.market_data_provider)
-    chain = provider.get_option_chain(ticker, spot, as_of)
+    as_of, chain = build_option_chain(ticker, spot)
 
     if direction_used is not None:
         scored = select_contracts(chain, direction_used)
@@ -188,7 +209,7 @@ async def get_symbol_options(
         "spot": spot,
         "source": settings.market_data_provider,
         "direction_used": direction_used,
-        "summary": _summary(chain, spot, closes),
+        "summary": chain_iv_summary(chain, spot, closes),
         "expiries": [
             {"expiry": expiry.isoformat(), "dte": dte} for expiry, dte in expiry_dte
         ],

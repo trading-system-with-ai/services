@@ -210,20 +210,36 @@ def heat_state(heat: float, limits: RiskLimits = RiskLimits()) -> str:
     return "BLOCKED"
 
 
-def _strength_tier(abs_edge: float, limits: RiskLimits) -> tuple[str, float] | None:
-    """Map |directional_edge| to (tier name, risk budget pct) (plan §12.2).
+def strength_tier(edge: float, limits: RiskLimits = RiskLimits()) -> str | None:
+    """Map a directional edge to its signal-strength tier name (plan §12.2).
 
-    Below ``strength_weak`` there is no valid signal -> ``None``.
+    The SINGLE source of truth for the |edge| -> tier mapping: :func:`assess`
+    budgets by it, and the §8 instrument matrix
+    (:mod:`libs.trading_core.strategies`) keys its strength column on the
+    names returned here. The sign of ``edge`` carries direction, not
+    strength, so |edge| is used. Below ``strength_weak`` there is no valid
+    signal -> ``None`` (honest null, never a fake "WEAK").
     """
+    abs_edge = abs(edge)
     if abs_edge >= limits.strength_very_strong:
-        return "VERY_STRONG", limits.budget_very_strong
+        return "VERY_STRONG"
     if abs_edge >= limits.strength_strong:
-        return "STRONG", limits.budget_strong
+        return "STRONG"
     if abs_edge >= limits.strength_moderate:
-        return "MODERATE", limits.budget_moderate
+        return "MODERATE"
     if abs_edge >= limits.strength_weak:
-        return "WEAK", limits.budget_weak
+        return "WEAK"
     return None
+
+
+def _tier_budget(strength: str, limits: RiskLimits) -> float:
+    """Risk budget (fraction of NAV) for a :func:`strength_tier` name (§12.2)."""
+    return {
+        "VERY_STRONG": limits.budget_very_strong,
+        "STRONG": limits.budget_strong,
+        "MODERATE": limits.budget_moderate,
+        "WEAK": limits.budget_weak,
+    }[strength]
 
 
 def _floor_qty(numerator: float, denominator: float) -> int:
@@ -298,8 +314,8 @@ def assess(
     # abs_max_trade_risk: "No confidence score may override" (plan §12.2).
     # ------------------------------------------------------------------
     abs_edge = abs(request.edge)
-    tier = _strength_tier(abs_edge, limits)
-    if tier is None:
+    strength = strength_tier(request.edge, limits)
+    if strength is None:
         return _early_reject(
             ["SIGNAL_TOO_WEAK"],
             [
@@ -309,8 +325,7 @@ def assess(
             ],
             heat_before,
         )
-    strength, budget = tier
-    budget = min(budget, limits.abs_max_trade_risk)
+    budget = min(_tier_budget(strength, limits), limits.abs_max_trade_risk)
 
     # ------------------------------------------------------------------
     # Step 4 — base sizing (plan §12.1): shares = floor(allowed risk /

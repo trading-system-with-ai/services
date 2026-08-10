@@ -195,6 +195,15 @@ class Position(Base):
     ``bars_held``. ``realized_pnl`` accumulates over partial closes and
     holds the final figure once CLOSED (null until any close happens —
     honest nulls, plan §44 rule 18).
+
+    Option positions (plan §8/§9, §12.1): ``instrument`` is LONG_CALL or
+    LONG_PUT, ``opt_expiry``/``opt_strike``/``opt_right`` identify the
+    contract, ``multiplier`` is 100 (1 for stock), ``quantity`` counts
+    CONTRACTS, ``avg_price`` is the entry premium PER SHARE, ``max_loss`` is
+    the full premium paid (``quantity * avg_price * multiplier`` — a long
+    option's premium is fully at risk, §12.1), and ``stop_distance`` stores
+    the per-share entry premium — the §11.3 PREMIUM hard-stop basis, NOT an
+    underlying price stop. The opt_* columns are honest nulls for stock.
     """
 
     __tablename__ = "positions"
@@ -218,6 +227,15 @@ class Position(Base):
     realized_pnl: Mapped[float | None] = mapped_column(
         Float, nullable=True, default=None
     )
+    # Option contract identity (null for stock — honest nulls, §44 rule 18).
+    opt_expiry: Mapped[str | None] = mapped_column(
+        String(10), nullable=True, default=None
+    )  # YYYY-MM-DD
+    opt_strike: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
+    opt_right: Mapped[str | None] = mapped_column(
+        String(1), nullable=True, default=None
+    )  # "C" | "P"
+    multiplier: Mapped[int] = mapped_column(Integer, default=1)  # 100 for options
 
 
 class Order(Base):
@@ -229,6 +247,12 @@ class Order(Base):
     UNIQUE when present, so replaying the same key can only ever return the
     existing order — a duplicate request can never fill twice. V1 paper
     orders fill instantly, so ``status`` defaults to FILLED.
+
+    Option orders (plan §8/§9): ``instrument`` is LONG_CALL or LONG_PUT with
+    the contract identified by ``opt_expiry``/``opt_strike``/``opt_right``;
+    ``quantity`` counts CONTRACTS and ``fill_price`` is the premium PER
+    SHARE (x100 multiplier applies to cash). The opt_* columns are honest
+    nulls for stock orders (§44 rule 18).
     """
 
     __tablename__ = "orders"
@@ -238,12 +262,21 @@ class Order(Base):
         String(64), unique=True, nullable=True, default=None
     )
     ticker: Mapped[str] = mapped_column(String(16), index=True)
+    instrument: Mapped[str] = mapped_column(String(16), default="LONG_STOCK")
     side: Mapped[str] = mapped_column(String(16))  # BUY_TO_OPEN | SELL_TO_CLOSE (§5)
     quantity: Mapped[int] = mapped_column(Integer)
     fill_price: Mapped[float] = mapped_column(Float)
     commission: Mapped[float] = mapped_column(Float)
     status: Mapped[str] = mapped_column(String(16), default="FILLED")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # Option contract identity (null for stock — honest nulls, §44 rule 18).
+    opt_expiry: Mapped[str | None] = mapped_column(
+        String(10), nullable=True, default=None
+    )  # YYYY-MM-DD
+    opt_strike: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
+    opt_right: Mapped[str | None] = mapped_column(
+        String(1), nullable=True, default=None
+    )  # "C" | "P"
 
 
 class Recommendation(Base):

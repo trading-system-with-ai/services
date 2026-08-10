@@ -81,13 +81,34 @@ def assert_contract_shape(body, ticker):
         assert g["status"] in {"PASS", "FAIL", "SKIPPED"}
         assert isinstance(g["detail"], str) and g["detail"]
     assert set(body["signal"]) == {"edge", "bias", "strength"}
+    # Option wiring additions: instrument is the §8 matrix verdict (null when
+    # the chain vetoed before the matrix ran — honest null), vol_regime the
+    # §7 classification, contract the §9 top-ranked candidate (null for
+    # stock / no trade).
     assert set(body["proposed"]) == {
         "instrument",
+        "vol_regime",
+        "instrument_rationale",
+        "contract",
         "entry_price",
         "stop_distance",
         "quantity_requested",
     }
-    assert body["proposed"]["instrument"] == "LONG_STOCK"
+    assert body["proposed"]["instrument"] in {
+        None,
+        "LONG_STOCK",
+        "LONG_CALL",
+        "LONG_PUT",
+        "NO_TRADE",
+    }
+    assert body["proposed"]["vol_regime"] in {
+        None,
+        "LOW",
+        "NORMAL",
+        "HIGH",
+        "EXTREME",
+    }
+    assert isinstance(body["proposed"]["instrument_rationale"], list)
     # §33: both narrative lists are always present.
     assert isinstance(body["why_trade"], list)
     assert isinstance(body["why_not_trade"], list)
@@ -162,15 +183,24 @@ async def test_fully_authorized_chain_runs_to_risk_or_fails_legitimately(client)
 
     first_fail = next((g["name"] for g in gates if g["status"] == "FAIL"), None)
     if first_fail in (None, "RISK_APPROVAL"):
-        # Chain reached the risk engine: the V1 skips must be exact.
-        assert by_name["VOLATILITY"]["status"] == "SKIPPED"
-        assert by_name["VOLATILITY"]["detail"] == SKIP_NO_OPTION_DATA
+        # Chain reached the risk engine. VOLATILITY is now a REAL §7
+        # classification off the stub chain summary (GOOGL deterministically
+        # classifies NORMAL and the §8 matrix keeps LONG_STOCK for it);
+        # LIQUIDITY stays the exact V1 skip and CONTRACT_SELECTION skips for
+        # a stock order.
+        assert by_name["VOLATILITY"]["status"] == "PASS"
+        assert "vol regime" in by_name["VOLATILITY"]["detail"]
         assert by_name["LIQUIDITY"]["status"] == "SKIPPED"
         assert by_name["LIQUIDITY"]["detail"] == SKIP_NO_OPTION_DATA
         assert by_name["INSTRUMENT"]["status"] == "PASS"
+        assert "§8" in by_name["INSTRUMENT"]["detail"]
         assert by_name["CONTRACT_SELECTION"]["status"] == "SKIPPED"
         assert by_name["CONTRACT_SELECTION"]["detail"] == SKIP_STOCK_ORDER
 
+        assert body["proposed"]["instrument"] == "LONG_STOCK"
+        assert body["proposed"]["contract"] is None
+        assert body["proposed"]["vol_regime"] is not None
+        assert body["proposed"]["instrument_rationale"]
         assert body["signal"]["bias"] == "BULL"
         assert body["proposed"]["entry_price"] > 0
         assert body["proposed"]["stop_distance"] > 0

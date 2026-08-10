@@ -5,7 +5,46 @@ decisions, test/audit status, and what's next.
 
 ---
 
-## 2026-08-10 — Iteration 9: Black-Scholes lib, stub option chain, Contract Selector v0, Options API
+## 2026-08-10 — Iteration 10: Options in the decision chain — vol regime, §8 matrix, option execution & exits
+
+**Built (pure libs → gateway chain + parallel UI, 2 adversarial verifiers, zero fixes):**
+- `libs/trading_core/volatility.py` — §7 vol regime v0 (LOW/NORMAL/HIGH/
+  EXTREME from ATM IV level + IV/RV ratio; provisional until IV history
+  enables IV Rank; every threshold a parameter).
+- `libs/trading_core/strategies/instrument.py` — the §8 Instrument Selection
+  matrix, every cell implemented + documented with §5 degradations (spreads
+  unpermitted → stock/single-leg/no-trade): BULL STRONG+LOW → LONG_CALL,
+  spread cells degrade, BEAR WEAK → NO_TRADE, EXTREME never buys premium,
+  NEUTRAL → NO_TRADE. AccountPermissions configurable. `strength_tier`
+  refactored public in risk engine (single source of truth for edge→tier).
+- `exits/engine.py` — option exits (§11.3/§11.7): PREMIUM_HARD_STOP (-45%
+  research parameter) > DTE_EXIT (≤21) > underlying-driven rules via shared
+  internals (bit-identical to stock evaluation, §21). Underlying HARD_STOP
+  replaced by the premium stop for options; missing mid reported loudly.
+- Gateway: VOLATILITY gate is now a real classification; INSTRUMENT gate is
+  the matrix verdict with rationale; CONTRACT_SELECTION proposes the §9
+  top-ranked contract; risk sizing for options passes entry=stop=mid×100 so
+  approved_quantity counts CONTRACTS with every cap intact (§12.1). Approve/
+  close handle ×100 multiplier + per-contract commission ($0.65); close
+  regenerates the chain to find the same contract, intrinsic-value fallback
+  if expired. Positions evaluate option rows via evaluate_option_exit.
+  `migrations/008_option_execution.sql`.
+
+**Verified:** 471/471 green (319 → +152). Exhaustive §8 sweep (1,200
+permission-expanded cells): always §5-legal, EXTREME never buys premium,
+rationale always present. 5,000-trial option sizing fuzz: contracts×premium
+×100 never exceeded the absolute cap nor tier budget; exact boundary check
+(100k NAV, STRONG, $250/contract) = exactly 4 contracts. Premium-stop/DTE
+boundary arithmetic bit-exact. Live option lifecycle cash-conserved to the
+cent.
+
+**Next (iteration 11):**
+1. Correlation buckets from returns (§12.4 rolling correlation grouping to
+   replace/augment the static TECH_MEGA list) + delta-adjusted exposure and
+  portfolio Greeks aggregation (§16) on the Risk page.
+2. Volatility targeting layer (§14) as an allocation modifier (capped 1.2x).
+3. Replay-style integration test: multi-day loop advancing stub data
+   (backfill → signal → preview → approve → monitor → exit) as one test.
 
 **Built (bs+selector libs → chain+API chain + parallel UI, 2 adversarial verifiers):**
 - `libs/trading_core/options/bs.py` — pure-stdlib Black-Scholes-Merton

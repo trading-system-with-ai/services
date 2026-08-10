@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     # Parameters, never hardcoded truths (plan §6.2).
     paper_slippage_bps: float = 5.0
     paper_commission_per_share: float = 0.005
+    # Option paper fills (plan §11): flat per-CONTRACT commission charged on
+    # both sides, alongside the same slippage model applied to the contract
+    # mid. A parameter, never a hardcoded truth (plan §6.2).
+    paper_commission_per_contract: float = 0.65
 
 
 @lru_cache
