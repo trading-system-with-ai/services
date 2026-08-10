@@ -5,7 +5,46 @@ decisions, test/audit status, and what's next.
 
 ---
 
-## 2026-08-10 — Iteration 3: Regime engine v0, directional signals v0, daily bars + analysis API
+## 2026-08-10 — Iteration 4: Backtest Engine V1 + backtest API + watchlist overview (Phase 3)
+
+**Built (engine → gateway chain + parallel UI, 2 adversarial verifiers):**
+- `libs/trading_core/backtest/engine.py` — pure replay engine, LONG STOCK only
+  (option backtesting deferred until real chain data exists — no fabricated
+  option prices). §20.3 semantics enforced: signals computed on `[:t+1]` slices
+  via the SAME `classify_regime`/`score_direction` used live (§21); decision at
+  close of t fills at open of t+1 with slippage bps + per-share commission (§44
+  rule 11); exits in priority order SIGNAL_FLIP → SIGNAL_DECAY (§11.1) →
+  ATR_TRAIL (§11.5) → TIME_STOP (§11.6) → END_OF_DATA; IS/OOS split with
+  per-segment metrics (report-only, §44 rule 16); every division guarded —
+  None, never NaN. All knobs in frozen validated `BacktestParams`.
+- 26-test quant-integrity suite: the no-look-ahead property (closed trades
+  bit-identical between 300-bar prefix and 400-bar runs), hand-computed fill
+  arithmetic, costs monotonicity, NO-TRADE honesty, long-only invariants.
+- `POST /api/backtests` (watchlist-gated, synchronous V1, params validated
+  before any state change), `GET /api/backtests[/{id}]`; records persisted with
+  USER BACKTEST_STARTED + SYSTEM BACKTEST_COMPLETED/FAILED audit events in one
+  transaction. `migrations/003_backtests.sql`.
+- `GET /api/watchlist/overview` — per-symbol price/regime/scores/bias +
+  opportunity_status v0 mapping (§31) + latest backtest status.
+
+**Bug found & fixed during review:** the gateway implementation agent spotted
+that the engine's fill block never copied `pending_entry` into `entry_reason`
+(every trade explained its exit but not its entry — §38 violation). Fixed with
+`entry_reason = pending_entry` in the fill branch + a regression test asserting
+every trade's entry_reason carries the edge number. Suite now 122 green.
+
+**Verified:** independent verifier re-derived fills to the cent, recomputed
+total-return/max-drawdown from the equity array (1e-6 agreement), re-ran the
+no-look-ahead experiment with a shock series, and exercised the API live
+(404/422 paths, audit pairs, overview status flip).
+
+**Next (iteration 5 — Phase 4 start):**
+1. Portfolio state: NAV, cash, positions tables; paper-fill plumbing groundwork.
+2. Risk Engine v0 as an independent module (§17): position sizing from risk
+   budget (§12.1-12.2), single-name cap, Portfolio Heat, cash floor by regime
+   (§13), APPROVE/RESIZE/REJECT decisions with reason codes, audited.
+3. `POST /api/orders/preview` returning the full gate-chain evaluation (§10).
+4. UI Risk page v1: NAV/cash/heat/limits + latest risk decisions.
 
 **Built (signals lib → gateway chain + parallel UI, 2 adversarial verifiers, zero fixes):**
 - `libs/trading_core/signals/regime.py` — Market Regime Engine v0 (§6.1):

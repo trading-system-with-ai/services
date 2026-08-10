@@ -81,6 +81,33 @@ class StockBarDaily(Base):
     volume: Mapped[float] = mapped_column(Float)
 
 
+class BacktestRecord(Base):
+    """One persisted run of Backtest Engine V1 (plan §20).
+
+    The engine's full output — resolved params, per-segment metrics, trades and
+    the equity curve — is stored as JSON exactly in the API response shape, so
+    reads never recompute anything. Rows are written by the backtests router in
+    the SAME transaction as their BACKTEST_* audit events (rule 12). ``status``
+    is COMPLETED | FAILED; a FAILED row keeps the engine's error message and
+    empty result payloads (honest nulls, plan §44 rule 18).
+    """
+
+    __tablename__ = "backtests"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticker: Mapped[str] = mapped_column(String(16), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    status: Mapped[str] = mapped_column(String(16))  # COMPLETED | FAILED
+    params: Mapped[dict] = mapped_column(JSON, default=dict)
+    metrics: Mapped[dict] = mapped_column(JSON, default=dict)
+    trades: Mapped[list] = mapped_column(JSON, default=list)
+    equity_curve: Mapped[dict] = mapped_column(JSON, default=dict)
+    oos_start_date: Mapped[str | None] = mapped_column(
+        String(10), nullable=True, default=None
+    )  # YYYY-MM-DD
+    error: Mapped[str] = mapped_column(Text, default="")
+
+
 class SystemState(Base):
     """Singleton row (id=1) backing the global kill switch (plan §18).
 

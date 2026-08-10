@@ -21,11 +21,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from libs.common.config import get_settings
 from libs.market_data import get_provider
 from libs.trading_core.features import atr, macd, realized_vol, rsi, sma
-from libs.trading_core.models import ActorType, AuditAction
-from libs.trading_core.signals import classify_regime, score_direction
+from libs.trading_core.models import (
+    ActorType,
+    AuditAction,
+    DirectionalBias,
+    MarketRegime,
+    OpportunityStatus,
+)
+from libs.trading_core.signals import (
+    DirectionalParams,
+    DirectionalResult,
+    RegimeParams,
+    classify_regime,
+    score_direction,
+)
 
 from .. import audit
-from ..db import StockBarDaily, WatchlistItem, get_session
+from ..db import BacktestRecord, StockBarDaily, WatchlistItem, get_session
 
 router = APIRouter(prefix="/api/watchlist", tags=["analysis"])
 
@@ -104,6 +116,112 @@ async def ensure_daily_bars(
     )
     await session.commit()
     return orm_bars
+
+
+# Regimes that agree with each directional bias (plan §31 v0 mapping).
+_BULL_REGIMES = frozenset({MarketRegime.STRONG_BULL, MarketRegime.MILD_BULL})
+_BEAR_REGIMES = frozenset({MarketRegime.STRONG_BEAR, MarketRegime.MILD_BEAR})
+
+
+def _opportunity_status(
+    bar_count: int,
+    regime: MarketRegime,
+    signal: DirectionalResult,
+    regime_params: RegimeParams,
+    directional_params: DirectionalParams,
+) -> OpportunityStatus:
+    """v0 opportunity-status mapping (plan §31), first match wins:
+
+    1. DATA_ISSUE     — fewer stored bars than ``regime_params.sma_slow``: the
+       slow trend structure (and hence the regime) is undefined.
+    2. ENTRY_READY    — bias != NEUTRAL AND the regime agrees with the bias
+       direction (BULL bias with STRONG/MILD_BULL; BEAR bias mirrored with
+       STRONG/MILD_BEAR).
+    3. SETUP_FORMING  — ``|directional_edge| >= bias_threshold / 2``: material
+       one-sided evidence that has not (yet) aligned into an entry.
+    4. WATCH          — some nonzero bull or bear score exists.
+    5. NO_SIGNAL      — otherwise.
+
+    All cutoffs come from the shared signal engines' parameter objects — no
+    threshold is hardcoded here (plan §6.2).
+    """
+    if bar_count < regime_params.sma_slow:
+        return OpportunityStatus.DATA_ISSUE
+    if signal.bias is DirectionalBias.BULL and regime in _BULL_REGIMES:
+        return OpportunityStatus.ENTRY_READY
+    if signal.bias is DirectionalBias.BEAR and regime in _BEAR_REGIMES:
+        return OpportunityStatus.ENTRY_READY
+    if abs(signal.directional_edge) >= directional_params.bias_threshold / 2.0:
+        return OpportunityStatus.SETUP_FORMING
+    if signal.bull_score > 0.0 or signal.bear_score > 0.0:
+        return OpportunityStatus.WATCH
+    return OpportunityStatus.NO_SIGNAL
+
+
+@router.get("/overview")
+async def get_watchlist_overview(
+    session: AsyncSession = Depends(get_session),
+) -> list[dict]:
+    """One dashboard row per Watchlist symbol (plan §31), ticker-ordered.
+
+    Each row carries the last close, the current regime and directional read
+    (computed by the SAME libs.trading_core.signals code the backtest replays,
+    plan §21), the v0 opportunity status (see :func:`_opportunity_status`),
+    and the symbol's latest backtest outcome: ``backtest_status`` is
+    ``"NONE"`` (never run) | ``"COMPLETED"`` | ``"FAILED"`` with
+    ``last_backtest_id`` pointing at that latest record (null when NONE).
+
+    Bars are lazily backfilled per symbol via the shared helper, so a fresh
+    symbol's first overview also writes its DATA_BACKFILL audit event.
+    """
+    settings = get_settings()
+    regime_params = RegimeParams()
+    directional_params = DirectionalParams()
+
+    rows = await session.execute(select(WatchlistItem).order_by(WatchlistItem.ticker))
+    overview: list[dict] = []
+    for item in rows.scalars().all():
+        bars = await ensure_daily_bars(session, item.ticker, settings.market_data_provider)
+        closes = [b.close for b in bars]
+        highs = [b.high for b in bars]
+        lows = [b.low for b in bars]
+        volumes = [b.volume for b in bars]
+
+        regime = classify_regime(closes, highs, lows, params=regime_params)
+        signal = score_direction(
+            closes, highs, lows, volumes=volumes, params=directional_params
+        )
+        status = _opportunity_status(
+            len(bars), regime.classification, signal, regime_params, directional_params
+        )
+
+        latest = await session.execute(
+            select(BacktestRecord)
+            .where(BacktestRecord.ticker == item.ticker)
+            .order_by(BacktestRecord.id.desc())
+            .limit(1)
+        )
+        last_backtest = latest.scalars().first()
+
+        overview.append(
+            {
+                "ticker": item.ticker,
+                "price": closes[-1],
+                "regime": regime.classification.value,
+                "bull_score": signal.bull_score,
+                "bear_score": signal.bear_score,
+                "directional_edge": signal.directional_edge,
+                "bias": signal.bias.value,
+                "opportunity_status": status.value,
+                "backtest_status": (
+                    last_backtest.status if last_backtest is not None else "NONE"
+                ),
+                "last_backtest_id": (
+                    last_backtest.id if last_backtest is not None else None
+                ),
+            }
+        )
+    return overview
 
 
 @router.get("/{ticker}/analysis")

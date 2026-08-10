@@ -16,6 +16,7 @@ from .db import init_db
 from .routers import (
     analysis,
     audit_log,
+    backtests,
     health,
     market,
     trading_control,
@@ -43,6 +44,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(watchlist.router)
     app.include_router(analysis.router)
+    app.include_router(backtests.router)
     app.include_router(trading_pool.router)
     app.include_router(market.router)
     app.include_router(trading_control.router)
