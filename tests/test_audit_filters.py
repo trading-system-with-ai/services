@@ -27,7 +27,11 @@ async def seed_audit_events(client):
     assert r.status_code == 201
     r = await client.post("/api/watchlist", json={"ticker": "AAPL"})
     assert r.status_code == 201
-    r = await client.post("/api/trading-pool", json={"ticker": "AAPL"})
+    # acknowledge_risks: AAPL has no stored history/backtest at promote time,
+    # so the §4.3 promotion checks fail and need an explicit override.
+    r = await client.post(
+        "/api/trading-pool", json={"ticker": "AAPL", "acknowledge_risks": True}
+    )
     assert r.status_code == 201
     # Removing a pooled symbol from the watchlist cascades a SYSTEM-attributed
     # TRADING_POOL_REMOVE alongside the USER WATCHLIST_REMOVE.

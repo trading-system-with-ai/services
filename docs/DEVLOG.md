@@ -5,7 +5,36 @@ decisions, test/audit status, and what's next.
 
 ---
 
-## 2026-08-10 — Iteration 14: Audit-driven alerts feed
+## 2026-08-10 — Iteration 15: §4.3 promotion checks + automated position monitor
+
+**Built:**
+- Trading Pool promotion checks (§4.3, closing a long-standing gap):
+  MIN_HISTORY (bars ≥ RegimeParams.sma_slow — the real parameter, not a
+  duplicated constant), BACKTEST_COMPLETED (latest id cited), OOS_STATS
+  (≥ 1 out-of-sample trade — zero trades = no OOS evidence), LIQUIDITY
+  (documented stub until Massive). Failures 422 with the structured checks;
+  `acknowledge_risks: true` overrides but the TRADING_POOL_ADD audit details
+  ALWAYS carry the full checks + acknowledged flag — overrides are
+  permanently visible (§4.3 + §38).
+- Automated position monitor: `run_exit_sweep` core shared by the POST
+  endpoint and `apps/gateway/monitor.py`'s asyncio loop (interval
+  `position_monitor_interval_seconds`, default 300, 0=disabled); survives
+  transient DB errors; telemetry counters; lifespan start + graceful
+  cancel/await shutdown; honest `GET /api/positions/monitor` status.
+
+**Verified:** 573/573 green. Live promotion ladder (fresh → bars-only →
+backtested → all-pass 201) exercised through real APIs with honest numeric
+details at each rung; override path's audit row inspected directly; with a
+1s interval the BACKGROUND task closed a forced hard-stop position with the
+full EXIT_GENERATED + SYSTEM ORDER_* chain and the server shut down cleanly.
+
+**Next (iteration 16):**
+1. Docs pass: README architecture diagram refresh + DEVLOG index; ARCHITECTURE
+   ADR for the alerts-as-audit-view and monitor decisions.
+2. Dependency floor pinning + a `make verify` running pytest + docker config
+   validation.
+3. Review remaining §45 checklist for any unproven claims; consider stopping
+   the loop if the plan's V1 surface is fully covered and hardened.
 
 **Built:**
 - `apps/gateway/alerts.py`: declarative ALERT_RULES over audit actions —

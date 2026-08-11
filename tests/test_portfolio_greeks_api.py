@@ -388,7 +388,11 @@ async def test_gate_chain_greek_breach_rejects_with_vol_multiplier_detail(client
     ticker = "GW"
     r = await client.post("/api/watchlist", json={"ticker": ticker})
     assert r.status_code == 201
-    r = await client.post("/api/trading-pool", json={"ticker": ticker})
+    # acknowledge_risks: the ticker has no stored history/backtest at promote
+    # time, so the §4.3 promotion checks fail and need an explicit override.
+    r = await client.post(
+        "/api/trading-pool", json={"ticker": ticker, "acknowledge_risks": True}
+    )
     assert r.status_code == 201
     r = await client.post(f"/api/trading-pool/{ticker}/trading", json={"enabled": True})
     assert r.status_code == 200

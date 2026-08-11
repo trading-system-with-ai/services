@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     # mid. A parameter, never a hardcoded truth (plan §6.2).
     paper_commission_per_contract: float = 0.65
 
+    # Automated position monitor (plan §26): seconds between background exit
+    # sweeps run by apps/gateway/monitor.py. 0 disables the background task
+    # entirely (the manual POST /api/positions/check-exits path always
+    # remains). A parameter, never a hardcoded truth (plan §6.2).
+    position_monitor_interval_seconds: int = 300
+
 
 @lru_cache
 def get_settings() -> Settings:

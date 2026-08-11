@@ -36,6 +36,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from libs.common.config import get_settings
 from libs.trading_core.exits import (
     ExitDecision,
     OptionState,
@@ -344,13 +345,58 @@ async def check_exits(session: AsyncSession = Depends(get_session)) -> dict:
     outranks the pause (§18 risk-priority). Runs under the paper-execution
     lock shared with approve/close, so a concurrent manual close can never
     double-sell the same position (§42 analogue).
+
+    The whole flow lives in :func:`run_exit_sweep`, shared verbatim with the
+    background position monitor (apps/gateway/monitor.py) — one sweep
+    implementation, two triggers (plan §21 spirit: never reimplement).
+    """
+    return await run_exit_sweep(session)
+
+
+@router.get("/monitor")
+async def monitor_status() -> dict:
+    """Status of the automated position monitor (plan §26, §44 rule 18).
+
+    ``enabled`` is honest: True only when the configured interval is > 0 AND
+    the background task actually started (lifespan ran). Under test
+    transports (httpx ASGITransport) lifespan never runs, so this reports
+    ``enabled: false`` with null sweep fields rather than pretending a
+    monitor is running.
+    """
+    # Local import: monitor.py imports run_exit_sweep from this module, so a
+    # module-level import here would be circular.
+    from .. import monitor
+
+    interval = get_settings().position_monitor_interval_seconds
+    state = monitor.STATE
+    return {
+        "enabled": interval > 0 and state.enabled,
+        "interval_seconds": interval,
+        "last_sweep_at": (
+            state.last_sweep_at.isoformat() if state.last_sweep_at else None
+        ),
+        "sweeps_total": state.sweeps_total,
+        "last_result": state.last_result,
+    }
+
+
+async def run_exit_sweep(session: AsyncSession) -> dict:
+    """One full exit sweep: evaluate + execute §11 exits, then COMMIT.
+
+    The single sweep implementation shared by POST /check-exits and the
+    background monitor loop (apps/gateway/monitor.py). Takes the
+    paper-execution lock (never double-sells against a concurrent manual
+    close/approve) and commits the transaction itself — triggered exits,
+    their EXIT_GENERATED + ORDER_* audit events and the position/cash
+    mutations land atomically (rule 12). Returns
+    ``{"checked": int, "exits_triggered": [...], "held": [...]}``.
     """
     async with execution_lock():
-        return await _check_exits_locked(session)
+        return await _run_exit_sweep_locked(session)
 
 
-async def _check_exits_locked(session: AsyncSession) -> dict:
-    """The check-exits flow proper — caller holds the paper-execution lock."""
+async def _run_exit_sweep_locked(session: AsyncSession) -> dict:
+    """The exit-sweep flow proper — caller holds the paper-execution lock."""
     positions = (
         (
             await session.execute(

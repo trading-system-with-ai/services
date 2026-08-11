@@ -11,6 +11,7 @@ counter/histogram samples labeled by the ROUTE TEMPLATE — never the concrete
 URL — so label cardinality stays bounded. ``GET /metrics`` renders the whole
 in-process registry in Prometheus text format.
 """
+import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -27,6 +28,7 @@ from libs.common.config import get_settings
 from libs.common.logging import setup_logging
 from libs.common.telemetry import REGISTRY, request_id_var
 
+from . import monitor
 from .db import StockBarDaily, WatchlistItem, get_session, init_db
 from .routers import (
     alerts,
@@ -92,7 +94,26 @@ _http_logger = logging.getLogger("http")
 async def lifespan(app: FastAPI):
     setup_logging()
     await init_db()
-    yield
+    # Automated position monitor (plan §26): a background task, started only
+    # when the configured interval is > 0 (0 disables it). NOTE: test suites
+    # drive the app through httpx ASGITransport, which does NOT run lifespan —
+    # the monitor task never starts under tests, GET /api/positions/monitor
+    # honestly reports enabled=false there, and the sweep core is tested
+    # directly (tests/test_position_monitor_auto.py).
+    monitor_task: asyncio.Task | None = None
+    if get_settings().position_monitor_interval_seconds > 0:
+        monitor_task = asyncio.create_task(monitor.monitor_loop())
+    try:
+        yield
+    finally:
+        # Graceful shutdown (§26): cancel and AWAIT the task so an in-flight
+        # sweep's cancellation fully unwinds before the process exits.
+        if monitor_task is not None:
+            monitor_task.cancel()
+            try:
+                await monitor_task
+            except asyncio.CancelledError:
+                pass
 
 
 async def _refresh_freshness_gauges(session: AsyncSession) -> None:

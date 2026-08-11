@@ -24,7 +24,11 @@ async def authorize(client, ticker, *, enable_symbol=True, resume=True):
     """Watchlist -> Trading Pool (-> per-symbol enable) (-> global resume)."""
     r = await client.post("/api/watchlist", json={"ticker": ticker})
     assert r.status_code == 201
-    r = await client.post("/api/trading-pool", json={"ticker": ticker})
+    # acknowledge_risks: the ticker has no stored history/backtest at promote
+    # time, so the §4.3 promotion checks fail and need an explicit override.
+    r = await client.post(
+        "/api/trading-pool", json={"ticker": ticker, "acknowledge_risks": True}
+    )
     assert r.status_code == 201
     if enable_symbol:
         r = await client.post(

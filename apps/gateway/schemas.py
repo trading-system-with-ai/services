@@ -42,6 +42,26 @@ class TradingPoolItemOut(BaseModel):
 class TradingPoolAddRequest(TickerRequest):
     # V1 account constraints: long-only defined-risk instruments
     allowed_strategies: list[str] = ["LONG_STOCK", "LONG_CALL", "LONG_PUT"]
+    # §4.3: a promotion whose readiness checks fail may still proceed when the
+    # user explicitly acknowledges the risk characteristics — the override is
+    # recorded permanently in the TRADING_POOL_ADD audit details.
+    acknowledge_risks: bool = False
+
+
+class PromotionCheck(BaseModel):
+    """One §4.3 promotion readiness check result (honest detail, §44 rule 18)."""
+
+    name: str
+    passed: bool
+    detail: str
+
+
+class TradingPoolPromotedOut(TradingPoolItemOut):
+    """POST /api/trading-pool response: the created row plus the §4.3
+    promotion-check results and whether the user overrode failures."""
+
+    promotion_checks: list[PromotionCheck]
+    risks_acknowledged: bool
 
 
 class TradingToggleRequest(BaseModel):

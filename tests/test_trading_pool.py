@@ -9,7 +9,11 @@ async def test_non_watchlist_symbol_cannot_enter_trading_pool(client):
 
 async def test_promotion_starts_with_trading_disabled(client):
     await client.post("/api/watchlist", json={"ticker": "NVDA"})
-    r = await client.post("/api/trading-pool", json={"ticker": "NVDA"})
+    # acknowledge_risks: NVDA has no stored history/backtest here, so the §4.3
+    # promotion checks fail and the promotion needs an explicit acknowledgement.
+    r = await client.post(
+        "/api/trading-pool", json={"ticker": "NVDA", "acknowledge_risks": True}
+    )
     assert r.status_code == 201
     assert r.json()["trading_enabled"] is False  # authorization != immediate purchase
 
@@ -30,7 +34,10 @@ async def test_short_strategies_rejected_by_account_constraints(client):
 
 async def test_trading_toggle_is_audited(client):
     await client.post("/api/watchlist", json={"ticker": "NVDA"})
-    await client.post("/api/trading-pool", json={"ticker": "NVDA"})
+    # acknowledge_risks: no stored history/backtest -> §4.3 checks fail.
+    await client.post(
+        "/api/trading-pool", json={"ticker": "NVDA", "acknowledge_risks": True}
+    )
     r = await client.post("/api/trading-pool/NVDA/trading", json={"enabled": True})
     assert r.json()["trading_enabled"] is True
 
@@ -41,7 +48,10 @@ async def test_trading_toggle_is_audited(client):
 
 async def test_watchlist_removal_cascades_out_of_trading_pool(client):
     await client.post("/api/watchlist", json={"ticker": "NVDA"})
-    await client.post("/api/trading-pool", json={"ticker": "NVDA"})
+    # acknowledge_risks: no stored history/backtest -> §4.3 checks fail.
+    await client.post(
+        "/api/trading-pool", json={"ticker": "NVDA", "acknowledge_risks": True}
+    )
 
     await client.delete("/api/watchlist/NVDA")
 
