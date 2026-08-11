@@ -25,6 +25,12 @@ therefore logs one WARNING per attempt and returns without touching a single
 position, leaving the loop alive and quiet-ish (one line per tick, no
 traceback, no crash loop) until a provider is configured.
 
+NO BROKER, NO SWEEP either — for the mirror-image reason. Exits SELL, and with
+no execution venue configured there is nowhere to send the sell; "closing" the
+position would move a local row while the broker still held the real one. That
+skip is enforced inside ``run_exit_sweep`` (shared with the manual endpoint, so
+neither trigger can forget it) and is likewise not counted as a sweep here.
+
 NOTE for tests: httpx ASGITransport does not run the app lifespan, so the
 loop never starts there — GET /api/positions/monitor then honestly reports
 ``enabled: false`` (§44 rule 18) and tests drive :func:`run_sweep_and_update`
@@ -109,6 +115,12 @@ async def run_sweep_and_update() -> dict:
         }
     async with SessionLocal() as session:
         result = await run_exit_sweep(session)
+    if "skipped" in result:
+        # The sweep declined to run (no execution venue — see run_exit_sweep,
+        # which logged its own WARNING). Nothing was swept, so nothing is
+        # counted: STATE and the telemetry counters stay exactly where they
+        # were, same as the no-market-data skip above.
+        return result
     exits = len(result["exits_triggered"])
     STATE.last_sweep_at = datetime.now(timezone.utc)
     STATE.sweeps_total += 1

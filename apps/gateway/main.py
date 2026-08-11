@@ -35,6 +35,7 @@ from .routers import (
     analysis,
     audit_log,
     backtests,
+    broker,
     config,
     health,
     market,
@@ -227,6 +228,7 @@ def create_app() -> FastAPI:
     app.include_router(recommendations.router)
     app.include_router(audit_log.router)
     app.include_router(alerts.router)
+    app.include_router(broker.router)
     app.include_router(config.router)
     return app
 

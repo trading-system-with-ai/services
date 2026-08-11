@@ -12,9 +12,15 @@ PAPER ONLY. THIS IS THE WHOLE POINT OF THE CLASS.
 Live trading must be impossible to reach by configuration alone, so the guard
 is applied twice, at two different layers:
 
-1. **Construction** rejects any base URL whose host is not the paper host
-   (:data:`PAPER_HOST`). Passing ``api.alpaca.markets``, or any other host,
-   raises ``ValueError`` naming the host. There is no flag, no environment
+1. **Construction** PARSES the base URL and rejects it unless every component
+   checks out: the host must equal the paper host (:data:`PAPER_HOST`)
+   exactly, the scheme must be ``https`` (credentials never cross the network
+   in cleartext) and no non-443 port may be given. The comparison is on the
+   PARSED host, never a substring match, so decoration cannot smuggle the live
+   host through — ``https://paper-api.alpaca.markets@api.alpaca.markets``
+   parses to host ``api.alpaca.markets`` and is refused, as is
+   ``https://API.ALPACA.MARKETS`` and ``https://paper-api.alpaca.markets.evil.com``.
+   The accepted URL is then stored NORMALISED. There is no flag, no environment
    variable and no settings field that disables this check — going live would
    require editing this module, which is exactly the friction we want.
 2. **Every submission** re-reads the account and refuses unless the broker
@@ -35,7 +41,7 @@ Failure policy:
 Credentials are never logged. The request logger redacts both header values.
 """
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from urllib.parse import urlparse
 
 import httpx
@@ -127,6 +133,34 @@ def _to_int(value: object, default: int = 0) -> int:
     return default if parsed is None else int(parsed)
 
 
+def occ_option_symbol(
+    underlying: str, expiry: date, strike: float, right: str
+) -> str:
+    """Build the OCC 21-character option symbol Alpaca expects.
+
+    Layout: ``ROOT`` left-justified to 6 chars, ``YYMMDD`` expiry, ``C``/``P``,
+    then the strike in thousandths zero-padded to 8 digits — e.g. a 2026-09-18
+    NVDA 150 call is ``NVDA  260918C00150000``.
+
+    Options ride the SAME ``POST /v2/orders`` endpoint as equities; only the
+    symbol format and the contract-vs-share unit differ, which is why this is a
+    symbol helper rather than a second code path.
+
+    The strike is rounded to the nearest tenth of a cent before scaling: a
+    float like 150.0000000001 must not become ``00150000`` off-by-one and
+    silently address a strike that does not exist.
+    """
+    root = underlying.strip().upper()
+    if not root or len(root) > 6:
+        raise ValueError(f"invalid option underlying {underlying!r} (1-6 chars)")
+    if right not in ("C", "P"):
+        raise ValueError(f"option right must be 'C' or 'P', got {right!r}")
+    if strike <= 0:
+        raise ValueError(f"option strike must be > 0, got {strike!r}")
+    thousandths = int(round(round(strike, 4) * 1000))
+    return f"{root:<6}{expiry.strftime('%y%m%d')}{right}{thousandths:08d}"
+
+
 def _parse_timestamp(value: object) -> datetime:
     """Parse an Alpaca RFC-3339 timestamp; fall back to now(UTC) if unusable.
 
@@ -178,17 +212,47 @@ class AlpacaPaperBroker:
                 "(settings.alpaca_api_secret); the broker is never used keyless"
             )
 
-        host = urlparse(base_url).hostname or base_url
+        # PAPER-ONLY GUARD, layer 1. The URL is PARSED and its components are
+        # compared exactly — never substring-matched — so no amount of
+        # decoration can smuggle the live host past this check. urlparse
+        # already lowercases the hostname and strips userinfo, which is what
+        # makes "https://paper-api.alpaca.markets@api.alpaca.markets" (host:
+        # api.alpaca.markets) and "https://API.ALPACA.MARKETS" both fail here.
+        parsed = urlparse(base_url)
+        host = parsed.hostname or base_url
         if host != PAPER_HOST:
             raise ValueError(
                 f"AlpacaPaperBroker refuses non-paper host {host!r}: this "
                 f"adapter is PAPER ONLY and talks to {PAPER_HOST!r} exclusively. "
                 "Live trading is not reachable by configuration."
             )
+        # HTTPS ONLY. The host check alone would still permit
+        # "http://paper-api.alpaca.markets", which sends the API key and
+        # secret across the network in CLEARTEXT. Credentials are the one
+        # thing this adapter must never leak, so the scheme is an invariant
+        # too, not a preference.
+        if parsed.scheme != "https":
+            raise ValueError(
+                f"AlpacaPaperBroker refuses scheme {parsed.scheme!r}: the "
+                "Alpaca API is HTTPS only and the API key/secret must never "
+                "cross the network in cleartext."
+            )
+        # No custom port. The paper host serves HTTPS on 443; an explicit port
+        # on the real hostname is not something a legitimate configuration
+        # needs, and allowing it widens the target for no benefit.
+        if parsed.port is not None and parsed.port != 443:
+            raise ValueError(
+                f"AlpacaPaperBroker refuses port {parsed.port}: {PAPER_HOST!r} "
+                "is reached on the default HTTPS port only."
+            )
 
         self.api_key = api_key
         self.api_secret = api_secret
-        self.base_url = base_url.rstrip("/")
+        # Normalise: the guard compared parsed components, so store a canonical
+        # URL rather than whatever spelling was supplied. This keeps the
+        # request log, the error text and any future host comparison reading
+        # the same string a case-variant spelling would otherwise fork.
+        self.base_url = f"https://{PAPER_HOST}{parsed.path.rstrip('/')}"
         self.timeout_seconds = timeout_seconds
         self._transport = transport
 

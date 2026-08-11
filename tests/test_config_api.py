@@ -51,6 +51,11 @@ async def test_values_match_real_dataclasses(client):
         "llm": settings.llm_provider,
         "llm_configured": True,
         "llm_model": settings.llm_model,
+        # The execution venue, same shape as the data providers. The fixture
+        # opts into BROKER_PROVIDER=simulated (internal fills, dev only) —
+        # there is no default venue either (§44 rule 18).
+        "broker": settings.broker_provider,
+        "broker_configured": True,
     }
 
     perms = AccountPermissions()

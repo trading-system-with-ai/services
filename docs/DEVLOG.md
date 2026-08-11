@@ -1,5 +1,49 @@
 # Development Log — Backend
 
+## 2026-08-10 — Alpaca paper broker (long stock + long options)
+
+Real execution, paper only. `libs/broker/` mirrors the market-data provider
+shape (Protocol + registry + `BrokerNotConfigured`); `AlpacaPaperBroker` talks
+Trading API v2 over raw httpx. Gateway wiring in `apps/gateway/broker_exec.py`
++ `deps.py`: `BROKER_PROVIDER` defaults to `""`, approve/close 503, and the
+exit sweep SKIPS — no silent fallback to the internal simulator, which stays
+reachable only as the explicit `simulated` value.
+
+**Live trading is unreachable by configuration.** Two layers: the constructor
+parses the URL and demands scheme `https`, host exactly
+`paper-api.alpaca.markets`, port 443 (any accepted spelling is normalised, so
+userinfo decoys are discarded rather than carried into requests); then every
+`submit_order` re-reads `GET /v2/account` and refuses unless the broker itself
+reports `is_paper`. The adversarial verifier attacked this with 18 URL
+variants and **found two real holes** — `http://` was accepted (API key in
+cleartext) and `:8080` on the real host was accepted. Both fixed and pinned by
+an 11-case matrix.
+
+**Options are Level 3 long calls/puts** — the user's account permits them, so
+the workflow's original "broker is stock-only, 422 on options" restriction was
+removed as soon as that was known. Options ride the same `POST /v2/orders`
+endpoint addressed by `occ_option_symbol()` (6-char padded root + YYMMDD +
+C/P + strike in thousandths, rounded before scaling so float noise cannot
+address a neighbouring strike). Wiring the symbol surfaced three arithmetic
+bugs the tests then pinned: the position row was written `LONG_STOCK` with no
+`opt_*` fields (so it could never have been closed — the close path rebuilds
+the OCC symbol from exactly those columns), and both the buy debit and the
+sell credit were missing the ×100 multiplier. An end-to-end round trip now
+asserts cash reconciles exactly: 2 contracts 4.20 → 6.50 leaves the account
+$460 richer, not $4.60.
+
+Still long-only (§5): no Sell-to-Open exists anywhere, so covered calls,
+CSPs and spreads remain out of scope — they need short legs, new max-loss
+models and new exit families (Phase 9, not a flag).
+
+Reconciliation (`GET /api/broker/reconcile`) compares broker positions/cash
+against local rows, and a mismatch pauses trading per §18 rather than
+auto-correcting — a test proves the pause has teeth (the next approve is
+blocked by the kill switch).
+
+Full suite: 769 passed, 1 skipped.
+
+
 ## 2026-08-10 — OpenAI LLM provider
 
 The user chose OpenAI for recommendations. `.env.example` alone could not

@@ -116,6 +116,64 @@ def test_non_paper_refusal_message_states_paper_only():
         )
 
 
+# --- Adversarial: the live host cannot be smuggled past the guard ----------
+# The check compares the PARSED host, never a substring, so none of these
+# spellings of the live host may construct an adapter.
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://API.ALPACA.MARKETS",                        # case variant
+        "https://api.alpaca.markets/",                       # trailing slash
+        "https://api.alpaca.markets:443",                    # explicit port
+        "https://paper-api.alpaca.markets@api.alpaca.markets",  # userinfo decoy
+        "https://user:pw@api.alpaca.markets",                # credentialed
+        "https://api.alpaca.markets?x=paper-api.alpaca.markets",  # query decoy
+        "https://api.alpaca.markets#paper-api.alpaca.markets",    # fragment decoy
+        "https://evil.com/paper-api.alpaca.markets",         # host in the PATH
+        "https://paper-api.alpaca.markets.evil.com",         # lookalike suffix
+        "api.alpaca.markets",                                # bare, no scheme
+        "//api.alpaca.markets",                              # scheme-relative
+    ],
+)
+def test_live_host_cannot_be_smuggled_in_by_any_spelling(base_url):
+    with pytest.raises(ValueError):
+        AlpacaPaperBroker(api_key="k", api_secret="s", base_url=base_url)
+
+
+def test_plaintext_http_is_refused_so_credentials_never_travel_in_the_clear():
+    # The host is correct here — only the SCHEME is wrong. Allowing it would
+    # put the API key and secret on the wire in cleartext.
+    with pytest.raises(ValueError, match="cleartext"):
+        AlpacaPaperBroker(
+            api_key="k", api_secret="s", base_url="http://paper-api.alpaca.markets"
+        )
+
+
+def test_custom_port_on_the_paper_host_is_refused():
+    with pytest.raises(ValueError, match="port"):
+        AlpacaPaperBroker(
+            api_key="k", api_secret="s",
+            base_url="https://paper-api.alpaca.markets:8080",
+        )
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://paper-api.alpaca.markets",
+        "https://paper-api.alpaca.markets/",       # trailing slash
+        "https://PAPER-API.ALPACA.MARKETS",        # case variant of the PAPER host
+        "https://paper-api.alpaca.markets:443",    # the default port, spelled out
+    ],
+)
+def test_paper_host_spellings_are_accepted_and_normalised(base_url):
+    # Every accepted spelling collapses to ONE canonical URL, so nothing
+    # downstream (logging, comparison) has to know about spelling variants.
+    broker = AlpacaPaperBroker(api_key="k", api_secret="s", base_url=base_url)
+    assert broker.base_url == ALPACA_PAPER_BASE_URL
+
+
 # ---------------------------------------------------------------------------
 # PAPER-ONLY GUARD, layer 2: submit re-verifies is_paper with the broker
 # ---------------------------------------------------------------------------

@@ -101,7 +101,7 @@ transaction, so every decision is auditable (§38, rule 12).
 import asyncio
 import weakref
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -132,6 +132,7 @@ from libs.trading_core.risk import (
 from libs.trading_core.risk.engine import strength_tier
 from libs.trading_core.signals import RegimeParams, classify_regime, score_direction
 from libs.trading_core.strategies import AccountPermissions, select_instrument
+from libs.broker.alpaca import occ_option_symbol
 from libs.trading_core.volatility import VolRegimeParams, classify_vol_regime
 
 from .. import audit
@@ -1100,7 +1101,24 @@ async def execute_sell_to_close(
     REDUCES risk, and risk protection outranks the pause (§18 risk-priority).
     The side is SELL_TO_CLOSE — for options that is the ONLY closing action;
     Sell-to-Open does not exist in this system (§5).
+
+    EXECUTION VENUE (§11): everything above describes the internal simulator,
+    reached only under ``BROKER_PROVIDER=simulated``. With a real broker
+    configured the sell is SUBMITTED to the broker and the local rows follow
+    the broker's actual fill — see :func:`_sell_to_close_via_broker`. This is
+    the ONE sell implementation for manual closes AND mechanical exits alike:
+    an exit that moved local rows while the broker still held the position is
+    exactly the reconciliation failure §18 warns about.
     """
+    if not simulated_broker_mode():
+        return await _sell_to_close_via_broker(
+            session,
+            position,
+            quantity,
+            reason=reason,
+            system_generated=system_generated,
+        )
+
     settings = get_settings()
     is_option = is_option_position(position)
     multiplier = position.multiplier or 1
@@ -1200,6 +1218,283 @@ async def execute_sell_to_close(
             "commission": commission,
             "position_id": position.id,
             "realized_pnl": realized,
+        },
+    )
+    return order, realized
+
+
+
+async def _sell_to_close_via_broker(
+    session: AsyncSession,
+    position: Position,
+    quantity: int,
+    *,
+    reason: str | None = None,
+    system_generated: bool = False,
+) -> tuple[Order, float]:
+    """Sell-to-close `position` through the REAL broker (§11).
+
+    The broker half of :func:`execute_sell_to_close`, with the same contract:
+    records rows and audit events on the session and NEVER commits. The local
+    position shrinks by what ACTUALLY filled at the broker — never by what was
+    requested — so a partial exit leaves an honestly partial position rather
+    than a local flat against a broker long.
+
+    Realized PnL is computed against the broker's own ``filled_avg_price``. A
+    zero-fill leaves the position completely untouched and returns 0.0
+    realized: nothing was sold, so nothing may be booked.
+
+    Raises 502 on a broker fault and 422 on a rejection — an exit that the
+    broker refused MUST NOT quietly close the local row, or the two ledgers
+    diverge exactly as §18 warns.
+    """
+    ticker = position.ticker
+
+    # Close the SAME instrument that was opened: an option position is closed
+    # by selling its OCC contract symbol, never the underlying ticker (that
+    # would sell shares we do not hold — and this account is long-only, §5).
+    if is_option_position(position):
+        try:
+            broker_symbol = occ_option_symbol(
+                ticker,
+                date.fromisoformat(position.opt_expiry or ""),
+                float(position.opt_strike),
+                position.opt_right or "",
+            )
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"cannot build the OCC symbol to close position "
+                    f"{position.id} ({ticker}): {exc}. The position row is "
+                    "missing or has malformed contract fields; it cannot be "
+                    "closed at the broker until they are corrected."
+                ),
+            ) from exc
+    else:
+        broker_symbol = ticker
+
+    # NO SHORTING (§5), enforced at the submission boundary itself.
+    #
+    # Both callers already constrain the quantity — /close rejects an
+    # over-close before it gets here and the exit sweep always passes
+    # pos.quantity — so this is defence in depth, not a live bug. It lives
+    # HERE because this is the last point before a "sell" leaves the process:
+    # a sell larger than the open long would leave the account SHORT, which
+    # this platform must never be able to do, and that guarantee should not
+    # depend on every future caller remembering to check.
+    if quantity > position.quantity:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"refusing to sell {quantity} of {ticker} against an OPEN "
+                f"position of {position.quantity}: this account is long-only "
+                "and a sell may never exceed the position it closes (§5)"
+            ),
+        )
+
+    broker = resolve_broker()
+    client_order_id = new_client_order_id(f"stc-{position.id}")
+
+    await audit.record(
+        session,
+        actor_type=ActorType.SYSTEM if system_generated else ActorType.USER,
+        actor_id="" if system_generated else CURRENT_USER,
+        action=AuditAction.ORDER_REQUESTED,
+        entity_type="order",
+        entity_id=client_order_id,
+        details={
+            "ticker": ticker,
+            "instrument": position.instrument,
+            "broker_symbol": broker_symbol,
+            "side": SELL_TO_CLOSE,
+            "quantity": quantity,
+            "reason": reason,
+            "system_generated": system_generated,
+            "client_order_id": client_order_id,
+            "venue": get_settings().broker_provider,
+        },
+    )
+
+    try:
+        broker_order, adopted = await submit_and_poll(
+            broker, client_order_id, broker_symbol, SELL_TO_CLOSE, quantity
+        )
+    except BrokerRejected as exc:
+        await audit.record(
+            session,
+            actor_type=ActorType.SYSTEM,
+            action=AuditAction.ORDER_REJECTED,
+            entity_type="order",
+            entity_id=client_order_id,
+            details={
+                "ticker": ticker,
+                "side": SELL_TO_CLOSE,
+                "client_order_id": client_order_id,
+                "reason": str(exc),
+                "rejected_by": "broker",
+                "position_unchanged": True,
+            },
+        )
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "BROKER_REJECTED",
+                "message": (
+                    f"the broker rejected the closing order: {exc}. The "
+                    "position is UNCHANGED locally — it is still open at the "
+                    "broker too."
+                ),
+            },
+        ) from exc
+    except BrokerError as exc:
+        await audit.record(
+            session,
+            actor_type=ActorType.SYSTEM,
+            action=AuditAction.ORDER_SUBMITTED,
+            entity_type="order",
+            entity_id=client_order_id,
+            details={
+                "ticker": ticker,
+                "side": SELL_TO_CLOSE,
+                "client_order_id": client_order_id,
+                "error": str(exc),
+                "outcome": (
+                    "broker call FAILED — the closing order may or may not "
+                    "exist at the broker; the local position was NOT changed. "
+                    "Reconcile with GET /api/broker/reconcile."
+                ),
+            },
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "BROKER_ERROR",
+                "message": (
+                    f"the broker call failed: {exc}. The position was left "
+                    "untouched locally; reconcile before retrying."
+                ),
+            },
+        ) from exc
+
+    filled = broker_order.filled_quantity
+    fill_price = broker_order.filled_avg_price
+
+    order = Order(
+        client_order_id=client_order_id,
+        ticker=ticker,
+        instrument=position.instrument,
+        side=SELL_TO_CLOSE,
+        quantity=quantity,
+        fill_price=fill_price if fill_price is not None else 0.0,
+        commission=0.0,  # whatever the broker charged; Alpaca paper: none
+        status=broker_order.status,
+        broker_order_id=broker_order.broker_order_id or None,
+        broker_status=broker_order.raw_status[:24] if broker_order.raw_status else None,
+        filled_quantity=filled,
+    )
+    session.add(order)
+    await session.flush()
+
+    await audit.record(
+        session,
+        actor_type=ActorType.SYSTEM,
+        action=AuditAction.ORDER_SUBMITTED,
+        entity_type="order",
+        entity_id=str(order.id),
+        details={
+            "fill_model": (
+                "broker: quantity, price and status are the BROKER's — no "
+                "internal fill model runs on this path"
+            ),
+            "venue": get_settings().broker_provider,
+            **broker_order_details(broker_order, adopted=adopted),
+        },
+    )
+
+    if broker_order.status == "REJECTED":
+        await audit.record(
+            session,
+            actor_type=ActorType.SYSTEM,
+            action=AuditAction.ORDER_REJECTED,
+            entity_type="order",
+            entity_id=str(order.id),
+            details={
+                "ticker": ticker,
+                "side": SELL_TO_CLOSE,
+                "reason": (
+                    f"the broker settled the closing order as "
+                    f"{broker_order.raw_status!r}"
+                ),
+                "rejected_by": "broker",
+                "position_unchanged": True,
+                **broker_order_details(broker_order, adopted=adopted),
+            },
+        )
+        return order, 0.0
+
+    if filled <= 0 or fill_price is None:
+        # NOTHING SOLD. The position stays exactly as it was — shrinking it
+        # here would create a local flat against a real broker long, which is
+        # the precise divergence the reconciliation kill switch exists for.
+        await audit.record(
+            session,
+            actor_type=ActorType.SYSTEM,
+            action=AuditAction.ORDER_SUBMITTED,
+            entity_type="order",
+            entity_id=str(order.id),
+            details={
+                "outcome": (
+                    "no quantity filled — the position is UNCHANGED and no "
+                    "cash moved. The closing order stands at the broker in "
+                    f"status {broker_order.raw_status!r}."
+                ),
+                "filled_quantity": filled,
+                **broker_order_details(broker_order, adopted=adopted),
+            },
+        )
+        return order, 0.0
+
+    # Options are quoted PER SHARE and trade in 100-share contracts, so both
+    # the cash credited and the realized P&L carry the position's multiplier.
+    # Dropping it here would credit an option close at 1/100th of its value.
+    multiplier = position.multiplier or 1
+    proceeds = filled * fill_price * multiplier
+    realized = (fill_price - position.avg_price) * filled * multiplier
+
+    portfolio = await get_or_create_portfolio(session)
+    portfolio.cash += proceeds
+    portfolio.updated_at = utcnow()
+
+    remaining = position.quantity - filled
+    position.max_loss = (
+        position.max_loss * remaining / position.quantity
+        if position.quantity > 0
+        else 0.0
+    )
+    position.quantity = remaining
+    position.realized_pnl = (position.realized_pnl or 0.0) + realized
+    if remaining <= 0:
+        position.status = POSITION_CLOSED
+        position.closed_at = utcnow()
+        position.max_loss = 0.0
+
+    await audit.record(
+        session,
+        actor_type=ActorType.SYSTEM,
+        action=AuditAction.ORDER_FILLED,
+        entity_type="order",
+        entity_id=str(order.id),
+        details={
+            "fill_price": fill_price,
+            "filled_quantity": filled,
+            "requested_quantity": quantity,
+            "partial": filled < quantity,
+            "commission": 0.0,
+            "position_id": position.id,
+            "realized_pnl": realized,
+            "cash_credited": proceeds,
+            **broker_order_details(broker_order, adopted=adopted),
         },
     )
     return order, realized
@@ -1496,6 +1791,348 @@ async def _approve_order_locked(
     }
 
 
+# ---------------------------------------------------------------------------
+# Real broker execution (plan §11) — the BUY_TO_OPEN half.
+# ---------------------------------------------------------------------------
+
+# The 422 message for an instrument with no broker representation. LONG_STOCK,
+# LONG_CALL and LONG_PUT all execute at the broker (options as OCC symbols on
+# the same endpoint); anything else does not exist in this long-only platform
+# (§5) and is refused rather than approximated.
+BROKER_INSTRUMENT_UNSUPPORTED = (
+    "{instrument} cannot be executed at the broker: this platform is long-only "
+    "(§5) and submits LONG_STOCK, LONG_CALL and LONG_PUT. The §8 matrix "
+    "selected {instrument} for {ticker}."
+)
+
+
+async def _approve_via_broker(
+    session: AsyncSession, req: OrderApproveRequest, chain: GateChainResult, quantity: int
+) -> dict:
+    """Submit an approved BUY_TO_OPEN to the real broker and record the truth.
+
+    Called with the §10 chain already PASSED, the risk-approved quantity fixed
+    and the shared execution lock held. What happens from here is the broker's
+    to decide; this function's whole job is to record what it decided without
+    embellishment:
+
+    - the order row is written with the broker's id, its RAW status and the
+      ACTUALLY filled quantity;
+    - a position opens ONLY for quantity that actually filled, at the broker's
+      own ``filled_avg_price`` — never at a modelled price;
+    - a zero-fill ACCEPTED order writes the order row, opens NO position, moves
+      NO cash, and is audited as exactly that;
+    - a rejection writes no position and audits ORDER_REJECTED with the
+      broker's own reason.
+
+    Idempotency spans the network (§42): our ``client_order_id`` goes to the
+    broker as its client_order_id and an order it already holds under that key
+    is ADOPTED rather than submitted twice. When the caller supplied no key,
+    one is generated here and stored, so the order remains recognisable after a
+    lost response.
+
+    NO LOCAL FILL-TIME CASH GUARD, deliberately. The simulated path re-checks
+    cash because it invents the price and could otherwise overdraw a number
+    only it controls. Here the §13 cash floor was already enforced by
+    RISK_APPROVAL, and the BROKER owns buying power: an order it cannot fund is
+    rejected by the broker itself and arrives as a :class:`BrokerRejected`.
+    Refusing locally on our own cash figure would refuse orders the broker
+    would happily fill — and our cash figure is precisely the number
+    reconciliation exists to check, so it is the wrong thing to arbitrate on.
+
+    Commits its own transaction — the chain's RISK_DECISION, the order row, any
+    position and every ORDER_* audit event land together (rule 12).
+    """
+    ticker = req.ticker
+
+    # LONG_STOCK trades the ticker; LONG_CALL/LONG_PUT trade an OCC contract
+    # symbol on the SAME endpoint. Anything else has no broker representation
+    # in this long-only platform (§5) and is refused before submission, with
+    # the veto's RISK_DECISION still auditable.
+    contract = chain.contract
+    if contract is None:
+        broker_symbol = ticker
+        instrument = InstrumentType.LONG_STOCK.value
+    elif chain.instrument in (
+        InstrumentType.LONG_CALL.value,
+        InstrumentType.LONG_PUT.value,
+    ):
+        instrument = chain.instrument
+        try:
+            broker_symbol = occ_option_symbol(
+                ticker, contract.expiry, contract.strike, contract.right
+            )
+        except ValueError as exc:
+            await session.commit()
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": (
+                        f"cannot build an OCC option symbol for {ticker}: {exc}"
+                    ),
+                    "preview": chain.preview,
+                },
+            ) from exc
+    else:
+        await session.commit()
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": BROKER_INSTRUMENT_UNSUPPORTED.format(
+                    instrument=chain.instrument, ticker=ticker
+                ),
+                "preview": chain.preview,
+            },
+        )
+
+    broker = resolve_broker()
+    client_order_id = req.client_order_id or new_client_order_id("bto")
+
+    await audit.record(
+        session,
+        actor_type=ActorType.USER,
+        actor_id=CURRENT_USER,
+        action=AuditAction.ORDER_REQUESTED,
+        entity_type="order",
+        entity_id=client_order_id,
+        details={
+            "ticker": ticker,
+            "instrument": instrument,
+            # The exact string sent to the broker — for an option this is the
+            # OCC symbol, so the audit trail identifies the actual contract.
+            "broker_symbol": broker_symbol,
+            "side": BUY_TO_OPEN,
+            "quantity_requested": req.quantity,
+            "quantity_submitted": quantity,
+            "client_order_id": client_order_id,
+            "venue": get_settings().broker_provider,
+        },
+    )
+
+    try:
+        broker_order, adopted = await submit_and_poll(
+            broker, client_order_id, broker_symbol, BUY_TO_OPEN, quantity
+        )
+    except BrokerRejected as exc:
+        # A business rejection: the broker's answer was "no". Audited with the
+        # broker's own reason, no position, no cash movement.
+        await audit.record(
+            session,
+            actor_type=ActorType.SYSTEM,
+            action=AuditAction.ORDER_REJECTED,
+            entity_type="order",
+            entity_id=client_order_id,
+            details={
+                "ticker": ticker,
+                "client_order_id": client_order_id,
+                "reason": str(exc),
+                "rejected_by": "broker",
+            },
+        )
+        await session.commit()
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": f"the broker rejected the order: {exc}",
+                "preview": chain.preview,
+            },
+        ) from exc
+    except BrokerError as exc:
+        # A FAULT, not a decision: the order may or may not exist at the
+        # broker. We must not claim either. Nothing local is written beyond the
+        # request audit, and reconciliation is the backstop.
+        await audit.record(
+            session,
+            actor_type=ActorType.SYSTEM,
+            action=AuditAction.ORDER_SUBMITTED,
+            entity_type="order",
+            entity_id=client_order_id,
+            details={
+                "ticker": ticker,
+                "client_order_id": client_order_id,
+                "error": str(exc),
+                "outcome": (
+                    "broker call FAILED — the order may or may not exist at "
+                    "the broker; no local row was written. Reconcile with "
+                    "GET /api/broker/reconcile."
+                ),
+            },
+        )
+        await session.commit()
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "BROKER_ERROR",
+                "message": (
+                    f"the broker call failed: {exc}. The order may or may not "
+                    "have reached the broker — nothing was recorded locally; "
+                    "reconcile before retrying."
+                ),
+            },
+        ) from exc
+
+    filled = broker_order.filled_quantity
+    fill_price = broker_order.filled_avg_price
+
+    order = Order(
+        client_order_id=client_order_id,
+        ticker=ticker,
+        instrument=instrument,
+        # opt_* identify WHICH contract traded; None for stock. Without these
+        # the position could not later be closed at the broker (the close path
+        # rebuilds the OCC symbol from exactly these three fields).
+        opt_expiry=contract.expiry.isoformat() if contract is not None else None,
+        opt_strike=contract.strike if contract is not None else None,
+        opt_right=contract.right if contract is not None else None,
+        side=BUY_TO_OPEN,
+        quantity=quantity,
+        # No modelled price EVER lands here: an unfilled order's fill_price is
+        # 0.0 because nothing was paid, not because we guessed.
+        fill_price=fill_price if fill_price is not None else 0.0,
+        # Commission is whatever the broker charged. Alpaca paper charges none
+        # and reports none, so claiming the internal per-share model's number
+        # would be inventing a cost that was not incurred.
+        commission=0.0,
+        status=broker_order.status,
+        broker_order_id=broker_order.broker_order_id or None,
+        broker_status=broker_order.raw_status[:24] if broker_order.raw_status else None,
+        filled_quantity=filled,
+    )
+    session.add(order)
+    await session.flush()
+
+    await audit.record(
+        session,
+        actor_type=ActorType.SYSTEM,
+        action=AuditAction.ORDER_SUBMITTED,
+        entity_type="order",
+        entity_id=str(order.id),
+        details={
+            "fill_model": (
+                "broker: quantity, price and status are the BROKER's — no "
+                "internal fill model runs on this path"
+            ),
+            "venue": get_settings().broker_provider,
+            **broker_order_details(broker_order, adopted=adopted),
+        },
+    )
+
+    position: Position | None = None
+    if broker_order.status == "REJECTED":
+        # A rejection discovered by POLLING (not at submit time) is a stored
+        # order in a terminal state — recorded, audited, no position.
+        await audit.record(
+            session,
+            actor_type=ActorType.SYSTEM,
+            action=AuditAction.ORDER_REJECTED,
+            entity_type="order",
+            entity_id=str(order.id),
+            details={
+                "ticker": ticker,
+                "reason": (
+                    f"the broker settled the order as {broker_order.raw_status!r}"
+                ),
+                "rejected_by": "broker",
+                **broker_order_details(broker_order, adopted=adopted),
+            },
+        )
+    elif filled > 0 and fill_price is not None:
+        # A REAL fill: the position opens for the FILLED quantity at the
+        # BROKER's average price — never the requested quantity (§11).
+        #
+        # Options are priced PER SHARE but trade in 100-share contracts, so
+        # cash and max loss both carry the multiplier. For a long option the
+        # premium paid IS the max loss (§12.1); for stock it is the stop
+        # distance per share.
+        multiplier = 100 if contract is not None else 1
+        cost = filled * fill_price * multiplier
+        portfolio = await get_or_create_portfolio(session)
+        portfolio.cash -= cost
+        portfolio.updated_at = utcnow()
+        position = Position(
+            ticker=ticker,
+            instrument=instrument,
+            quantity=filled,
+            avg_price=fill_price,
+            multiplier=multiplier,
+            opt_expiry=contract.expiry.isoformat() if contract is not None else None,
+            opt_strike=contract.strike if contract is not None else None,
+            opt_right=contract.right if contract is not None else None,
+            max_loss=(
+                cost if contract is not None else filled * (chain.stop_distance or 0.0)
+            ),
+            # For options this is the per-share premium basis the §11.3
+            # premium stop measures against, not an underlying stop.
+            stop_distance=(
+                fill_price if contract is not None else (chain.stop_distance or 0.0)
+            ),
+            entry_edge=chain.edge,
+            entry_bar_date=chain.last_bar_date,
+            status=POSITION_OPEN,
+        )
+        session.add(position)
+        await session.flush()
+        await audit.record(
+            session,
+            actor_type=ActorType.SYSTEM,
+            action=AuditAction.ORDER_FILLED,
+            entity_type="order",
+            entity_id=str(order.id),
+            details={
+                "fill_price": fill_price,
+                "filled_quantity": filled,
+                "requested_quantity": quantity,
+                "partial": filled < quantity,
+                "commission": 0.0,
+                "position_id": position.id,
+                "cash_debited": cost,
+                **broker_order_details(broker_order, adopted=adopted),
+            },
+        )
+    else:
+        # ZERO FILL. The order is live (or settled unfilled) at the broker and
+        # nothing has happened yet: no position, no cash movement, and the
+        # audit says so in as many words rather than leaving a silent gap.
+        await audit.record(
+            session,
+            actor_type=ActorType.SYSTEM,
+            action=AuditAction.ORDER_SUBMITTED,
+            entity_type="order",
+            entity_id=str(order.id),
+            details={
+                "outcome": (
+                    "no quantity filled — NO position was opened and no cash "
+                    "moved. The order stands at the broker in status "
+                    f"{broker_order.raw_status!r}; whatever fills later is "
+                    "surfaced by GET /api/broker/reconcile."
+                ),
+                "filled_quantity": filled,
+                **broker_order_details(broker_order, adopted=adopted),
+            },
+        )
+
+    await session.commit()
+
+    return {
+        "order": _order_payload(order),
+        "position": (
+            {
+                "id": position.id,
+                "ticker": position.ticker,
+                "instrument": position.instrument,
+                "quantity": position.quantity,
+                "avg_price": position.avg_price,
+                "stop_price": position.avg_price - position.stop_distance,
+                "max_loss": position.max_loss,
+                "contract": None,
+            }
+            if position is not None
+            else None
+        ),
+        "preview": chain.preview,
+    }
+
+
 @router.post("/close")
 async def close_position(
     req: OrderCloseRequest, session: AsyncSession = Depends(get_session)
@@ -1519,14 +2156,25 @@ async def close_position(
     (rule 12), under the paper-execution lock so two rapid closes can never
     double-credit cash (§42 analogue).
 
+    EXECUTION VENUE (§11): the reference-price machinery above is the internal
+    simulator, reached only under ``BROKER_PROVIDER=simulated``. With a real
+    broker the sell is submitted to the broker and the position shrinks by what
+    ACTUALLY filled, at the broker's own average price — no reference price and
+    no slippage model are involved.
+
     503 ``MARKET_DATA_NOT_CONFIGURED`` when no market data provider is
     configured. Closing normally outranks the §18 kill switch because it
     reduces risk — but this is not a policy pause, it is the absence of a
     price. A fill must happen AT something, and booking realized PnL against
     an invented number would corrupt the ledger permanently. Refusing is the
     conservative answer: the position stays open and honest.
+
+    503 ``BROKER_NOT_CONFIGURED`` when no execution venue is configured, on the
+    same reasoning: with nowhere to send the sell, marking the position closed
+    locally would claim an exit that never happened. The position stays open.
     """
     require_market_data_provider()
+    require_broker()
     async with execution_lock():
         return await _close_position_locked(req, session)
 
@@ -1550,19 +2198,24 @@ async def _close_position_locked(
             ),
         )
 
-    if is_option_position(position):
-        reference, source = await option_close_reference(session, position)
-    else:
-        reference = await _last_stored_close(session, ticker)
-        source = "last stored close"
-        if reference is None:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"no stored bars for {ticker} — the paper fill model has no "
-                    "reference price (honest error, §44 rule 18)"
-                ),
-            )
+    # The reference price is the INTERNAL fill model's input. On the broker
+    # path there is nothing to reference — the broker sets the price — so it is
+    # neither computed nor required (0.0 is passed and ignored downstream).
+    reference, source = 0.0, "broker fill (no reference price used)"
+    if simulated_broker_mode():
+        if is_option_position(position):
+            reference, source = await option_close_reference(session, position)
+        else:
+            reference = await _last_stored_close(session, ticker)
+            source = "last stored close"
+            if reference is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"no stored bars for {ticker} — the paper fill model has no "
+                        "reference price (honest error, §44 rule 18)"
+                    ),
+                )
 
     order, realized = await execute_sell_to_close(
         session,

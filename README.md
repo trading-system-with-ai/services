@@ -46,7 +46,7 @@ Copy `.env.example` to `.env` for configuration. Never commit `.env`.
 
 ## Verification
 
-- `make test` — the full pytest suite (573 tests), sqlite-backed, no services needed.
+- `make test` — the full pytest suite (726 tests), sqlite-backed, no services needed.
 - `make verify` — tests + `docker compose config` validation + a YAML parse of
   `.github/workflows/ci.yml`, i.e. everything CI checks that can run locally.
 - Docker acceptance: `make up`, then hit `http://localhost:8000/health` and the UI on
@@ -67,8 +67,9 @@ time the `db` container initializes its volume (to re-run them from scratch:
   timescaledb` + tuning) and break `create_hypertable()` in 002. When adding
   `migrations/00X_*.sql`, add the matching volume line in `docker-compose.yml`.
 - `007_stock_bars_daily.sql` mirrors the ORM model
-  `apps/gateway/db.py::StockBarDaily` exactly (the gateway's `init_db()`
-  `create_all` is a dev convenience only). If the model changes, change the
+  `apps/gateway/db.py::StockBarDaily` exactly, and `009_broker.sql` mirrors the
+  broker columns on `apps/gateway/db.py::Order` (the gateway's `init_db()`
+  `create_all` is a dev convenience only). If a model changes, change the
   migration in the same commit.
 
 ### Frontend container

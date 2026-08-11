@@ -28,7 +28,7 @@ from libs.trading_core.signals import DirectionalParams, RegimeParams
 from libs.trading_core.strategies import AccountPermissions
 
 from ..db import get_or_create_system_state, get_session
-from ..deps import llm_configured, market_data_configured
+from ..deps import broker_configured, llm_configured, market_data_configured
 
 router = APIRouter(prefix="/api/config", tags=["config"])
 
@@ -73,6 +73,13 @@ async def get_config(session: AsyncSession = Depends(get_session)) -> dict:
             "llm": settings.llm_provider,
             "llm_configured": llm_configured(),
             "llm_model": settings.llm_model,
+            # The execution venue, same shape and same honesty as the two
+            # above: "" when unset (approve/close 503 and the exit sweep
+            # skips), "simulated" for internal fills (development only), or a
+            # real broker name. No credential material — the Alpaca key id and
+            # secret are never read here.
+            "broker": settings.broker_provider,
+            "broker_configured": broker_configured(),
         },
         "account_permissions": asdict(AccountPermissions()),
         "risk_limits": _risk_limits_payload(),

@@ -452,6 +452,11 @@ ALL_PROBED_ENDPOINTS = MARKET_DATA_ENDPOINTS + LLM_ENDPOINTS + [
     ("GET", "/api/health/strategy", None),
     ("GET", "/api/positions/monitor", None),
     ("GET", "/api/alerts", None),
+    # The broker surfaces: both must answer in the unconfigured state (they
+    # are how a user finds out WHY execution refused) without inventing an
+    # account, a position or a price to fill the silence.
+    ("GET", "/api/broker/status", None),
+    ("GET", "/api/broker/reconcile", None),
 ]
 
 

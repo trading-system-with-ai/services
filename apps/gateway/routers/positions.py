@@ -29,7 +29,20 @@ INTRINSIC value when the contract is missing from today's chain (documented
 in routers/orders.py). Mechanical exits are NOT blocked by the §18 kill
 switch: exits reduce risk, and risk protection outranks the pause (§18
 risk-priority).
+
+MECHANICAL EXITS USE THE SAME BROKER PATH AS MANUAL CLOSES (plan §11, §18).
+``execute_sell_to_close`` is the single sell implementation for both, so a
+triggered exit is submitted to the configured broker exactly like a
+user-initiated close. There is deliberately no local-only shortcut: an exit
+that flattened the local row while the broker still held the position is
+precisely the divergence the §18 reconciliation kill switch exists to catch,
+and it would be a silent one.
+
+NO BROKER, NO SWEEP: when no execution venue is configured the sweep SKIPS
+with a warning — like the no-market-data case — rather than closing positions
+locally. Closing a row we cannot actually sell would be a fabricated exit.
 """
+import logging
 from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -48,7 +61,13 @@ from libs.trading_core.models import ActorType, AuditAction
 
 from .. import audit
 from ..db import Position, StockBarDaily, get_session
-from ..deps import market_data_configured, require_market_data_provider
+from ..deps import (
+    BROKER_NOT_CONFIGURED,
+    broker_configured,
+    broker_unavailable_reason,
+    market_data_configured,
+    require_market_data_provider,
+)
 from .options import option_chain_or_none
 from .orders import (
     POSITION_OPEN,
@@ -60,6 +79,10 @@ from .orders import (
 )
 
 router = APIRouter(prefix="/api/positions", tags=["positions"])
+
+# Named "position_monitor" so a skipped sweep logs on the SAME logger whether
+# it was triggered by the endpoint or the background loop.
+logger = logging.getLogger("position_monitor")
 
 VALID_STATUS = ("OPEN", "CLOSED", "ALL")
 
@@ -390,6 +413,14 @@ async def check_exits(session: AsyncSession = Depends(get_session)) -> dict:
     configured: every exit rule is a comparison against a current price, so a
     sweep without market data could only ever act on invented numbers. Refusing
     to sweep is the safe answer — it changes nothing (§44 rule 18).
+
+    With no BROKER configured the sweep answers 200 with ``"skipped":
+    "BROKER_NOT_CONFIGURED"`` and changes nothing. It is a 200 rather than a
+    503 on purpose: unlike the market-data case, the caller asked "is anything
+    ready to exit, and if so exit it" and the honest answer is "nothing was
+    swept, here is why" — the same shape the background monitor reports. What
+    matters is what it does NOT do: close positions locally that it cannot sell
+    at the broker.
     """
     require_market_data_provider()
     return await run_exit_sweep(session)
@@ -431,8 +462,30 @@ async def run_exit_sweep(session: AsyncSession) -> dict:
     close/approve) and commits the transaction itself — triggered exits,
     their EXIT_GENERATED + ORDER_* audit events and the position/cash
     mutations land atomically (rule 12). Returns
-    ``{"checked": int, "exits_triggered": [...], "held": [...]}``.
+    ``{"checked": int, "exits_triggered": [...], "held": [...]}``, plus
+    ``"exits_failed": [...]`` when the broker refused or could not execute a
+    signalled exit — one position's failure never aborts the sweep, because
+    the other positions still deserve their protective exits.
+
+    SKIPS ENTIRELY when no execution venue is configured: no evaluation, no
+    position change, one WARNING, and ``"skipped": "BROKER_NOT_CONFIGURED"``
+    added to the result. An exit sweep exists to SELL; with nowhere to send
+    the sell, "closing" a position would only move a local row and leave the
+    broker holding the real thing (§18 reconciliation).
     """
+    if not broker_configured():
+        reason = broker_unavailable_reason()
+        logger.warning(
+            "exit_sweep_skipped_no_broker",
+            extra={"extra_fields": {"reason": reason}},
+        )
+        return {
+            "checked": 0,
+            "exits_triggered": [],
+            "held": [],
+            "skipped": BROKER_NOT_CONFIGURED,
+            "reason": reason,
+        }
     async with execution_lock():
         return await _run_exit_sweep_locked(session)
 
@@ -453,6 +506,11 @@ async def _run_exit_sweep_locked(session: AsyncSession) -> dict:
 
     exits_triggered: list[dict] = []
     held: list[dict] = []
+    # Exits the engine SIGNALLED but the broker did not execute (refused,
+    # unreachable, or filled nothing). Reported, never hidden: the position is
+    # still open at the broker AND locally, which is the honest state, but the
+    # user must be told the protective exit did not actually happen (§37).
+    failed: list[dict] = []
     for pos in positions:
         bars = await _stored_bars(session, pos.ticker)
         option_read = None
@@ -491,15 +549,45 @@ async def _run_exit_sweep_locked(session: AsyncSession) -> dict:
                 source = "intrinsic (contract missing from today's chain)"
         else:
             reference, source = bars[-1].close, "last stored close"
-        order, _realized = await execute_sell_to_close(
-            session,
-            pos,
-            pos.quantity,  # mechanical exits always close in full (§11)
-            reference,
-            reason=f"exit engine: {decision.triggered_rule}",
-            system_generated=True,
-            reference_source=source,
-        )
+        try:
+            order, _realized = await execute_sell_to_close(
+                session,
+                pos,
+                pos.quantity,  # mechanical exits always close in full (§11)
+                reference,
+                reason=f"exit engine: {decision.triggered_rule}",
+                system_generated=True,
+                reference_source=source,
+            )
+        except HTTPException as exc:
+            # One position's exit failed at the broker (a rejection, a fault,
+            # or an option the broker cannot trade). The sweep continues: the
+            # OTHER positions still deserve their protective exits, and
+            # aborting here would lose them all. The audit trail already
+            # carries the broker's own reason (written by the sell path).
+            detail = exc.detail
+            message = (
+                detail.get("message") if isinstance(detail, dict) else str(detail)
+            )
+            logger.warning(
+                "exit_execution_failed",
+                extra={
+                    "extra_fields": {
+                        "ticker": pos.ticker,
+                        "rule": decision.triggered_rule,
+                        "status_code": exc.status_code,
+                        "reason": message,
+                    }
+                },
+            )
+            failed.append(
+                {
+                    "ticker": pos.ticker,
+                    "rule": decision.triggered_rule,
+                    "reason": message,
+                }
+            )
+            continue
         exits_triggered.append(
             {
                 "ticker": pos.ticker,
@@ -509,8 +597,13 @@ async def _run_exit_sweep_locked(session: AsyncSession) -> dict:
         )
 
     await session.commit()
-    return {
+    result = {
         "checked": len(positions),
         "exits_triggered": exits_triggered,
         "held": held,
     }
+    if failed:
+        # Only present when something went wrong, so the common shape is
+        # unchanged — but never suppressed when it did.
+        result["exits_failed"] = failed
+    return result

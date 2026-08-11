@@ -2,16 +2,29 @@
 
 TWO CLIENTS, TWO WORLDS — the split matters, so it is spelled out here:
 
-- ``client`` runs with BOTH providers explicitly set to "stub". The stubs are
-  opt-in development/test providers (never defaults — see libs/common/config.py
-  and each stub's module docstring); setting them here is what lets the bulk of
-  the suite exercise the full pipeline end to end with deterministic data.
-- ``unconfigured_client`` runs with BOTH providers UNSET, which is the state a
-  fresh install starts in. tests/test_no_synthetic_data.py uses it to prove the
+- ``client`` runs with BOTH data providers explicitly set to "stub" and the
+  execution venue set to ``BROKER_PROVIDER=simulated``. All three are opt-in
+  development/test values (never defaults — see libs/common/config.py and each
+  stub's module docstring); setting them here is what lets the bulk of the
+  suite exercise the full pipeline end to end with deterministic data.
+- ``unconfigured_client`` runs with ALL THREE UNSET, which is the state a fresh
+  install starts in. tests/test_no_synthetic_data.py uses it to prove the
   platform shows NOTHING rather than synthetic numbers when Massive is not
   configured.
 
-Both fixtures set the environment AND clear the ``get_settings`` lru_cache
+WHY THE FIXTURE OWNS ``BROKER_PROVIDER=simulated`` (and not the call sites):
+execution now has no default venue either. With ``BROKER_PROVIDER`` unset,
+POST /api/orders/approve and POST /api/orders/close answer 503
+BROKER_NOT_CONFIGURED and the exit sweep skips — an unconfigured install places
+nothing and never falls back to the internal fill simulator. Every existing
+test that approves, closes or sweeps therefore needs to opt INTO the simulator
+explicitly, and it does so here, once, exactly the way MARKET_DATA_PROVIDER=stub
+is opted into. Under ``simulated`` the internal §11 paper fill model runs
+byte-identically to before the broker existed, so those tests' hand-computed
+fill arithmetic is unchanged. A test that wants the REAL broker path overrides
+the variable itself (see tests/test_broker_execution.py).
+
+All fixtures set the environment AND clear the ``get_settings`` lru_cache
 before and after the test, so a cached Settings object can never leak the wrong
 provider configuration into the next test.
 """
@@ -31,7 +44,7 @@ from libs.common.config import get_settings
 
 # Environment variables this module owns. Saved and restored around every test
 # so provider configuration never leaks between them.
-_PROVIDER_ENV_VARS = ("MARKET_DATA_PROVIDER", "LLM_PROVIDER")
+_PROVIDER_ENV_VARS = ("MARKET_DATA_PROVIDER", "LLM_PROVIDER", "BROKER_PROVIDER")
 
 
 def _apply_provider_env(values: dict[str, str | None]) -> dict[str, str | None]:
@@ -64,33 +77,41 @@ async def _client_with_providers(values: dict[str, str | None]):
 
 @pytest.fixture
 async def client():
-    """The full-pipeline client: both providers explicitly set to "stub".
+    """The full-pipeline client: data providers "stub", execution "simulated".
 
-    The stub providers are NOT defaults (an unconfigured install serves
-    nothing); this fixture opts into them so the suite can exercise every code
-    path against deterministic, reproducible synthetic data.
+    None of these three are defaults (an unconfigured install serves nothing
+    and places nothing); this fixture opts into all of them so the suite can
+    exercise every code path against deterministic, reproducible synthetic
+    data and internal fills. See the module docstring for why the broker opt-in
+    lives here rather than at the call sites.
     """
     async with _client_with_providers(
-        {"MARKET_DATA_PROVIDER": "stub", "LLM_PROVIDER": "stub"}
+        {
+            "MARKET_DATA_PROVIDER": "stub",
+            "LLM_PROVIDER": "stub",
+            "BROKER_PROVIDER": "simulated",
+        }
     ) as c:
         yield c
 
 
 @pytest.fixture
 async def unconfigured_client():
-    """A client with NO market data and NO LLM provider — a fresh install.
+    """A client with NO market data, NO LLM and NO broker — a fresh install.
 
     Used by tests/test_no_synthetic_data.py to prove the core guarantee: with
     Massive unconfigured, every market-facing endpoint 503s and no synthetic
-    price, bar, chain, greek or recommendation reaches the response body.
+    price, bar, chain, greek or recommendation reaches the response body — and
+    by tests/test_broker_execution.py for its execution counterpart: with no
+    broker, nothing is placed and nothing is closed.
 
-    Both variables are set to the EMPTY STRING rather than deleted: an
+    All three variables are set to the EMPTY STRING rather than deleted: an
     environment variable overrides ``.env``, so this pins the unconfigured
     state even on a developer machine whose real ``.env`` names a provider.
     Deleting them would let the local ``.env`` leak in and quietly turn this
     fixture into a configured one.
     """
     async with _client_with_providers(
-        {"MARKET_DATA_PROVIDER": "", "LLM_PROVIDER": ""}
+        {"MARKET_DATA_PROVIDER": "", "LLM_PROVIDER": "", "BROKER_PROVIDER": ""}
     ) as c:
         yield c
