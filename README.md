@@ -20,8 +20,10 @@ Portfolio allocates. Risk decides. Execution obeys. Exit protects. Audit explain
 
 ```text
 libs/
-  common/         config, structured logging (shared plumbing)
-  trading_core/   domain models, features, signals, strategies, risk, exits
+  common/         config, structured logging, telemetry (shared plumbing)
+  trading_core/   domain models + the full quant core: features, signals,
+                  backtest, risk, exits, options, contracts, strategies,
+                  volatility, greeks, correlation, allocation, health
                   (shared verbatim between backtest and live — mandatory rule)
 apps/
   gateway/        FastAPI modular monolith: watchlist, trading-pool, audit modules.
@@ -41,6 +43,17 @@ make up        # full stack: timescaledb + redis + gateway via docker compose
 ```
 
 Copy `.env.example` to `.env` for configuration. Never commit `.env`.
+
+## Verification
+
+- `make test` — the full pytest suite (573 tests), sqlite-backed, no services needed.
+- `make verify` — tests + `docker compose config` validation + a YAML parse of
+  `.github/workflows/ci.yml`, i.e. everything CI checks that can run locally.
+- Docker acceptance: `make up`, then hit `http://localhost:8000/health` and the UI on
+  `http://localhost:3000`; `make down` when done.
+
+What was built and why lives in [docs/DEVLOG.md](docs/DEVLOG.md) (per-iteration log)
+and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (ADRs).
 
 ## Migrations
 

@@ -1,4 +1,4 @@
-.PHONY: install dev test ci up down
+.PHONY: install dev test ci verify up down
 
 install:
 	python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
@@ -11,6 +11,11 @@ test:
 
 ci:
 	.venv/bin/pytest -q
+
+verify:
+	.venv/bin/pytest -q
+	docker compose config -q
+	.venv/bin/python -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))"
 
 up:
 	docker compose up --build -d

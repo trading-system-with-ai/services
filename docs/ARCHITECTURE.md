@@ -60,3 +60,43 @@ symbol's history remains watchlist-gated. Reference backfills go through the sam
 `ensure_daily_bars` path as watchlist analysis, so they are SYSTEM-attributed
 `DATA_BACKFILL` audit events committed in the same transaction as the inserted bars
 (ADR-003).
+
+## ADR-006: Alerts are a classified view over the audit trail (2026-08-10)
+
+The Dashboard alerts feed (§18/§29/§38) could have been its own table with its own
+writers — a second event stream that every mutation path would have to remember to feed.
+
+**Decision:** there is no alerts table. The audit log (ADR-003) is the single event
+source; `GET /api/alerts` is a severity-graded *read* of it. A declarative
+`ALERT_RULES` table (`apps/gateway/alerts.py`) maps an `AuditAction` to
+`(severity, title builder, optional keep-predicate)` — any audit action absent from the
+table is simply not an alert, and predicates filter routine rows (an approving risk
+preview is not an alert; a rejection or veto is).
+
+**Consequence:** alerts can never diverge from the audit record — if it alerted, it is
+in the audit trail with the same id, timestamp, and correlation id, and there is no
+second writer to drift. Adding or retiring an alert is a one-line rule change, not a new
+write path. Future push notifications (§38) subscribe to the same classification: they
+consume classified audit rows rather than inventing another event source.
+
+## ADR-007: In-process position monitor (2026-08-10)
+
+Mechanical exits (§11) must fire even when nobody is clicking, which requires a
+periodic sweep of open positions (§26, §37). The obvious shapes are a separate
+monitor service or a cron job.
+
+**Decision:** the monitor is an asyncio background task (`apps/gateway/monitor.py`)
+started and cancelled by the gateway lifespan — not a separate service or cron. This
+follows the V1 modular monolith rule (ADR-001, plan §24): one process until scaling
+needs prove otherwise. The task runs the SAME `run_exit_sweep` as
+`POST /api/positions/check-exits` (never a reimplementation, §21 spirit), and every
+sweep executes under the shared paper-execution lock, so a background sweep and a
+user-triggered check can never double-sell the same position. The interval is
+configuration (`POSITION_MONITOR_INTERVAL_SECONDS`, default 300); `0` disables the
+task entirely, and `GET /api/positions/monitor` honestly reports whether the loop is
+actually running.
+
+**Consequence:** correctness currently rides on there being one gateway process —
+horizontal scaling later requires moving the sweep to a single-owner worker (or leader
+election) before running multiple gateway replicas. Because the sweep logic is already
+a shared function behind a lock, that move is a packaging change, not a logic change.

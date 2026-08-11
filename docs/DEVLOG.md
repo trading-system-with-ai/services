@@ -5,7 +5,48 @@ decisions, test/audit status, and what's next.
 
 ---
 
-## 2026-08-10 — Iteration 15: §4.3 promotion checks + automated position monitor
+## 2026-08-10 — Iteration 16: V1 DEFINITION-OF-DONE AUDIT — §45 COMPLETE (16/17 PROVEN, 1 PARTIAL)
+
+An adversarial evidence audit walked every §45 bullet against named tests,
+endpoints, and recorded live verifications (573/573 tests; two Docker E2E
+passes; the 60-day replay test; live authority-boundary and promotion-ladder
+audits). Result:
+
+- **PROVEN (16):** independent builds; Docker Compose stack; watchlist CRUD;
+  historical backtests; mechanical Bull/Bear/Neutral signals; Long Stock /
+  Call / Put paper simulation; Trading Pool promotion (§4.3 checks);
+  portfolio allocator sizing; dynamic cash reserve; risk reject/resize;
+  pool-only paper orders; position monitoring (automated sweep);
+  mechanical Sell-to-Close exits; LLM approval boundary; audit logs on all
+  decisions; UI surface (all nine §28 sections live).
+- **PARTIAL (1):** "Massive data ingested only for appropriate symbols" —
+  the gating architecture is fully tested, but Massive itself is not
+  integrated: all market data is deterministic stub. Blocked on
+  MASSIVE_API_KEY + a real MassiveProvider.
+- **§44 rules 1–20:** no violations. Noted soft spots: rule 9 — the backtest
+  engine's exit rules are engine-internal rather than imported from
+  libs/trading_core/exits (signals ARE shared; exits consolidation is a
+  known follow-up); rule 17 untested until Phase 10 (no parameter
+  optimization has occurred yet); LIQUIDITY gates stubbed.
+
+**Blocked on user input (nothing more code-on-stubs can unlock):**
+1. MASSIVE_API_KEY → real bars/quotes/chains/IV history (also unlocks IV
+   Rank, real liquidity gates, ask/bid WORST fills).
+2. LLM_API_KEY → switch llm_provider to "anthropic" for live
+   recommendations.
+3. git push → the CI in both repos has never run remotely (both 15 commits
+   ahead of origin).
+4. Free host port 8000 → canonical-port compose bring-up (E2E passes used
+   an override port).
+5. Broker credentials → Phase 6 real paper account / Phase 11 live rollout.
+
+Docs pass: ADR-006 (alerts as audit view), ADR-007 (in-process monitor),
+README refreshes, `make verify` (pytest + compose config + CI YAML) green.
+
+**The development loop pauses here** — V1 per the plan's own definition is
+complete on stub data. Phases 9 (spreads — needs account permission
+decision), 10 (EV-based research upgrade), and 11 (live rollout) resume when
+the blocking inputs above are provided.
 
 **Built:**
 - Trading Pool promotion checks (§4.3, closing a long-standing gap):
