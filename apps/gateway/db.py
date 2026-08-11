@@ -253,6 +253,18 @@ class Order(Base):
     ``quantity`` counts CONTRACTS and ``fill_price`` is the premium PER
     SHARE (x100 multiplier applies to cash). The opt_* columns are honest
     nulls for stock orders (§44 rule 18).
+
+    Broker execution (plan §11): when the order went to a real broker,
+    ``broker_order_id`` is the broker's own id (UNIQUE when set — one local row
+    per broker order, so a reconciliation can never match two rows to one
+    order), ``broker_status`` its RAW status string preserved verbatim, and
+    ``filled_quantity`` how much ACTUALLY filled. All three are honest nulls /
+    0 for internally simulated fills.
+
+    PARTIAL FILLS ARE FIRST-CLASS. ``quantity`` is what we ASKED for and
+    ``filled_quantity`` what happened; they are not the same fact and the code
+    never conflates them. A position opens with the FILLED quantity, and a
+    zero-fill ACCEPTED order opens no position at all.
     """
 
     __tablename__ = "orders"
@@ -277,6 +289,14 @@ class Order(Base):
     opt_right: Mapped[str | None] = mapped_column(
         String(1), nullable=True, default=None
     )  # "C" | "P"
+    # Broker execution (plan §11) — honest nulls for simulated fills.
+    broker_order_id: Mapped[str | None] = mapped_column(
+        String(64), unique=True, nullable=True, default=None
+    )
+    broker_status: Mapped[str | None] = mapped_column(
+        String(24), nullable=True, default=None
+    )  # the broker's RAW status string, preserved verbatim
+    filled_quantity: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class Recommendation(Base):

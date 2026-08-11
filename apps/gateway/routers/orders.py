@@ -59,6 +59,30 @@ premium — the §11.3 PREMIUM hard-stop basis (the exit engine stops at
 ``entry_premium * (1 - premium_hard_stop_pct)``), NOT an underlying price
 stop; ``max_loss`` is the full premium paid (``qty * fill * 100``, §12.1).
 
+EXECUTION VENUE (plan §11, §44 rule 18) — ``Settings.broker_provider``:
+
+- UNSET (the default): approve and close answer 503
+  ``BROKER_NOT_CONFIGURED`` and place NOTHING. There is deliberately NO
+  fallback to the internal simulator. A simulated fill reported as a broker
+  fill would be an execution that never happened, presented as one that did —
+  the exact class of invented data this platform refuses.
+- ``"simulated"``: DEVELOPMENT / BACKTEST-COMPARISON ONLY, an explicit opt-in
+  exactly like the stub market-data and LLM providers. The internal paper fill
+  model documented above runs unchanged; nothing about it is byte-different
+  from before the broker existed.
+- ``"alpaca_paper"``: real orders against a real Alpaca PAPER account. Fills,
+  quantities and prices come from the BROKER, never from the fill model, and
+  partial fills are first-class — a position opens with the FILLED quantity
+  and a zero-fill ACCEPTED order opens no position at all. Submission
+  mechanics (network-level idempotency, bounded polling) live in
+  apps/gateway/broker_exec.py and are shared with the exit sweep.
+
+OPTIONS ARE OUT OF SCOPE FOR THE BROKER PATH in this change: Alpaca options
+trading is not wired. With a real broker configured, an approval whose §8
+instrument resolves to LONG_CALL/LONG_PUT answers 422 naming the limitation —
+options remain fully available in ``"simulated"`` mode. Fabricating an option
+order submission would be the same dishonesty in a different costume.
+
 Risk approval calls ``libs.trading_core.risk.assess`` — the risk engine is
 never reimplemented here, and risk limits have PRIORITY over strategy
 confidence (§44 rule 20). The call now also carries (a) the §14 vol-targeting
@@ -111,6 +135,13 @@ from libs.trading_core.strategies import AccountPermissions, select_instrument
 from libs.trading_core.volatility import VolRegimeParams, classify_vol_regime
 
 from .. import audit
+from ..broker_exec import (
+    BrokerError,
+    BrokerRejected,
+    broker_order_details,
+    new_client_order_id,
+    submit_and_poll,
+)
 from ..db import (
     Order,
     Position,
@@ -121,7 +152,12 @@ from ..db import (
     get_session,
     utcnow,
 )
-from ..deps import require_market_data_provider
+from ..deps import (
+    require_broker,
+    require_market_data_provider,
+    resolve_broker,
+    simulated_broker_mode,
+)
 from ..schemas import TickerRequest
 from .analysis import ensure_daily_bars, market_regime_from_spy
 from .options import build_option_chain, chain_iv_summary
@@ -903,6 +939,13 @@ def _contract_payload(row: Order | Position) -> dict | None:
 
 
 def _order_payload(order: Order) -> dict:
+    """One order row as the API reports it.
+
+    ``quantity`` is what was REQUESTED and ``filled_quantity`` what actually
+    filled — separate facts, never conflated (§11 partial fills). The
+    ``broker`` block is an honest null for internally simulated fills and
+    carries the broker's own id and RAW status word otherwise.
+    """
     return {
         "id": order.id,
         "client_order_id": order.client_order_id,
@@ -910,10 +953,19 @@ def _order_payload(order: Order) -> dict:
         "instrument": order.instrument,
         "side": order.side,
         "quantity": order.quantity,
+        "filled_quantity": order.filled_quantity,
         "fill_price": order.fill_price,
         "commission": order.commission,
         "status": order.status,
         "contract": _contract_payload(order),
+        "broker": (
+            {
+                "broker_order_id": order.broker_order_id,
+                "broker_status": order.broker_status,
+            }
+            if order.broker_order_id is not None or order.broker_status is not None
+            else None
+        ),
         "created_at": order.created_at.isoformat(),
     }
 
@@ -1185,11 +1237,26 @@ async def approve_order(
     paper-execution lock so two rapid approves can never double-fill (§42;
     V1 no-pyramiding).
 
+    EXECUTION VENUE: with ``BROKER_PROVIDER=simulated`` everything above runs
+    exactly as documented. With a real broker the QUANTITY, PRICE and STATUS
+    all come from the broker instead: the order is submitted with our
+    ``client_order_id``, polled briefly, and the position opens with the FILLED
+    quantity — a partial fill opens a partial position, a zero-fill ACCEPTED
+    order opens none. Option instruments are 422 on the broker path (module
+    docstring).
+
     503 ``MARKET_DATA_NOT_CONFIGURED`` when no market data provider is
     configured — checked BEFORE the lock and before the idempotency lookup, so
     an unconfigured install cannot fill an order at a made-up price.
+
+    503 ``BROKER_NOT_CONFIGURED`` when no execution venue is configured, for
+    the same reason one step further along: with no broker there is nowhere to
+    place the order, and quietly simulating one instead would report an
+    execution that never happened. Nothing is written — no Order row, no
+    Position row, no cash movement.
     """
     require_market_data_provider()
+    require_broker()
     async with execution_lock():
         return await _approve_order_locked(req, session)
 
@@ -1261,6 +1328,14 @@ async def _approve_order_locked(
 
     approved = chain.assessment.approved_quantity
     quantity = min(req.quantity, approved) if req.quantity is not None else approved
+
+    # --- Execution venue (§11, §44 rule 18) --------------------------------
+    # The chain has passed and a quantity is approved. WHERE the order goes is
+    # decided here and only here: a real broker, or — only when explicitly
+    # opted into — the internal simulator below. The unconfigured case never
+    # reaches this line (approve_order raised 503 before taking the lock).
+    if not simulated_broker_mode():
+        return await _approve_via_broker(session, req, chain, quantity)
 
     # --- Paper fill (§11): slippage against the trader + commission. -------
     # Options (§12.1): fill = contract mid * (1 + slippage) PER SHARE; the

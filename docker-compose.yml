@@ -22,6 +22,7 @@ services:
       - ./migrations/006_recommendations_evidence.sql:/docker-entrypoint-initdb.d/006_recommendations_evidence.sql:ro
       - ./migrations/007_stock_bars_daily.sql:/docker-entrypoint-initdb.d/007_stock_bars_daily.sql:ro
       - ./migrations/008_option_execution.sql:/docker-entrypoint-initdb.d/008_option_execution.sql:ro
+      - ./migrations/009_broker.sql:/docker-entrypoint-initdb.d/009_broker.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U trading"]
       interval: 5s
@@ -42,7 +43,17 @@ services:
     build:
       context: .
       dockerfile: apps/gateway/Dockerfile
+    # Provider selection and credentials come from .env (gitignored). Without
+    # this the container starts with every provider UNSET and the platform
+    # correctly serves nothing — which looks like a bug but is the honest
+    # default. `required: false` keeps a fresh clone (no .env yet) bootable.
+    env_file:
+      - path: .env
+        required: false
     environment:
+      # Container-internal service addresses always win over any .env value:
+      # `environment` overrides `env_file`, and a host-oriented DATABASE_URL
+      # (localhost:5432) would not resolve inside the container.
       DATABASE_URL: postgresql+asyncpg://trading:trading@db:5432/trading
       REDIS_URL: redis://redis:6379/0
     ports:

@@ -442,12 +442,26 @@ def test_openai_missing_api_key_raises():
         OpenAIRecommendationProvider(api_key="", model=OPENAI_MODEL)
 
 
-def test_registry_knows_openai_and_still_has_no_default():
+def test_registry_knows_openai_and_still_has_no_default(monkeypatch):
+    """"openai" resolves; naming nothing is still the unconfigured state.
+
+    The key is pinned to "" here rather than relying on the ambient
+    environment: a developer machine with a real LLM_API_KEY in .env would
+    otherwise construct the provider successfully and silently invert what
+    this test claims to prove.
+    """
+    from libs.common.config import get_settings
     from libs.llm import LLMProviderNotConfigured
 
-    # Registered by name...
-    with pytest.raises(ProviderError, match="API key"):
-        get_recommendation_provider("openai")  # no key configured in tests
-    # ...but naming nothing is still the unconfigured state, not a fallback.
-    with pytest.raises(LLMProviderNotConfigured):
-        get_recommendation_provider("")
+    monkeypatch.setenv("LLM_API_KEY", "")
+    get_settings.cache_clear()
+    try:
+        # Registered by name — and keyless construction is refused, so the
+        # OpenAI provider can never reach the network without a key.
+        with pytest.raises(ProviderError, match="API key"):
+            get_recommendation_provider("openai")
+        # Naming nothing is the unconfigured state, not a fallback.
+        with pytest.raises(LLMProviderNotConfigured):
+            get_recommendation_provider("")
+    finally:
+        get_settings.cache_clear()

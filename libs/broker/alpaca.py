@@ -1,0 +1,459 @@
+"""Alpaca PAPER-ONLY broker adapter (development plan §11 — real execution).
+
+Speaks the Alpaca Trading API v2 over raw httpx — deliberately NOT the
+``alpaca-py`` SDK, because every other provider in this codebase
+(``libs/llm/anthropic.py``, ``libs/llm/openai.py``) is a raw-httpx adapter and
+a second HTTP style would be one more thing to keep in sync. Credentials come
+from configuration (``settings.alpaca_api_key`` / ``settings.alpaca_api_secret``)
+— never hardcoded here.
+
+PAPER ONLY. THIS IS THE WHOLE POINT OF THE CLASS.
+
+Live trading must be impossible to reach by configuration alone, so the guard
+is applied twice, at two different layers:
+
+1. **Construction** rejects any base URL whose host is not the paper host
+   (:data:`PAPER_HOST`). Passing ``api.alpaca.markets``, or any other host,
+   raises ``ValueError`` naming the host. There is no flag, no environment
+   variable and no settings field that disables this check — going live would
+   require editing this module, which is exactly the friction we want.
+2. **Every submission** re-reads the account and refuses unless the broker
+   itself reports ``is_paper``. The URL check alone would be trusting our own
+   configuration; this check trusts the broker. A key pair that somehow points
+   at a funded live account is refused before any order is POSTed.
+
+Failure policy:
+  - Missing/blank key or secret -> :class:`BrokerError` at construction time,
+    so the adapter can never fire keyless (mirrors the LLM adapters).
+  - Network / HTTP-level failures -> :class:`BrokerError`.
+  - An order the broker refuses at submission -> :class:`BrokerRejected`.
+  - An unrecognised Alpaca status -> mapped to ``ACCEPTED`` (the safe,
+    non-terminal reading) with the raw string preserved and a WARNING logged.
+    We NEVER guess ``FILLED``: inventing a fill is exactly the class of
+    invented data this platform refuses to produce.
+
+Credentials are never logged. The request logger redacts both header values.
+"""
+import logging
+from datetime import datetime, timezone
+from urllib.parse import urlparse
+
+import httpx
+
+from .provider import (
+    BUY_TO_OPEN,
+    SELL_TO_CLOSE,
+    BrokerAccount,
+    BrokerError,
+    BrokerOrder,
+    BrokerPosition,
+    BrokerRejected,
+)
+
+logger = logging.getLogger(__name__)
+
+# The ONLY host this adapter will talk to. Not a default — an invariant.
+PAPER_HOST = "paper-api.alpaca.markets"
+ALPACA_PAPER_BASE_URL = f"https://{PAPER_HOST}"
+
+DEFAULT_TIMEOUT_SECONDS = 15.0
+
+KEY_HEADER = "APCA-API-KEY-ID"
+SECRET_HEADER = "APCA-API-SECRET-KEY"
+_REDACTED = "***redacted***"
+
+# Our side vocabulary (§5) -> Alpaca's. BUY_TO_OPEN opens a long,
+# SELL_TO_CLOSE closes one. There is deliberately NO entry that can open a
+# short: "sell_to_open" is not in this table and Alpaca's "sell" is reachable
+# only via SELL_TO_CLOSE.
+_SIDE_TO_ALPACA = {
+    BUY_TO_OPEN: "buy",
+    SELL_TO_CLOSE: "sell",
+}
+
+# Alpaca order status -> our normalised lifecycle. Anything absent from this
+# table maps to ACCEPTED with a WARNING (see _map_status).
+_STATUS_MAP = {
+    "new": "ACCEPTED",
+    "accepted": "ACCEPTED",
+    "pending_new": "ACCEPTED",
+    "accepted_for_bidding": "ACCEPTED",
+    "partially_filled": "PARTIALLY_FILLED",
+    "filled": "FILLED",
+    "rejected": "REJECTED",
+    "canceled": "CANCELED",
+    "pending_cancel": "CANCELED",
+    "expired": "EXPIRED",
+}
+
+
+def _map_status(raw: str) -> str:
+    """Map an Alpaca status string onto our lifecycle enum.
+
+    An unrecognised status becomes ``ACCEPTED`` — the safe non-terminal
+    reading, meaning "live at the broker, keep watching it" — never
+    ``FILLED``. Guessing a fill would fabricate an execution that may not have
+    happened; guessing "still working" only costs another poll.
+    """
+    mapped = _STATUS_MAP.get(raw)
+    if mapped is None:
+        logger.warning(
+            "Unrecognised Alpaca order status %r; treating as ACCEPTED and "
+            "preserving the raw status (never guessing FILLED)",
+            raw,
+        )
+        return "ACCEPTED"
+    return mapped
+
+
+def _to_float(value: object) -> float | None:
+    """Parse an Alpaca numeric string to float; None when absent/unparseable."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_int(value: object, default: int = 0) -> int:
+    """Parse an Alpaca quantity to int; `default` when absent/unparseable.
+
+    Alpaca sends quantities as decimal strings ("5", "5.0"), so this goes
+    through float first and truncates — this platform only trades whole
+    shares/contracts.
+    """
+    parsed = _to_float(value)
+    return default if parsed is None else int(parsed)
+
+
+def _parse_timestamp(value: object) -> datetime:
+    """Parse an Alpaca RFC-3339 timestamp; fall back to now(UTC) if unusable.
+
+    A missing timestamp must not sink an otherwise-good order response — the
+    order exists at the broker either way, and losing it over a formatting
+    detail would be worse than an approximate submitted_at.
+    """
+    if isinstance(value, str) and value:
+        text = value.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            logger.warning("Unparseable Alpaca timestamp %r; using current time", value)
+        else:
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc)
+
+
+class AlpacaPaperBroker:
+    """BrokerProvider backed by the Alpaca PAPER Trading API v2.
+
+    Paper-only by construction: see the module docstring for the two-layer
+    guard. This class has no live mode.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        base_url: str = ALPACA_PAPER_BASE_URL,
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
+        """`transport` is injectable so tests can mock the network (httpx.MockTransport).
+
+        Raises :class:`BrokerError` when either credential is missing/blank,
+        and ``ValueError`` naming the host when `base_url` is not the Alpaca
+        paper host — a live URL is an operator error we refuse loudly, not a
+        mode we support.
+        """
+        if not api_key or not api_key.strip():
+            raise BrokerError(
+                "AlpacaPaperBroker requires a non-empty API key "
+                "(settings.alpaca_api_key); the broker is never used keyless"
+            )
+        if not api_secret or not api_secret.strip():
+            raise BrokerError(
+                "AlpacaPaperBroker requires a non-empty API secret "
+                "(settings.alpaca_api_secret); the broker is never used keyless"
+            )
+
+        host = urlparse(base_url).hostname or base_url
+        if host != PAPER_HOST:
+            raise ValueError(
+                f"AlpacaPaperBroker refuses non-paper host {host!r}: this "
+                f"adapter is PAPER ONLY and talks to {PAPER_HOST!r} exclusively. "
+                "Live trading is not reachable by configuration."
+            )
+
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.base_url = base_url.rstrip("/")
+        self.timeout_seconds = timeout_seconds
+        self._transport = transport
+
+    # ------------------------------------------------------------------
+    # HTTP plumbing
+    # ------------------------------------------------------------------
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            KEY_HEADER: self.api_key,
+            SECRET_HEADER: self.api_secret,
+            "content-type": "application/json",
+        }
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict | None = None,
+        params: dict | None = None,
+        allow_404: bool = False,
+    ) -> httpx.Response:
+        """Perform one Alpaca call, translating transport/HTTP faults.
+
+        Returns the response for 2xx, and for 404 when `allow_404` (the caller
+        distinguishes "no such order" from a fault). Everything else raises
+        :class:`BrokerError`. Credentials never appear in the log line.
+        """
+        url = f"{self.base_url}{path}"
+        logger.debug(
+            "Alpaca %s %s (headers: %s=%s, %s=%s)",
+            method, url, KEY_HEADER, _REDACTED, SECRET_HEADER, _REDACTED,
+        )
+        try:
+            with httpx.Client(
+                timeout=self.timeout_seconds, transport=self._transport
+            ) as client:
+                response = client.request(
+                    method, url, json=json_body, params=params, headers=self._headers()
+                )
+        except httpx.HTTPError as exc:
+            raise BrokerError(f"Alpaca API request failed: {exc!r}") from exc
+
+        if response.status_code == 404 and allow_404:
+            return response
+        if response.status_code >= 400:
+            raise BrokerError(
+                f"Alpaca API returned HTTP {response.status_code} for "
+                f"{method} {path}: {response.text[:500]}"
+            )
+        return response
+
+    @staticmethod
+    def _json(response: httpx.Response) -> dict | list:
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise BrokerError(
+                f"Alpaca API returned a non-JSON body: {response.text[:200]!r}"
+            ) from exc
+
+    # ------------------------------------------------------------------
+    # Parsing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_order(payload: dict, fallback_side: str | None = None) -> BrokerOrder:
+        """Build a BrokerOrder from an Alpaca order object.
+
+        `fallback_side` is used only when Alpaca's payload omits the side (it
+        does not in practice) — the side we asked for is then the best answer.
+        """
+        raw_status = str(payload.get("status", ""))
+        alpaca_side = str(payload.get("side", "")).lower()
+        if alpaca_side == "buy":
+            side = BUY_TO_OPEN
+        elif alpaca_side == "sell":
+            side = SELL_TO_CLOSE
+        else:
+            side = fallback_side or alpaca_side.upper()
+
+        return BrokerOrder(
+            broker_order_id=str(payload.get("id", "")),
+            client_order_id=str(payload.get("client_order_id", "")),
+            symbol=str(payload.get("symbol", "")),
+            side=side,
+            status=_map_status(raw_status),
+            requested_quantity=_to_int(payload.get("qty")),
+            filled_quantity=_to_int(payload.get("filled_qty")),
+            filled_avg_price=_to_float(payload.get("filled_avg_price")),
+            submitted_at=_parse_timestamp(payload.get("submitted_at")),
+            raw_status=raw_status,
+        )
+
+    # ------------------------------------------------------------------
+    # BrokerProvider
+    # ------------------------------------------------------------------
+
+    def get_account(self) -> BrokerAccount:
+        """Return the account snapshot (``GET /v2/account``).
+
+        ``is_paper`` is taken from Alpaca's own boolean when present. If the
+        field is absent we fall back to the host we are pinned to — which the
+        constructor already guarantees is the paper host.
+        """
+        payload = self._json(self._request("GET", "/v2/account"))
+        if not isinstance(payload, dict):
+            raise BrokerError("Alpaca /v2/account returned an unexpected payload")
+
+        raw_is_paper = payload.get("is_paper")
+        is_paper = (
+            bool(raw_is_paper)
+            if raw_is_paper is not None
+            else urlparse(self.base_url).hostname == PAPER_HOST
+        )
+        return BrokerAccount(
+            cash=_to_float(payload.get("cash")) or 0.0,
+            equity=_to_float(payload.get("equity")) or 0.0,
+            buying_power=_to_float(payload.get("buying_power")) or 0.0,
+            currency=str(payload.get("currency", "USD")),
+            is_paper=is_paper,
+            account_number=str(payload.get("account_number", "")),
+        )
+
+    def submit_order(
+        self, client_order_id: str, symbol: str, side: str, quantity: int
+    ) -> BrokerOrder:
+        """Submit a day market order (``POST /v2/orders``).
+
+        `side` is ``BUY_TO_OPEN`` -> Alpaca ``"buy"`` or ``SELL_TO_CLOSE`` ->
+        Alpaca ``"sell"``. **No mapping here can produce a short**: there is no
+        Sell-to-Open in this platform (§5), and a ``"sell"`` is only ever
+        emitted to close an existing long — the gateway enforces that a
+        SELL_TO_CLOSE never exceeds the held quantity before it ever calls
+        this method. This adapter simply has no vocabulary for opening a short.
+
+        SAFETY: the account is read FIRST and the order is POSTed only if the
+        broker reports a paper account. A live account raises
+        :class:`BrokerError` with no order ever sent.
+        """
+        if side not in _SIDE_TO_ALPACA:
+            raise ValueError(
+                f"unknown order side {side!r}; known: {sorted(_SIDE_TO_ALPACA)} "
+                "(Sell-to-Open does not exist — §5)"
+            )
+        if quantity <= 0:
+            raise ValueError(f"quantity must be > 0, got {quantity}")
+
+        # PAPER-ONLY GUARD, layer 2: trust the broker, not our own config.
+        # This happens BEFORE the POST so a live account never sees an order.
+        account = self.get_account()
+        if not account.is_paper:
+            raise BrokerError(
+                "refusing to submit an order: Alpaca reports account "
+                f"{account.account_number!r} is NOT a paper account. This "
+                "adapter is paper-only and will not trade real money."
+            )
+
+        payload = {
+            "symbol": symbol,
+            "qty": str(quantity),
+            "side": _SIDE_TO_ALPACA[side],
+            "type": "market",
+            "time_in_force": "day",
+            "client_order_id": client_order_id,
+        }
+
+        url = f"{self.base_url}/v2/orders"
+        logger.debug(
+            "Alpaca POST %s (headers: %s=%s, %s=%s) payload=%s",
+            url, KEY_HEADER, _REDACTED, SECRET_HEADER, _REDACTED, payload,
+        )
+        try:
+            with httpx.Client(
+                timeout=self.timeout_seconds, transport=self._transport
+            ) as client:
+                response = client.post(url, json=payload, headers=self._headers())
+        except httpx.HTTPError as exc:
+            raise BrokerError(f"Alpaca API request failed: {exc!r}") from exc
+
+        # 4xx on submit is the broker refusing the order on its own terms —
+        # a business rejection, not a transport fault.
+        if 400 <= response.status_code < 500:
+            raise BrokerRejected(
+                f"Alpaca rejected order {client_order_id!r} for {symbol} "
+                f"(HTTP {response.status_code}): {response.text[:500]}"
+            )
+        if response.status_code >= 500:
+            raise BrokerError(
+                f"Alpaca API returned HTTP {response.status_code} for "
+                f"POST /v2/orders: {response.text[:500]}"
+            )
+
+        body = self._json(response)
+        if not isinstance(body, dict):
+            raise BrokerError("Alpaca /v2/orders returned an unexpected payload")
+
+        order = self._parse_order(body, fallback_side=side)
+        # Alpaca can also answer 200 with status "rejected" — same fact,
+        # different envelope, so it raises the same exception. A rejection
+        # discovered later by get_order() stays a BrokerOrder(REJECTED).
+        if order.status == "REJECTED":
+            raise BrokerRejected(
+                f"Alpaca rejected order {client_order_id!r} for {symbol} "
+                f"(status {order.raw_status!r})"
+            )
+        return order
+
+    def get_order(self, client_order_id: str) -> BrokerOrder | None:
+        """Look an order up by OUR id (``GET /v2/orders:by_client_order_id``).
+
+        Returns None on 404 — a definitive "the broker has no such order",
+        which is what makes this safe to use for reconciling a submission whose
+        response was lost. Transport faults raise instead, because they do not
+        mean absence.
+        """
+        response = self._request(
+            "GET",
+            "/v2/orders:by_client_order_id",
+            params={"client_order_id": client_order_id},
+            allow_404=True,
+        )
+        if response.status_code == 404:
+            return None
+        body = self._json(response)
+        if not isinstance(body, dict):
+            raise BrokerError(
+                "Alpaca /v2/orders:by_client_order_id returned an unexpected payload"
+            )
+        return self._parse_order(body)
+
+    def list_positions(self) -> list[BrokerPosition]:
+        """Return all open positions (``GET /v2/positions``)."""
+        body = self._json(self._request("GET", "/v2/positions"))
+        if not isinstance(body, list):
+            raise BrokerError("Alpaca /v2/positions returned an unexpected payload")
+
+        positions: list[BrokerPosition] = []
+        for row in body:
+            if not isinstance(row, dict):
+                logger.warning("Skipping malformed Alpaca position entry")
+                continue
+            positions.append(
+                BrokerPosition(
+                    symbol=str(row.get("symbol", "")),
+                    quantity=_to_int(row.get("qty")),
+                    avg_entry_price=_to_float(row.get("avg_entry_price")) or 0.0,
+                    market_value=_to_float(row.get("market_value")),
+                )
+            )
+        return positions
+
+    def cancel_order(self, client_order_id: str) -> None:
+        """Cancel the order carrying our `client_order_id`.
+
+        Alpaca cancels by ITS order id, so this resolves the client id first.
+        An unknown client id raises :class:`BrokerError` — asking to cancel
+        something the broker never heard of is a real problem worth surfacing,
+        not a silent no-op.
+        """
+        order = self.get_order(client_order_id)
+        if order is None:
+            raise BrokerError(
+                f"cannot cancel unknown order {client_order_id!r}: "
+                "the broker has no order with that client_order_id"
+            )
+        self._request("DELETE", f"/v2/orders/{order.broker_order_id}")
