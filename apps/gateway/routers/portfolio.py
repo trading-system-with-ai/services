@@ -28,6 +28,19 @@ cannot be known — no stored bars, or a contract missing from today's chain
 (e.g. expired) — is reported with ``data_ok: false`` and contributes ZEROS
 to the totals, with the gap named in its ``note``.
 
+NO MARKET DATA (the unconfigured install): this endpoint does NOT 503 — unlike
+the market-facing endpoints, its substance is the DATABASE. NAV, cash, the
+position list, max_loss and the configured limits are all real stored facts,
+and refusing to show a user their own cash balance because no quote feed is
+configured would be its own dishonesty. Instead every market-derived field
+degrades to an honest null: ``market_price`` / ``market_value`` per position
+(with a ``DATA_ISSUE`` note), every ``greeks`` total and per-position number,
+``forecast_vol`` inside ``vol_targeting``, and ``market_regime`` (SPY bars are
+market data too). A top-level ``market_data`` block —
+``{"configured": bool, "message": str | None}`` — states the situation
+outright so no client has to infer it from the nulls. NAV then equals cash
+exactly: positions contribute nothing rather than a synthetic mark.
+
 Read-only: the endpoint changes no state and makes no decision, so it writes
 no audit event (rule 12 covers state changes and decisions).
 """
@@ -57,8 +70,9 @@ from ..db import (
     get_or_create_system_state,
     get_session,
 )
+from ..deps import market_data_configured, market_data_status
 from .analysis import market_regime_from_spy
-from .options import REALIZED_VOL_PERIOD, build_option_chain
+from .options import REALIZED_VOL_PERIOD, option_chain_or_none
 
 router = APIRouter(prefix="/api/portfolio", tags=["portfolio"])
 
@@ -84,7 +98,9 @@ def is_option_position(position: Position) -> bool:
     return position.instrument in _OPTION_INSTRUMENTS
 
 
-def position_market_value(position: Position, price: float | None) -> float | None:
+def position_market_value(
+    position: Position, price: float | None, *, market_data: bool = True
+) -> float | None:
     """One OPEN position's market value for the NAV / risk snapshot (§12.5).
 
     Stock: ``quantity * last stored close`` (``None`` when the ticker has no
@@ -94,7 +110,15 @@ def position_market_value(position: Position, price: float | None) -> float | No
     portfolio view; it is exact for heat purposes because a long option's
     max_loss IS that premium (§12.1). Shared by this view and the order
     path's risk snapshot so both build the identical portfolio picture.
+
+    ``market_data=False`` (no provider configured) returns ``None`` for EVERY
+    position, options included. The option book value is a real stored number,
+    but it is served under the name ``market_value`` and would be read as a
+    current mark; with no feed to confirm it, the honest answer is null and
+    NAV falls back to cash alone (§44 rule 18).
     """
+    if not market_data:
+        return None
     if is_option_position(position):
         return position.quantity * position.avg_price * (position.multiplier or 1)
     if price is None:
@@ -126,17 +150,23 @@ async def open_positions_with_prices(
     """OPEN positions (ticker-ordered) paired with the last stored daily close.
 
     The price is ``None`` — an honest null (plan §44 rule 18) — when the
-    ticker has no stored bars; callers surface that as a DATA_ISSUE and count
-    0 toward NAV. Shared by the portfolio risk view and the order preview
-    path so both build the identical portfolio picture.
+    ticker has no stored bars, and for EVERY position when no market data
+    provider is configured (there is then no price anyone can vouch for).
+    Callers surface that as a DATA_ISSUE and count 0 toward NAV. Shared by the
+    portfolio risk view and the order preview path so both build the identical
+    portfolio picture.
     """
     rows = await session.execute(
         select(Position)
         .where(Position.status == POSITION_OPEN)
         .order_by(Position.ticker, Position.id)
     )
+    have_market_data = market_data_configured()
     out: list[tuple[Position, float | None]] = []
     for pos in rows.scalars().all():
+        if not have_market_data:
+            out.append((pos, None))
+            continue
         price = (
             await session.execute(
                 select(StockBarDaily.close)
@@ -182,11 +212,18 @@ def portfolio_greeks_read(
     :func:`libs.trading_core.greeks.aggregate_greeks` — never reimplemented
     here (plan §21). Shared by this view and the order gate chain so the risk
     engine judges the same book the user sees.
+
+    With NO market data provider configured, every position lands in the
+    can't-know branch and its per-position numbers are NULLS rather than the
+    usual zeros: one bad row among good ones legitimately contributes zero to
+    the totals, but a whole table of zeros would read as a genuinely flat
+    book, which is a claim nobody can make without market data (§44 rule 18).
     """
     inputs: list[PositionGreeksInput] = []
     rows: list[dict] = []
     ok_row_indexes: list[int] = []
     chains: dict[str, list[ContractQuote]] = {}  # one chain build per ticker
+    have_market_data = market_data_configured()
     for pos, price in pairs:
         note: str | None = None
         per_share: tuple[float, float, float, float] | None = None
@@ -194,10 +231,15 @@ def portfolio_greeks_read(
             note = (
                 f"DATA_ISSUE: no stored bars for {pos.ticker} — spot unknown; "
                 "greeks contribute zeros"
+                if have_market_data
+                else (
+                    "DATA_ISSUE: no market data provider is configured — spot "
+                    "unknown; no greeks can be computed for this position"
+                )
             )
         elif is_option_position(pos):
             if pos.ticker not in chains:
-                _, chains[pos.ticker] = build_option_chain(pos.ticker, price)
+                chains[pos.ticker] = option_chain_or_none(pos.ticker, price) or []
             contract = find_option_contract(chains[pos.ticker], pos)
             if contract is None:
                 note = (
@@ -216,15 +258,22 @@ def portfolio_greeks_read(
             per_share = (1.0, 0.0, 0.0, 0.0)
 
         if per_share is None:
+            # Zeros are this row's documented contribution to the TOTALS when
+            # ONE position's data is missing (a contract that expired off the
+            # chain, a ticker with no stored bars) — ``data_ok: false`` plus
+            # ``note`` carry the honesty. But when NO provider is configured
+            # nothing about any position is knowable, and a table of zeros
+            # would read as a flat book; those rows report nulls instead.
+            blank = None if not have_market_data else 0.0
             rows.append(
                 {
                     "ticker": pos.ticker,
                     "instrument": pos.instrument,
-                    "equivalent_shares": 0.0,
-                    "delta_notional_usd": 0.0,
-                    "gamma": 0.0,
-                    "theta_usd_per_day": 0.0,
-                    "vega_usd": 0.0,
+                    "equivalent_shares": blank,
+                    "delta_notional_usd": blank,
+                    "gamma": blank,
+                    "theta_usd_per_day": blank,
+                    "vega_usd": blank,
                     "data_ok": False,
                     "note": note,
                 }
@@ -267,6 +316,8 @@ def vol_targeting_block(
     nav: float,
     pairs: list[tuple[Position, float | None]],
     closes_by_ticker: Mapping[str, list[float]],
+    *,
+    market_data: bool = True,
 ) -> dict:
     """The §14 vol-targeting read: forecast vol -> exposure multiplier.
 
@@ -286,9 +337,26 @@ def vol_targeting_block(
     at ``abs_max_trade_risk`` — vol targeting can NEVER override hard risk
     caps (§14, §44 rule 20). Shared by this view and the order gate chain so
     the reported multiplier IS the one the risk engine applies.
+
+    ``market_data=False``: the forecast is a null and the multiplier is the
+    neutral 1.0 with a note saying so. RV20 is computed from price history —
+    without a provider there is no forecast to state, and stating one anyway
+    would put a synthetic number straight into a sizing decision (§44 r18).
     """
     params = VOL_TARGET_PARAMS
     forecast: float | None = None
+    if not market_data:
+        return {
+            "target_vol": params.target_vol,
+            "forecast_vol": None,
+            "multiplier": exposure_multiplier(None, params),
+            "max_multiplier": params.max_multiplier,
+            "note": (
+                "no market data provider is configured — no vol forecast is "
+                "available (honest null); multiplier 1.0 means no adjustment "
+                "(§14)"
+            ),
+        }
     if pairs:
         weighted = 0.0
         any_rv = False
@@ -331,18 +399,33 @@ def vol_targeting_block(
 
 @router.get("/risk")
 async def get_portfolio_risk(session: AsyncSession = Depends(get_session)) -> dict:
-    """Current portfolio risk state (plan §12.5, §13, §14, §16, §35). Read-only."""
+    """Current portfolio risk state (plan §12.5, §13, §14, §16, §35). Read-only.
+
+    Never 503s: see the module docstring — the DB facts are always reported and
+    the market-derived fields degrade to nulls under a ``market_data`` block.
+    """
     limits = RiskLimits()
+    have_market_data = market_data_configured()
     portfolio = await get_or_create_portfolio(session)
     state = await get_or_create_system_state(session)
     # Broad-market regime from SPY via the shared helper (plan §6.1, ADR-005).
-    regime = (await market_regime_from_spy(session)).classification
+    # SPY bars ARE market data, so with no provider the regime is an honest
+    # null — and so is the regime-dependent cash floor it selects (§13).
+    regime = (
+        (await market_regime_from_spy(session)).classification
+        if have_market_data
+        else None
+    )
 
     pairs = await open_positions_with_prices(session)
     # NAV is derived, never stored: cash + market value of OPEN positions
     # (options at premium book value, §12.1 — see position_market_value);
-    # bar-less stock counts 0 (surfaced as DATA_ISSUE below).
-    values = [position_market_value(pos, price) for pos, price in pairs]
+    # bar-less stock counts 0 (surfaced as DATA_ISSUE below). With no market
+    # data every value is null, so NAV == cash exactly — no synthetic marks.
+    values = [
+        position_market_value(pos, price, market_data=have_market_data)
+        for pos, price in pairs
+    ]
     nav = portfolio.cash + sum(v for v in values if v is not None)
     position_risks = [
         PositionRisk(
@@ -369,9 +452,10 @@ async def get_portfolio_risk(session: AsyncSession = Depends(get_session)) -> di
                 "market_value": value,
                 "max_loss": pos.max_loss,
                 "opened_at": pos.opened_at.isoformat(),
-                # Honest data gap (plan §44 rule 18): no stored bars for this
-                # ticker, so its market price is unknown; a bar-less STOCK
-                # position also counts 0 to NAV.
+                # Honest data gap (plan §44 rule 18): either no market data
+                # provider is configured at all, or this ticker has no stored
+                # bars — either way the market price is unknown and the
+                # position counts 0 toward NAV.
                 "note": None if price is not None else "DATA_ISSUE",
             }
         )
@@ -452,13 +536,41 @@ async def get_portfolio_risk(session: AsyncSession = Depends(get_session)) -> di
             f"(${vega_cap:,.2f})"
         )
 
+    # Greek TOTALS: real aggregates when the chain is knowable, honest nulls
+    # when it is not. Zeros would read as "flat book" — a claim nobody can
+    # make without market data (§44 rule 18).
+    greeks_block: dict = {
+        "net_delta_shares": greeks.net_delta_shares if have_market_data else None,
+        "delta_adjusted_notional_usd": delta_notional if have_market_data else None,
+        "delta_notional_pct_nav": (
+            delta_notional / nav if have_market_data else None
+        ),
+        "net_gamma": greeks.net_gamma if have_market_data else None,
+        "net_theta_usd_per_day": (
+            greeks.net_theta_per_day if have_market_data else None
+        ),
+        "net_vega_usd": greeks.net_vega if have_market_data else None,
+        "limits": {
+            "max_delta_notional_pct_nav": limits.max_delta_notional_pct_nav,
+            "max_net_theta_pct_nav": limits.max_net_theta_pct_nav,
+            "max_net_vega_pct_nav": limits.max_net_vega_pct_nav,
+        },
+        "breaches": breaches,
+        "per_position": greeks_rows,
+    }
+
     return {
         "as_of": datetime.now(timezone.utc).isoformat(),
+        # Honest status of the one dependency this view degrades on, stated
+        # outright so a client never has to infer it from the nulls.
+        "market_data": market_data_status(),
         "nav": nav,
         "cash": portfolio.cash,
         "cash_pct": portfolio.cash / nav,
-        "market_regime": regime.value,
-        "cash_floor_pct": limits.cash_floors[regime],
+        # Both null without market data: the regime is computed from SPY bars,
+        # and the §13 cash floor is selected BY the regime.
+        "market_regime": regime.value if regime is not None else None,
+        "cash_floor_pct": limits.cash_floors[regime] if regime is not None else None,
         "trading_enabled": state.trading_enabled,
         "portfolio_heat_pct": heat,
         "heat_state": heat_state(heat, limits),
@@ -466,22 +578,10 @@ async def get_portfolio_risk(session: AsyncSession = Depends(get_session)) -> di
         "max_new_risk_pct": max_new_risk_usd / nav,
         "positions": positions_out,
         "buckets": buckets_out,
-        "greeks": {
-            "net_delta_shares": greeks.net_delta_shares,
-            "delta_adjusted_notional_usd": delta_notional,
-            "delta_notional_pct_nav": delta_notional / nav,
-            "net_gamma": greeks.net_gamma,
-            "net_theta_usd_per_day": greeks.net_theta_per_day,
-            "net_vega_usd": greeks.net_vega,
-            "limits": {
-                "max_delta_notional_pct_nav": limits.max_delta_notional_pct_nav,
-                "max_net_theta_pct_nav": limits.max_net_theta_pct_nav,
-                "max_net_vega_pct_nav": limits.max_net_vega_pct_nav,
-            },
-            "breaches": breaches,
-            "per_position": greeks_rows,
-        },
-        "vol_targeting": vol_targeting_block(nav, pairs, closes_by_ticker),
+        "greeks": greeks_block,
+        "vol_targeting": vol_targeting_block(
+            nav, pairs, closes_by_ticker, market_data=have_market_data
+        ),
         "limits": {
             "single_name_risk_pct": limits.single_name_risk,
             "single_name_capital_pct": limits.single_name_capital,

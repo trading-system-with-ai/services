@@ -36,6 +36,7 @@ from libs.trading_core.models import ActorType, AuditAction
 
 from .. import audit
 from ..db import BacktestRecord, WatchlistItem, get_session
+from ..deps import require_market_data_provider
 from ..schemas import TICKER_RE
 from .analysis import ensure_daily_bars
 from .watchlist import CURRENT_USER
@@ -145,7 +146,14 @@ async def create_backtest(
     Synchronous V1 (no queue — see module docstring): the response is the
     finished record. 422s (unknown param keys, invalid values with the
     engine's own message) happen before any state change or audit write.
+
+    503 ``MARKET_DATA_NOT_CONFIGURED`` when no market data provider is
+    configured. A backtest is a claim about how a strategy WOULD have
+    performed; run over synthetic bars it produces a Sharpe ratio, a win rate
+    and an equity curve that look exactly like evidence and are worth nothing.
+    Checked before any state change or audit write.
     """
+    require_market_data_provider()
     # --- Param validation first: a 422 must not write state or audit. -------
     unknown = sorted(set(req.params) - _PARAM_FIELDS)
     if unknown:

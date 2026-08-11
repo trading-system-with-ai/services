@@ -1,13 +1,41 @@
 """Market data provider interface (development plan §22.1).
 
-Consumers depend only on this Protocol. Concrete providers (the local stub
-today, the MASSIVE-backed provider later) are selected by configuration via
-:func:`libs.market_data.get_provider`, never imported directly by callers —
-this keeps the provider swappable without touching consumer code.
+Consumers depend only on this Protocol. Concrete providers (the MASSIVE-backed
+provider; the local stub for development and tests) are selected by
+configuration via :func:`libs.market_data.get_provider`, never imported
+directly by callers — this keeps the provider swappable without touching
+consumer code.
+
+NO PROVIDER, NO DATA (§44 rule 18): there is no default provider. When
+``MARKET_DATA_PROVIDER`` is unset the registry raises
+:class:`ProviderNotConfigured` and every consumer surfaces that as an honest
+503 — an unconfigured install must NEVER be served synthetic numbers that
+look like real market data.
 """
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Protocol
+
+# The message every unconfigured-market-data path reports verbatim, so the API
+# error, the logs and the tests all name the SAME missing configuration.
+MARKET_DATA_NOT_CONFIGURED_MESSAGE = (
+    "market data provider is not configured — set MARKET_DATA_PROVIDER and "
+    "the corresponding credentials"
+)
+
+
+class ProviderNotConfigured(RuntimeError):
+    """No market data provider is configured (``MARKET_DATA_PROVIDER`` unset).
+
+    Deliberately NOT a ``ValueError``: an unknown provider name is a
+    misconfiguration the operator typed, while this is the absence of any
+    configuration at all — the state a fresh install starts in. Callers map it
+    to HTTP 503 ``MARKET_DATA_NOT_CONFIGURED`` and show nothing (§44 rule 18),
+    never a synthetic fallback.
+    """
+
+    def __init__(self, message: str = MARKET_DATA_NOT_CONFIGURED_MESSAGE) -> None:
+        super().__init__(message)
 
 # One option contract snapshot (plan §9). This is deliberately the SAME class
 # as libs.trading_core.contracts.ContractQuote — imported and aliased, never

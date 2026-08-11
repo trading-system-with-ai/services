@@ -45,7 +45,11 @@ async def test_values_match_real_dataclasses(client):
     assert body["environment"] == settings.environment
     assert body["providers"] == {
         "market_data": settings.market_data_provider,
+        # Explicit "is there a data source at all" booleans (§44 rule 18);
+        # true here because the fixture opts into the stub providers.
+        "market_data_configured": True,
         "llm": settings.llm_provider,
+        "llm_configured": True,
         "llm_model": settings.llm_model,
     }
 

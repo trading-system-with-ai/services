@@ -1,5 +1,16 @@
 """Deterministic stub recommendation provider.
 
+NOT LLM OUTPUT. NEVER A DEFAULT.
+
+Every draft this module produces is TEMPLATE-GENERATED — assembled from
+hand-written phrases and seeded scores, with no model call, no news, and no
+analysis behind it. It exists so local development and the test suite can
+exercise the recommendation pipeline deterministically, and it is reachable
+ONLY by explicitly setting ``LLM_PROVIDER=stub``. It must NEVER be used as a
+default or a fallback: when no LLM provider is configured the platform
+produces NO recommendations (HTTP 503 ``LLM_NOT_CONFIGURED``) rather than text
+that reads like real analysis but is not (§44 rule 18).
+
 STUB ONLY (development plan §4.1): this provider serves hand-written,
 plausible-sounding candidate drafts for local development and tests until the
 real news ingestion + LLM pipeline lands (Phase 8 full). It performs no I/O.

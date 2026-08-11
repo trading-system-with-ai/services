@@ -1,5 +1,17 @@
 """Deterministic stub market data provider.
 
+NOT MARKET DATA. NEVER A DEFAULT.
+
+Every number this module produces is SYNTHETIC — invented by seeded random
+walks and sinusoids, with no relationship whatsoever to any real market. It
+exists so local development and the test suite can exercise the full pipeline
+deterministically, and it is reachable ONLY by explicitly setting
+``MARKET_DATA_PROVIDER=stub``. It must NEVER be used as a default, a fallback,
+or a substitute when the real provider is unavailable: MASSIVE is the only
+supported source of real market data, and when it is not configured the
+platform shows NOTHING (HTTP 503 ``MARKET_DATA_NOT_CONFIGURED``) rather than
+numbers that look real but are not (§44 rule 18).
+
 STUB ONLY (development plan §22.1): this provider serves synthetic quotes and
 synthetic daily bars for local development and tests until the real MASSIVE
 market data integration lands. Quote prices are fixed per-symbol base values

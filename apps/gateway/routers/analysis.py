@@ -19,7 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from libs.common.config import get_settings
-from libs.market_data import get_provider
+from libs.market_data import ProviderNotConfigured, get_provider
 from libs.trading_core.features import atr, macd, realized_vol, rsi, sma
 from libs.trading_core.models import (
     ActorType,
@@ -39,6 +39,7 @@ from libs.trading_core.signals import (
 
 from .. import audit
 from ..db import BacktestRecord, StockBarDaily, WatchlistItem, get_session
+from ..deps import market_data_unavailable, require_market_data_provider
 
 router = APIRouter(prefix="/api/watchlist", tags=["analysis"])
 
@@ -75,6 +76,14 @@ async def ensure_daily_bars(
     Watchlist gating (plan §4.2) is the CALLER's responsibility — the market
     overview path uses this same function for the exempt system reference
     symbols (ADR-005).
+
+    UNCONFIGURED PROVIDER: when `provider_name` is blank the registry raises
+    :class:`ProviderNotConfigured` and this function re-raises it as the
+    shared 503 ``MARKET_DATA_NOT_CONFIGURED`` — the SAME body every other
+    market-data route returns. Because every backfill in the codebase funnels
+    through here, that one translation covers the analysis, bars, options,
+    backtest and order-gate paths at once: no bar is ever invented, and stored
+    bars (real data already fetched) still serve normally.
     """
     rows = await session.execute(
         select(StockBarDaily)
@@ -85,7 +94,10 @@ async def ensure_daily_bars(
     if stored:
         return stored
 
-    provider = get_provider(provider_name)
+    try:
+        provider = get_provider(provider_name)
+    except ProviderNotConfigured as exc:
+        raise market_data_unavailable(exc) from exc
     fetched = provider.get_daily_bars(ticker, days)
     if not fetched:
         raise HTTPException(
@@ -200,7 +212,13 @@ async def get_watchlist_overview(
 
     Bars are lazily backfilled per symbol via the shared helper, so a fresh
     symbol's first overview also writes its DATA_BACKFILL audit event.
+
+    503 ``MARKET_DATA_NOT_CONFIGURED`` when no market data provider is
+    configured: every column of this dashboard — last price, regime, scores,
+    opportunity status — is market data or computed from it, so an
+    unconfigured install shows no rows rather than rows of fiction.
     """
+    require_market_data_provider()
     settings = get_settings()
     regime_params = RegimeParams()
     directional_params = DirectionalParams()
@@ -258,8 +276,11 @@ async def get_symbol_analysis(
     """Full technical analysis for one Watchlist symbol (plan §6).
 
     404s for tickers not on the Watchlist: historical data may exist only for
-    Watchlist symbols (plan §4.2).
+    Watchlist symbols (plan §4.2). 503 ``MARKET_DATA_NOT_CONFIGURED`` when no
+    market data provider is configured — every number here is market data or
+    computed from it, so there is nothing honest to serve (§44 rule 18).
     """
+    require_market_data_provider()
     ticker = ticker.upper()
     row = await session.execute(
         select(WatchlistItem).where(WatchlistItem.ticker == ticker)
@@ -358,8 +379,11 @@ async def get_symbol_bars(
     exactly like the analysis endpoint — historical data may exist only for
     Watchlist symbols (plan §4.2) — and shares the same lazy-backfill path, so
     the first request for a fresh symbol writes its one DATA_BACKFILL audit
-    event and later requests are read-only.
+    event and later requests are read-only. 503
+    ``MARKET_DATA_NOT_CONFIGURED`` when no market data provider is configured:
+    bars are raw market data, never synthesized.
     """
+    require_market_data_provider()
     ticker = ticker.upper()
     row = await session.execute(
         select(WatchlistItem).where(WatchlistItem.ticker == ticker)

@@ -17,6 +17,14 @@ logged (with traceback) and swallowed; the next tick runs normally.
 ``asyncio.CancelledError`` is ALWAYS re-raised so graceful shutdown (§26 —
 lifespan cancels + awaits the task) is never swallowed.
 
+NO MARKET DATA, NO SWEEP: when no market data provider is configured the
+sweep is SKIPPED, not attempted. Every §11 exit rule compares against a
+current price, so a sweep without market data could only act on invented
+numbers — and acting means selling real positions. :func:`run_sweep_and_update`
+therefore logs one WARNING per attempt and returns without touching a single
+position, leaving the loop alive and quiet-ish (one line per tick, no
+traceback, no crash loop) until a provider is configured.
+
 NOTE for tests: httpx ASGITransport does not run the app lifespan, so the
 loop never starts there — GET /api/positions/monitor then honestly reports
 ``enabled: false`` (§44 rule 18) and tests drive :func:`run_sweep_and_update`
@@ -29,8 +37,10 @@ from datetime import datetime, timezone
 
 from libs.common.config import get_settings
 from libs.common.telemetry import REGISTRY
+from libs.market_data import MARKET_DATA_NOT_CONFIGURED_MESSAGE
 
 from .db import SessionLocal
+from .deps import market_data_configured
 from .routers.positions import run_exit_sweep
 
 logger = logging.getLogger("position_monitor")
@@ -74,7 +84,29 @@ async def run_sweep_and_update() -> dict:
 
     Split out from :func:`monitor_loop` so tests can drive a single sweep
     deterministically without a running background task.
+
+    Skips entirely (no session, no evaluation, NO position change) with one
+    WARNING line when no market data provider is configured — see the module
+    docstring. The skip result keeps the sweep's shape with
+    ``"skipped": "MARKET_DATA_NOT_CONFIGURED"`` added, and deliberately does
+    NOT advance ``sweeps_total`` or the telemetry counter: nothing was swept.
     """
+    if not market_data_configured():
+        logger.warning(
+            "position_monitor_skipped_no_market_data",
+            extra={
+                "extra_fields": {
+                    "reason": MARKET_DATA_NOT_CONFIGURED_MESSAGE,
+                    "sweeps_total": STATE.sweeps_total,
+                }
+            },
+        )
+        return {
+            "checked": 0,
+            "exits_triggered": [],
+            "held": [],
+            "skipped": "MARKET_DATA_NOT_CONFIGURED",
+        }
     async with SessionLocal() as session:
         result = await run_exit_sweep(session)
     exits = len(result["exits_triggered"])

@@ -21,6 +21,28 @@ class ProviderError(Exception):
     """Raised when a recommendation provider fails (network, HTTP, config)."""
 
 
+# The message every unconfigured-LLM path reports verbatim, so the API error,
+# the logs and the tests all name the SAME missing configuration.
+LLM_NOT_CONFIGURED_MESSAGE = (
+    "LLM provider is not configured — set LLM_PROVIDER and the corresponding "
+    "credentials"
+)
+
+
+class LLMProviderNotConfigured(ProviderError):
+    """No LLM provider is configured (``LLM_PROVIDER`` unset).
+
+    Mirrors :class:`libs.market_data.ProviderNotConfigured`: an unknown
+    provider name stays a ``ValueError`` (an operator typo), while this is the
+    absence of any configuration at all. Callers map it to HTTP 503
+    ``LLM_NOT_CONFIGURED`` — an unconfigured install must never be served
+    template-generated recommendations that read like real analysis.
+    """
+
+    def __init__(self, message: str = LLM_NOT_CONFIGURED_MESSAGE) -> None:
+        super().__init__(message)
+
+
 @dataclass
 class RecommendationDraft:
     """One LLM-proposed candidate, matching the plan §4.1 recommendation schema.

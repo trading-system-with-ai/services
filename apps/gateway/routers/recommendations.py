@@ -22,6 +22,7 @@ from libs.trading_core.models import ActorType, AuditAction
 
 from .. import audit
 from ..db import Recommendation, WatchlistItem, get_session, utcnow
+from ..deps import require_llm_provider
 from .watchlist import CURRENT_USER, add_ticker_to_watchlist
 
 router = APIRouter(prefix="/api/recommendations", tags=["recommendations"])
@@ -77,7 +78,14 @@ async def refresh_recommendations(session: AsyncSession = Depends(get_session)):
     SAFETY (plan §4.1, §44 rule 5): this route writes recommendation rows and
     audit events ONLY — never the Watchlist, Trading Pool, orders or
     positions. LLM output carries zero execution authority.
+
+    503 ``LLM_NOT_CONFIGURED`` when no LLM provider is configured. A
+    recommendation is a claim that some analysis happened; with no provider
+    there is no analysis, and template-generated drafts that read like
+    research are exactly the kind of plausible fiction this system refuses to
+    serve (§44 rule 18). No rows are created and nothing is audited.
     """
+    require_llm_provider()
     settings = get_settings()
     provider_name = settings.llm_provider
     try:

@@ -1,5 +1,34 @@
 # Development Log — Backend
 
+## 2026-08-10 — OpenAI LLM provider
+
+The user chose OpenAI for recommendations. `.env.example` alone could not
+express that: the registry only knew `stub` and `anthropic`, so configuring
+`LLM_PROVIDER=openai` would have failed with "unknown LLM provider".
+
+**Built:** `libs/llm/openai.py` — `OpenAIRecommendationProvider` on the
+Responses API (`POST /v1/responses`) with strict `text.format` JSON-schema
+structured output, registered as `"openai"`. It mirrors the Anthropic
+provider exactly, because the two must be interchangeable by configuration
+alone: ProviderError on a missing key at construction (never fires keyless)
+or on transport/HTTP failure, and malformed model output logged-and-skipped
+so a bad generation degrades to "no candidates" instead of crashing a
+request path. Refusal parts and unparseable bodies yield an empty list.
+14 new tests against a mocked httpx transport.
+
+**Model id:** `gpt-5.6-sol` — verified against OpenAI's live model docs
+rather than recalled (the assistant's training cutoff predates the GPT-5.6
+family). `.env.example` lists the flagship/balanced/cheap tiers for both
+providers and states that `LLM_MODEL` must match `LLM_PROVIDER` — there is
+no cross-provider translation.
+
+**Unchanged:** `llm_provider` still defaults to `""`. Recommendations stay
+off until the user sets both `LLM_PROVIDER` and `LLM_API_KEY`; an
+unconfigured install still answers 503 LLM_NOT_CONFIGURED.
+
+Full suite: 628 passing.
+
+
 Newest entries first. Each loop iteration appends one entry: what was built, key
 decisions, test/audit status, and what's next.
 

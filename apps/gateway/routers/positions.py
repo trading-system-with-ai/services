@@ -48,7 +48,8 @@ from libs.trading_core.models import ActorType, AuditAction
 
 from .. import audit
 from ..db import Position, StockBarDaily, get_session
-from .options import build_option_chain
+from ..deps import market_data_configured, require_market_data_provider
+from .options import option_chain_or_none
 from .orders import (
     POSITION_OPEN,
     execute_sell_to_close,
@@ -61,6 +62,14 @@ from .orders import (
 router = APIRouter(prefix="/api/positions", tags=["positions"])
 
 VALID_STATUS = ("OPEN", "CLOSED", "ALL")
+
+# Shown in an OPEN row's ``exit_reasons`` when no market data provider is
+# configured: the position is real, but nothing market-derived about it can be
+# known, so the gap is NAMED rather than filled with a synthetic number.
+NO_MARKET_DATA_REASON = (
+    "DATA_ISSUE: no market data provider is configured — no current price, "
+    "market value or exit evaluation is available for this position"
+)
 
 
 async def _stored_bars(session: AsyncSession, ticker: str) -> list[StockBarDaily]:
@@ -97,13 +106,17 @@ def _option_live_read(
     helper (routers/options.py) — an honest ``None`` when the contract is
     missing from the chain (e.g. expired), which makes the §11.3 premium
     stop report "insufficient data" loudly rather than pretending (§44
-    rule 18).
+    rule 18). The same honest ``None`` covers "no market data provider is
+    configured": ``dte`` is arithmetic on a stored expiry date and stays
+    real, but no mid can be known without a chain.
     """
     dte: int | None = None
     if position.opt_expiry:
         today = datetime.now(timezone.utc).date()
         dte = max(0, (date.fromisoformat(position.opt_expiry) - today).days)
-    _, chain = build_option_chain(position.ticker, spot)
+    chain = option_chain_or_none(position.ticker, spot)
+    if chain is None:
+        return dte, None
     contract = find_option_contract(chain, position)
     return dte, contract.mid if contract is not None else None
 
@@ -209,6 +222,19 @@ async def list_positions(
     quote lives in ``contract.current_mid``. ``stop_price`` on an option row
     is the §11.3 PREMIUM stop per share (from the exit engine), not an
     underlying level.
+
+    NOT 503 when market data is unconfigured — the deliberate difference from
+    every other market-facing endpoint. A position is a REAL row: the user
+    holds it, and its quantity, entry price, open date and realized PnL are
+    facts the DATABASE owns, not market data. Hiding them because no quote is
+    available would be its own dishonesty. The row is therefore still listed
+    and only the MARKET-DERIVED fields become honest nulls —
+    ``current_price``, ``market_value``, ``unrealized_pnl``,
+    ``unrealized_pnl_pct``, ``trail_price``, ``current_edge``, the option
+    ``current_mid`` and the whole exit-engine read — with the gap named in
+    ``exit_reasons``. Endpoints whose entire substance IS market data
+    (overview, analysis, bars, options, order preview/approve/close,
+    backtests, check-exits) answer 503 instead.
     """
     status = status.upper()
     if status not in VALID_STATUS:
@@ -221,6 +247,10 @@ async def list_positions(
     if status != "ALL":
         stmt = stmt.where(Position.status == status)
     positions = (await session.execute(stmt)).scalars().all()
+
+    # Checked ONCE per request: with no provider the live read is skipped for
+    # every OPEN row (see the docstring — real rows, null market fields).
+    have_market_data = market_data_configured()
 
     out: list[dict] = []
     for pos in positions:
@@ -270,7 +300,13 @@ async def list_positions(
             "exit_reasons": [],
             "contract": contract_out,
         }
-        if pos.status == POSITION_OPEN:
+        if pos.status == POSITION_OPEN and not have_market_data:
+            # No provider configured: the row's DB facts above stand, every
+            # market-derived field stays null, and the user is told why
+            # instead of being shown a number nobody can vouch for.
+            row["stop_price"] = None
+            row["exit_reasons"] = [NO_MARKET_DATA_REASON]
+        elif pos.status == POSITION_OPEN:
             bars = await _stored_bars(session, pos.ticker)
             option_read = None
             if bars:
@@ -349,7 +385,13 @@ async def check_exits(session: AsyncSession = Depends(get_session)) -> dict:
     The whole flow lives in :func:`run_exit_sweep`, shared verbatim with the
     background position monitor (apps/gateway/monitor.py) — one sweep
     implementation, two triggers (plan §21 spirit: never reimplement).
+
+    503 ``MARKET_DATA_NOT_CONFIGURED`` when no market data provider is
+    configured: every exit rule is a comparison against a current price, so a
+    sweep without market data could only ever act on invented numbers. Refusing
+    to sweep is the safe answer — it changes nothing (§44 rule 18).
     """
+    require_market_data_provider()
     return await run_exit_sweep(session)
 
 

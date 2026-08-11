@@ -12,6 +12,9 @@ INITIAL_CASH = 100_000.0
 
 CONTRACT_KEYS = {
     "as_of",
+    # Honest status of the market data dependency this view degrades on rather
+    # than 503s on (tests/test_no_synthetic_data.py owns the unconfigured case).
+    "market_data",
     "nav",
     "cash",
     "cash_pct",
@@ -37,6 +40,10 @@ async def test_fresh_portfolio_risk(client):
 
     assert set(body) == CONTRACT_KEYS
     datetime.fromisoformat(body["as_of"])
+
+    # A provider IS configured for this fixture, so the block says so and the
+    # market-derived fields below are real (not the degraded null path).
+    assert body["market_data"] == {"configured": True, "message": None}
 
     # Fresh paper account: NAV == cash == paper_initial_cash, zero heat.
     assert body["nav"] == INITIAL_CASH

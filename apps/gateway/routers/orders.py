@@ -121,6 +121,7 @@ from ..db import (
     get_session,
     utcnow,
 )
+from ..deps import require_market_data_provider
 from ..schemas import TickerRequest
 from .analysis import ensure_daily_bars, market_regime_from_spy
 from .options import build_option_chain, chain_iv_summary
@@ -857,7 +858,13 @@ async def preview_order(
 
     Places no order. Writes exactly one SYSTEM RISK_DECISION audit event —
     veto or approval — committed in the same transaction (§38, rule 12).
+
+    503 ``MARKET_DATA_NOT_CONFIGURED`` when no market data provider is
+    configured. Every gate — data quality, regime, volatility, contract
+    selection, sizing — is a judgement about current prices; running them on
+    invented numbers would produce a confident recommendation about nothing.
     """
+    require_market_data_provider()
     result = await run_gate_chain(session, req.ticker, req.quantity, req.direction)
     await session.commit()
     return result.preview
@@ -1177,7 +1184,12 @@ async def approve_order(
     all commit atomically (rule 12). The whole flow runs under the
     paper-execution lock so two rapid approves can never double-fill (§42;
     V1 no-pyramiding).
+
+    503 ``MARKET_DATA_NOT_CONFIGURED`` when no market data provider is
+    configured — checked BEFORE the lock and before the idempotency lookup, so
+    an unconfigured install cannot fill an order at a made-up price.
     """
+    require_market_data_provider()
     async with execution_lock():
         return await _approve_order_locked(req, session)
 
@@ -1431,7 +1443,15 @@ async def close_position(
     ORDER_SUBMITTED -> ORDER_FILLED audit chain commit in ONE transaction
     (rule 12), under the paper-execution lock so two rapid closes can never
     double-credit cash (§42 analogue).
+
+    503 ``MARKET_DATA_NOT_CONFIGURED`` when no market data provider is
+    configured. Closing normally outranks the §18 kill switch because it
+    reduces risk — but this is not a policy pause, it is the absence of a
+    price. A fill must happen AT something, and booking realized PnL against
+    an invented number would corrupt the ledger permanently. Refusing is the
+    conservative answer: the position stays open and honest.
     """
+    require_market_data_provider()
     async with execution_lock():
         return await _close_position_locked(req, session)
 

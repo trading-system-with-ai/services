@@ -1,7 +1,10 @@
 """Market overview API (development plan §22.1, §6.1).
 
-Quotes come from the configured MarketDataProvider (stub until the MASSIVE
-integration lands). The market regime is COMPUTED by the Market Regime Engine
+Quotes come from the configured MarketDataProvider — Massive is the only
+supported real source. With NO provider configured this endpoint answers 503
+``MARKET_DATA_NOT_CONFIGURED`` and reports no numbers at all: an overview of
+invented prices would be worse than no overview (§44 rule 18).
+The market regime is COMPUTED by the Market Regime Engine
 (libs.trading_core.signals.classify_regime, plan §6.1) from stored SPY daily
 bars — no placeholder.
 
@@ -23,6 +26,7 @@ from libs.market_data import get_provider
 from libs.trading_core.signals import classify_regime
 
 from ..db import get_session
+from ..deps import require_market_data_provider
 from .analysis import ensure_daily_bars
 
 router = APIRouter(prefix="/api/market", tags=["market"])
@@ -37,6 +41,13 @@ REGIME_SYMBOL = "SPY"
 
 @router.get("/overview")
 async def market_overview(session: AsyncSession = Depends(get_session)) -> dict:
+    """Index quotes + the SPY-derived regime, or 503 when unconfigured.
+
+    Everything in this payload is market data or computed from it, so with no
+    provider configured there is nothing honest to return: the shared guard
+    raises 503 ``MARKET_DATA_NOT_CONFIGURED`` before any number is produced.
+    """
+    require_market_data_provider()
     settings = get_settings()
     provider = get_provider(settings.market_data_provider)
     quotes = provider.get_quotes(INDEX_SYMBOLS)

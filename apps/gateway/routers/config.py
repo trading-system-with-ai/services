@@ -28,6 +28,7 @@ from libs.trading_core.signals import DirectionalParams, RegimeParams
 from libs.trading_core.strategies import AccountPermissions
 
 from ..db import get_or_create_system_state, get_session
+from ..deps import llm_configured, market_data_configured
 
 router = APIRouter(prefix="/api/config", tags=["config"])
 
@@ -63,8 +64,14 @@ async def get_config(session: AsyncSession = Depends(get_session)) -> dict:
     return {
         "environment": settings.environment,
         "providers": {
+            # Provider NAMES are reported verbatim — "" when unset, never a
+            # cosmetic default — alongside explicit booleans so a client can
+            # tell "no data source" from "some data source" without parsing
+            # names it does not know (§44 rule 18).
             "market_data": settings.market_data_provider,
+            "market_data_configured": market_data_configured(),
             "llm": settings.llm_provider,
+            "llm_configured": llm_configured(),
             "llm_model": settings.llm_model,
         },
         "account_permissions": asdict(AccountPermissions()),

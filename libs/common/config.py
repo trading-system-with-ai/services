@@ -14,14 +14,24 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:///./dev.db"
     redis_url: str = "redis://localhost:6379/0"
 
-    # External providers (empty by default; required only when the relevant service starts)
+    # External providers.
+    #
+    # HONESTY RULE (§44 rule 18): both provider fields default to "" — UNSET —
+    # and there is deliberately NO fallback. Massive is the only supported real
+    # market data source; when MARKET_DATA_PROVIDER is unset every endpoint
+    # needing market data answers 503 MARKET_DATA_NOT_CONFIGURED and the
+    # platform shows NOTHING rather than synthetic numbers that look real.
+    # The "stub" providers still exist in the registries but are opt-in only
+    # (development/tests), never a default — an unconfigured install must never
+    # silently serve made-up prices, bars, chains or recommendations.
     massive_api_key: str = ""
-    market_data_provider: str = "stub"  # "stub" until the MASSIVE integration lands (plan §22.1)
-    # Safe default: the deterministic stub works without any API key (plan
-    # §4.1); switch to "anthropic" once llm_api_key is configured.
-    llm_provider: str = "stub"
+    market_data_provider: str = ""  # "" = unset; "massive" (real) | "stub" (dev/tests only)
+    llm_provider: str = ""  # "" = unset; "openai" | "anthropic" (real) | "stub" (dev/tests only)
     llm_api_key: str = ""
-    llm_model: str = "claude-sonnet-5"
+    # Must match llm_provider — model ids are provider-specific and there is no
+    # cross-provider translation (e.g. "gpt-5.6-sol" for openai,
+    # "claude-opus-5" for anthropic). Ignored while llm_provider is unset.
+    llm_model: str = "gpt-5.6-sol"
 
     # Global safety switches
     trading_enabled: bool = False  # kill switch default: OFF until explicitly enabled

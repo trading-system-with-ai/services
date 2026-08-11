@@ -29,7 +29,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from libs.common.config import get_settings
-from libs.market_data import get_provider
+from libs.market_data import ProviderNotConfigured, get_provider
 from libs.trading_core.contracts import (
     ContractQuote,
     ScoredContract,
@@ -40,6 +40,7 @@ from libs.trading_core.models import DirectionalBias
 from libs.trading_core.signals import score_direction
 
 from ..db import WatchlistItem, get_session
+from ..deps import market_data_configured, require_market_data_provider
 from .analysis import ensure_daily_bars
 
 router = APIRouter(prefix="/api/watchlist", tags=["options"])
@@ -89,11 +90,34 @@ def build_option_chain(ticker: str, spot: float) -> tuple[date, list[ContractQuo
     is keyed by (symbol, day), so two calls on the same day are
     byte-identical (deterministic by construction). Returns ``(as_of,
     chain)`` where ``as_of`` is the snapshot DATE.
+
+    Raises :class:`libs.market_data.ProviderNotConfigured` when no provider is
+    configured — a chain is pure market data and is never invented. Callers
+    that must keep answering (the positions list, the portfolio risk view) use
+    :func:`option_chain_or_none` instead and report honest nulls.
     """
     settings = get_settings()
     as_of = datetime.now(timezone.utc).date()
     provider = get_provider(settings.market_data_provider)
     return as_of, provider.get_option_chain(ticker, spot, as_of)
+
+
+def option_chain_or_none(ticker: str, spot: float) -> list[ContractQuote] | None:
+    """Today's chain for `ticker`, or ``None`` when market data is unconfigured.
+
+    The degrading variant of :func:`build_option_chain`, for read views that
+    stay 200 because their substance is real DB state (positions, portfolio
+    risk). ``None`` means "no quote is knowable" and every option-derived
+    field the caller would have filled becomes an honest null — never a zero,
+    never a synthetic mid (§44 rule 18).
+    """
+    if not market_data_configured():
+        return None
+    try:
+        _as_of, chain = build_option_chain(ticker, spot)
+    except ProviderNotConfigured:
+        return None
+    return chain
 
 
 def chain_iv_summary(
@@ -156,11 +180,15 @@ async def get_symbol_options(
 ) -> dict:
     """Option chain + selector verdicts for one Watchlist symbol (plan §9).
 
-    404s for tickers not on the Watchlist (plan §4.2). Read-only — no audit
-    event (chain reads are reads). ``as_of`` is the chain snapshot DATE:
-    the stub chain is keyed by day, so two calls on the same day return
-    byte-identical payloads (deterministic by construction).
+    404s for tickers not on the Watchlist (plan §4.2). 503
+    ``MARKET_DATA_NOT_CONFIGURED`` when no market data provider is configured
+    — spot, the chain, the greeks and the IV summary are all market data or
+    computed from it, so nothing here can be served honestly without it.
+    Read-only — no audit event (chain reads are reads). ``as_of`` is the chain
+    snapshot DATE: the stub chain is keyed by day, so two calls on the same
+    day return byte-identical payloads (deterministic by construction).
     """
+    require_market_data_provider()
     ticker = ticker.upper()
     row = await session.execute(
         select(WatchlistItem).where(WatchlistItem.ticker == ticker)

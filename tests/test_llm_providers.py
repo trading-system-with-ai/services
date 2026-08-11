@@ -129,14 +129,39 @@ def test_draft_boundary_values_accepted():
 # Registry
 # ---------------------------------------------------------------------------
 
-def test_registry_default_provider_is_stub():
-    # Safe default (works keyless — plan §4.1): the Settings field defaults to
-    # "stub", and asking the registry for it yields the stub implementation.
+def test_registry_has_no_default_provider():
+    # THERE IS NO DEFAULT (§44 rule 18). The Settings field defaults to "" —
+    # unset — so an unconfigured install can never be served
+    # template-generated drafts that read like real research.
     from libs.common.config import Settings
 
-    assert Settings.model_fields["llm_provider"].default == "stub"
+    assert Settings.model_fields["llm_provider"].default == ""
+
+
+def test_registry_stub_is_opt_in_and_still_available():
+    # The stub stays in the registry as an explicitly opt-in development/test
+    # provider: asking for it by name still yields the stub implementation.
     provider = get_recommendation_provider("stub")
     assert isinstance(provider, StubRecommendationProvider)
+
+
+@pytest.mark.parametrize("name", ["", "   ", "\t"])
+def test_registry_blank_name_raises_not_configured(name):
+    # Blank name = the unconfigured state, and it names the missing setting.
+    from libs.llm import LLMProviderNotConfigured
+
+    with pytest.raises(LLMProviderNotConfigured, match="LLM_PROVIDER"):
+        get_recommendation_provider(name)
+
+
+def test_not_configured_is_a_provider_error_not_a_value_error():
+    # LLMProviderNotConfigured subclasses ProviderError (callers that already
+    # handle provider failure keep working) and is NOT a ValueError — an
+    # unknown NAME is an operator typo, absence of config is a different fact.
+    from libs.llm import LLMProviderNotConfigured
+
+    assert issubclass(LLMProviderNotConfigured, ProviderError)
+    assert not issubclass(LLMProviderNotConfigured, ValueError)
 
 
 def test_registry_unknown_name_raises():
@@ -267,3 +292,162 @@ def test_anthropic_missing_api_key_raises():
     # llm_api_key can never reach the network (plan §4.1 safe default).
     with pytest.raises(ProviderError, match="API key"):
         AnthropicRecommendationProvider(api_key="", model="claude-sonnet-5")
+
+
+# ---------------------------------------------------------------------------
+# OpenAI provider (mocked httpx transport — never touches the network)
+#
+# Mirrors the Anthropic suite: the two providers are interchangeable by
+# configuration alone, so they must fail and degrade identically.
+# ---------------------------------------------------------------------------
+
+OPENAI_MODEL = "gpt-5.6-sol"
+
+
+def _openai_response(recommendations):
+    """A Responses API body carrying the structured-output JSON."""
+    return {
+        "id": "resp_test",
+        "object": "response",
+        "model": OPENAI_MODEL,
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": json.dumps({"recommendations": recommendations}),
+                    }
+                ],
+            }
+        ],
+        "usage": {"input_tokens": 10, "output_tokens": 20},
+    }
+
+
+def _openai_provider_with(handler):
+    from libs.llm.openai import OpenAIRecommendationProvider
+
+    return OpenAIRecommendationProvider(
+        api_key="test-key",
+        model=OPENAI_MODEL,
+        transport=httpx.MockTransport(handler),
+    )
+
+
+def test_openai_parses_valid_response_and_sends_expected_request():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["headers"] = request.headers
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_openai_response([VALID_ENTRY]))
+
+    drafts = _openai_provider_with(handler).generate({"TSLA"}, AS_OF, limit=5)
+
+    assert len(drafts) == 1
+    draft = drafts[0]
+    assert draft.ticker == "AAPL"
+    assert draft.sentiment == pytest.approx(0.6)
+    assert draft.evidence[0]["source"] == "Reuters"
+
+    # Request shape per the OpenAI Responses API.
+    assert captured["url"].endswith("/v1/responses")
+    assert captured["headers"]["authorization"] == "Bearer test-key"
+    assert captured["body"]["model"] == OPENAI_MODEL
+    fmt = captured["body"]["text"]["format"]
+    assert fmt["type"] == "json_schema" and fmt["strict"] is True
+    assert "TSLA" in captured["body"]["input"]
+
+
+def test_openai_reads_output_text_convenience_field():
+    def handler(request):
+        body = _openai_response([VALID_ENTRY])
+        body["output_text"] = json.dumps({"recommendations": [VALID_ENTRY]})
+        return httpx.Response(200, json=body)
+
+    assert [d.ticker for d in _openai_provider_with(handler).generate(set(), AS_OF)] == ["AAPL"]
+
+
+def test_openai_drops_malformed_entries_without_raising():
+    malformed = [
+        {**VALID_ENTRY, "ticker": "MSFT", "sentiment": 3.0},  # out of range
+        {k: v for k, v in VALID_ENTRY.items() if k != "ticker"},  # missing field
+        "not-an-object",
+    ]
+
+    def handler(request):
+        return httpx.Response(200, json=_openai_response([VALID_ENTRY] + malformed))
+
+    drafts = _openai_provider_with(handler).generate(set(), AS_OF)
+    assert [d.ticker for d in drafts] == ["AAPL"]
+
+
+def test_openai_drops_excluded_tickers_defensively():
+    def handler(request):
+        return httpx.Response(200, json=_openai_response([VALID_ENTRY]))
+
+    assert _openai_provider_with(handler).generate({"AAPL"}, AS_OF) == []
+
+
+def test_openai_refusal_returns_empty_list():
+    def handler(request):
+        body = _openai_response([])
+        body["output"] = [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "refusal", "refusal": "I can't help with that."}],
+            }
+        ]
+        return httpx.Response(200, json=body)
+
+    assert _openai_provider_with(handler).generate(set(), AS_OF) == []
+
+
+def test_openai_unparseable_text_returns_empty_list():
+    def handler(request):
+        body = _openai_response([])
+        body["output"][0]["content"][0]["text"] = "not json at all"
+        return httpx.Response(200, json=body)
+
+    assert _openai_provider_with(handler).generate(set(), AS_OF) == []
+
+
+def test_openai_network_error_raises_provider_error():
+    def handler(request):
+        raise httpx.ConnectError("connection refused", request=request)
+
+    with pytest.raises(ProviderError, match="request failed"):
+        _openai_provider_with(handler).generate(set(), AS_OF)
+
+
+def test_openai_http_error_status_raises_provider_error():
+    def handler(request):
+        return httpx.Response(500, json={"error": {"message": "server error"}})
+
+    with pytest.raises(ProviderError, match="HTTP 500"):
+        _openai_provider_with(handler).generate(set(), AS_OF)
+
+
+def test_openai_missing_api_key_raises():
+    # The registry only constructs this provider from settings, so an empty
+    # llm_api_key can never reach the network (plan §4.1 safe default).
+    from libs.llm.openai import OpenAIRecommendationProvider
+
+    with pytest.raises(ProviderError, match="API key"):
+        OpenAIRecommendationProvider(api_key="", model=OPENAI_MODEL)
+
+
+def test_registry_knows_openai_and_still_has_no_default():
+    from libs.llm import LLMProviderNotConfigured
+
+    # Registered by name...
+    with pytest.raises(ProviderError, match="API key"):
+        get_recommendation_provider("openai")  # no key configured in tests
+    # ...but naming nothing is still the unconfigured state, not a fallback.
+    with pytest.raises(LLMProviderNotConfigured):
+        get_recommendation_provider("")
