@@ -61,7 +61,16 @@ stop; ``max_loss`` is the full premium paid (``qty * fill * 100``, §12.1).
 
 Risk approval calls ``libs.trading_core.risk.assess`` — the risk engine is
 never reimplemented here, and risk limits have PRIORITY over strategy
-confidence (§44 rule 20). Every chain run writes exactly ONE SYSTEM-attributed
+confidence (§44 rule 20). The call now also carries (a) the §14 vol-targeting
+``budget_multiplier`` — the SAME computation the portfolio risk view reports
+(shared helper in routers/portfolio.py; 1.0 when no positions are open), which
+scales the tier budget but can NEVER override hard caps (§14) and is named in
+the RISK_APPROVAL detail whenever it differs from 1 — and (b) the §16
+portfolio greeks (current book aggregated via the shared helper, plus the
+candidate's per-share greeks: stock delta 1, options the proposed contract's
+greeks), so a post-trade greek-limit breach REJECTs exactly like any other
+risk limit, with its reason codes and explanations surfaced in the preview.
+Every chain run writes exactly ONE SYSTEM-attributed
 RISK_DECISION audit event — even when vetoed at gate one — in the same
 transaction, so every decision is auditable (§38, rule 12).
 """
@@ -79,6 +88,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from libs.common.config import get_settings
 from libs.trading_core.contracts import ContractQuote, SelectorParams, select_contracts
 from libs.trading_core.features import atr
+from libs.trading_core.greeks import PositionGreeksInput
 from libs.trading_core.models import (
     ActorType,
     AuditAction,
@@ -114,7 +124,20 @@ from ..db import (
 from ..schemas import TickerRequest
 from .analysis import ensure_daily_bars, market_regime_from_spy
 from .options import build_option_chain, chain_iv_summary
-from .portfolio import open_positions_with_prices
+
+# The portfolio-picture helpers live in routers/portfolio.py so the risk view
+# and this order path build the identical book (plan §21). find_option_contract
+# and is_option_position are also RE-EXPORTED through this module on purpose:
+# routers/positions.py imports them from here.
+from .portfolio import (
+    find_option_contract,
+    is_option_position,
+    open_positions_with_prices,
+    portfolio_greeks_read,
+    position_market_value,
+    stored_closes_by_ticker,
+    vol_targeting_block,
+)
 
 router = APIRouter(prefix="/api/orders", tags=["orders"])
 
@@ -206,16 +229,6 @@ SKIP_STOCK_ORDER = "stock order — no contract selection needed"
 # resolved BEAR direction may still trade a bear regime — via long puts only.
 _BEAR_REGIMES = frozenset({MarketRegime.MILD_BEAR, MarketRegime.STRONG_BEAR})
 
-# Option instruments (the §8 matrix outputs needing a §9 contract).
-_OPTION_INSTRUMENTS = frozenset(
-    {InstrumentType.LONG_CALL.value, InstrumentType.LONG_PUT.value}
-)
-
-
-def is_option_position(position: Position) -> bool:
-    """True when `position` holds a long option (LONG_CALL / LONG_PUT)."""
-    return position.instrument in _OPTION_INSTRUMENTS
-
 
 class OrderPreviewRequest(TickerRequest):
     quantity: int | None = Field(default=None, ge=1)
@@ -265,23 +278,6 @@ class GateChainResult:
     def failed(self) -> bool:
         """True when any gate FAILed — no order may be produced (§42)."""
         return self.veto_gate is not None
-
-
-def position_market_value(position: Position, price: float | None) -> float | None:
-    """One OPEN position's market value for the NAV / risk snapshot (§12.5).
-
-    Stock: ``quantity * last stored close`` (``None`` when the ticker has no
-    stored bars — honest null, the caller counts 0 toward NAV). Options:
-    ``quantity * avg_price * multiplier`` — the premium PAID (book value), a
-    documented V1 approximation until option marks are wired into the
-    portfolio view; it is exact for heat purposes because a long option's
-    max_loss IS that premium (§12.1).
-    """
-    if is_option_position(position):
-        return position.quantity * position.avg_price * (position.multiplier or 1)
-    if price is None:
-        return None
-    return position.quantity * price
 
 
 async def run_gate_chain(
@@ -651,6 +647,47 @@ async def run_gate_chain(
             regime=spy_regime,
             trading_enabled=state.trading_enabled,
         )
+        # §14 vol targeting: the SAME computation the portfolio risk view
+        # reports (shared helper — one implementation, plan §21). The
+        # multiplier scales the §12.2 tier budget INSIDE assess, which
+        # hard-caps it at abs_max_trade_risk — vol targeting can NEVER
+        # override hard caps (§14, §44 rule 20). No open positions -> 1.0.
+        closes_by_ticker = await stored_closes_by_ticker(
+            session, (pos.ticker for pos, _price in pairs)
+        )
+        vol_block = vol_targeting_block(nav, pairs, closes_by_ticker)
+        budget_multiplier = vol_block["multiplier"]
+        # §16 portfolio greek limits: the current book's aggregated greeks
+        # (shared helper) plus the candidate's per-share greeks — stock is
+        # delta 1 / gamma 0 / theta 0 / vega 0; an option candidate carries
+        # the proposed §9 contract's greeks. assess checks the post-trade
+        # book at the APPROVED quantity; a breach REJECTs like any other
+        # risk limit (§44 rule 20).
+        book_greeks, _greek_rows = portfolio_greeks_read(pairs)
+        if chosen is not None:
+            candidate_greeks = PositionGreeksInput(
+                ticker=ticker,
+                instrument=decision.instrument.value,
+                quantity=1,  # requested basis; assess scales by approved qty
+                multiplier=OPTION_MULTIPLIER,
+                spot=entry_price,
+                delta=chosen.delta,
+                gamma=chosen.gamma,
+                theta_per_day=chosen.theta,
+                vega=chosen.vega,
+            )
+        else:
+            candidate_greeks = PositionGreeksInput(
+                ticker=ticker,
+                instrument=InstrumentType.LONG_STOCK.value,
+                quantity=1,  # requested basis; assess scales by approved qty
+                multiplier=1,
+                spot=entry_price,
+                delta=1.0,
+                gamma=0.0,
+                theta_per_day=0.0,
+                vega=0.0,
+            )
         assessment = assess(
             RiskRequest(
                 ticker=ticker,
@@ -661,6 +698,16 @@ async def run_gate_chain(
             ),
             snapshot,
             limits,
+            budget_multiplier=budget_multiplier,
+            portfolio_greeks=book_greeks,
+            new_position_greeks=candidate_greeks,
+        )
+        # §14 transparency: when vol targeting actually scaled the budget the
+        # gate detail says so, with the real number.
+        vt_detail = (
+            f", budget multiplier {budget_multiplier:.2f} (vol targeting)"
+            if abs(budget_multiplier - 1.0) > 1e-9
+            else ""
         )
         unit = "contracts" if chosen is not None else "shares"
         if assessment.decision is RiskDecision.REJECT:
@@ -668,7 +715,8 @@ async def run_gate_chain(
                 "RISK_APPROVAL",
                 FAIL,
                 f"risk engine REJECT ({', '.join(assessment.reason_codes)}) — "
-                "risk limits have priority over strategy confidence (§44 rule 20)",
+                "risk limits have priority over strategy confidence "
+                f"(§44 rule 20){vt_detail}",
             )
             vetoed = True
         elif assessment.decision is RiskDecision.APPROVE_WITH_RESIZE:
@@ -677,14 +725,14 @@ async def run_gate_chain(
                 PASS,
                 f"APPROVE_WITH_RESIZE: quantity resized to "
                 f"{assessment.approved_quantity} {unit} "
-                f"({', '.join(assessment.reason_codes)})",
+                f"({', '.join(assessment.reason_codes)}){vt_detail}",
             )
         else:
             gate(
                 "RISK_APPROVAL",
                 PASS,
                 f"APPROVE: {assessment.approved_quantity} {unit}, "
-                f"${assessment.trade_risk_usd:,.2f} at risk",
+                f"${assessment.trade_risk_usd:,.2f} at risk{vt_detail}",
             )
 
     # §33: aggregate the passing/failing gate details + risk explanations;
@@ -915,23 +963,6 @@ async def _last_stored_close(session: AsyncSession, ticker: str) -> float | None
         .scalars()
         .first()
     )
-
-
-def find_option_contract(
-    chain: list[ContractQuote], position: Position
-) -> ContractQuote | None:
-    """Locate `position`'s EXACT contract (expiry + strike + right) in a
-    freshly regenerated chain; ``None`` when it is no longer quoted (e.g.
-    expired off the chain) — the caller falls back to intrinsic value."""
-    for c in chain:
-        if (
-            c.expiry.isoformat() == position.opt_expiry
-            and c.right == position.opt_right
-            and position.opt_strike is not None
-            and abs(c.strike - position.opt_strike) < 1e-9
-        ):
-            return c
-    return None
 
 
 def option_intrinsic_value(position: Position, spot: float) -> float:

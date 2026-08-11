@@ -450,3 +450,266 @@ def test_property_risk_invariants_hold_for_random_portfolios():
     # The generator must actually exercise both outcomes.
     assert approvals > 20
     assert rejects > 20
+
+
+# ---------------------------------------------------------------------------
+# ADDITIVE §14 / §16 parameters (appended; all tests above are UNCHANGED).
+# budget_multiplier scales the tier budget BEFORE the absolute cap; the
+# portfolio greek limits check the post-trade book at the APPROVED quantity.
+# ---------------------------------------------------------------------------
+
+from libs.trading_core.greeks import (  # noqa: E402
+    PortfolioGreeks,
+    PositionGreeksInput,
+)
+
+
+def flat_greeks(
+    delta_notional: float = 0.0,
+    theta_per_day: float = 0.0,
+    vega: float = 0.0,
+) -> PortfolioGreeks:
+    """Current-book greeks with only the exercised exposures non-zero."""
+    return PortfolioGreeks(
+        net_delta_shares=0.0,
+        delta_adjusted_notional=delta_notional,
+        net_gamma=0.0,
+        net_theta_per_day=theta_per_day,
+        net_vega=vega,
+        per_position=(),
+    )
+
+
+def candidate(
+    delta: float = 0.0,
+    spot: float = 10.0,
+    theta_per_day: float = 0.0,
+    vega: float = 0.0,
+    quantity: int = 25,
+    multiplier: int = 100,
+    instrument: str = "LONG_CALL",
+) -> PositionGreeksInput:
+    """Candidate per-share greeks; ``quantity`` is the requested basis —
+    the engine must rescale to the APPROVED quantity."""
+    return PositionGreeksInput(
+        ticker="XOM",
+        instrument=instrument,
+        quantity=quantity,
+        multiplier=multiplier,
+        spot=spot,
+        delta=delta,
+        gamma=0.0,
+        theta_per_day=theta_per_day,
+        vega=vega,
+    )
+
+
+# --- §14 budget multiplier -------------------------------------------------
+
+
+def test_budget_multiplier_half_halves_budget_bound_quantity():
+    # Reference: VERY_STRONG budget 1.25% of 100,000 / stop 1.0 = 1,250.
+    # Multiplier 0.5 -> effective budget 0.625% -> floor(625 / 1.0) = 625.
+    base = assess(req(edge=90.0), snap())
+    assert base.approved_quantity == 1_250
+    halved = assess(req(edge=90.0), snap(), budget_multiplier=0.5)
+    assert halved.decision is RiskDecision.APPROVE
+    assert halved.approved_quantity == 625
+    assert halved.risk_budget_pct == pytest.approx(0.00625)
+    assert halved.trade_risk_usd == pytest.approx(625.0)
+
+
+def test_budget_multiplier_never_overrides_abs_max_trade_risk():
+    # 0.0125 * 10 = 12.5% raw, but §14 NEVER overrides hard caps:
+    # effective = min(0.125, abs_max_trade_risk 0.015) = 1.5% -> floor(
+    # 1,500 / 1.0) = 1,500 shares (single-name risk headroom is exactly
+    # 1,500 as well, so the abs cap is what binds the budget).
+    result = assess(req(edge=90.0), snap(), budget_multiplier=10.0)
+    assert result.risk_budget_pct == pytest.approx(0.015)
+    assert result.approved_quantity == 1_500
+    assert result.decision is RiskDecision.APPROVE
+
+
+def test_budget_multiplier_must_be_positive():
+    with pytest.raises(ValueError):
+        assess(req(edge=90.0), snap(), budget_multiplier=0.0)
+    with pytest.raises(ValueError):
+        assess(req(edge=90.0), snap(), budget_multiplier=-0.5)
+
+
+# --- §16 portfolio greek limits, each firing individually ------------------
+
+
+def test_portfolio_delta_limit_rejects_with_post_trade_numbers():
+    # Book delta-adjusted notional $140,000. Approved qty is the budget
+    # quantity 1,250 (stock, mult 1); its contribution is 1,250 * 1 * 1.0
+    # * $10 = $12,500 -> post-trade $152,500 > cap 1.50 * 100,000 =
+    # $150,000 -> PORTFOLIO_DELTA_LIMIT, rejected outright.
+    result = assess(
+        req(edge=90.0, entry_price=10.0, stop_distance=1.0),
+        snap(),
+        portfolio_greeks=flat_greeks(delta_notional=140_000.0),
+        new_position_greeks=candidate(
+            delta=1.0, spot=10.0, quantity=1_250, multiplier=1,
+            instrument="LONG_STOCK",
+        ),
+    )
+    assert result.decision is RiskDecision.REJECT
+    assert result.approved_quantity == 0
+    assert result.reason_codes == ["PORTFOLIO_DELTA_LIMIT"]
+    joined = " ".join(result.explanations)
+    assert "152,500.00" in joined  # §36-style real numbers
+    assert "150,000.00" in joined
+
+
+def test_portfolio_theta_limit_rejects_individually():
+    # Budget: floor(100,000 * 0.0125 / stop 50) = 25 contracts. Theta
+    # contribution 25 * 100 * (-0.05) = -$125/day; book -$90/day -> post
+    # -$215/day. Cap 0.001 * 100,000 = $100/day -> |−215| > 100 -> reject.
+    # Delta (25*100*0.5*$10 = $12,500 < $150,000) and vega (25*100*0.1 =
+    # $250 < $1,000) stay inside their caps: ONLY theta fires.
+    result = assess(
+        req(edge=90.0, entry_price=250.0, stop_distance=50.0),
+        snap(),
+        portfolio_greeks=flat_greeks(theta_per_day=-90.0),
+        new_position_greeks=candidate(
+            delta=0.5, theta_per_day=-0.05, vega=0.1
+        ),
+    )
+    assert result.decision is RiskDecision.REJECT
+    assert result.approved_quantity == 0
+    assert result.reason_codes == ["PORTFOLIO_THETA_LIMIT"]
+    assert "215.00" in " ".join(result.explanations)
+
+
+def test_portfolio_vega_limit_rejects_individually():
+    # Book vega $900; contribution 25 * 100 * 0.2 = $500 -> post $1,400 >
+    # cap 0.01 * 100,000 = $1,000 -> reject. Delta ($7,500 vs cap $150,000)
+    # and theta (-$50 vs $100/day) stay inside: ONLY vega fires.
+    result = assess(
+        req(edge=90.0, entry_price=250.0, stop_distance=50.0),
+        snap(),
+        portfolio_greeks=flat_greeks(vega=900.0),
+        new_position_greeks=candidate(
+            delta=0.3, theta_per_day=-0.02, vega=0.2
+        ),
+    )
+    assert result.decision is RiskDecision.REJECT
+    assert result.reason_codes == ["PORTFOLIO_VEGA_LIMIT"]
+    assert "1,400.00" in " ".join(result.explanations)
+
+
+def test_all_three_greek_limits_fire_together_when_all_breach():
+    # delta: 149,000 + 25*100*0.5*10 = 161,500 > 150,000
+    # theta: -95 + 25*100*(-0.05) = -220 -> 220 > 100
+    # vega:  990 + 25*100*0.1 = 1,240 > 1,000
+    result = assess(
+        req(edge=90.0, entry_price=250.0, stop_distance=50.0),
+        snap(),
+        portfolio_greeks=flat_greeks(
+            delta_notional=149_000.0, theta_per_day=-95.0, vega=990.0
+        ),
+        new_position_greeks=candidate(
+            delta=0.5, spot=10.0, theta_per_day=-0.05, vega=0.1
+        ),
+    )
+    assert result.decision is RiskDecision.REJECT
+    assert result.reason_codes == [
+        "PORTFOLIO_DELTA_LIMIT",
+        "PORTFOLIO_THETA_LIMIT",
+        "PORTFOLIO_VEGA_LIMIT",
+    ]
+
+
+def test_greek_check_scales_to_approved_quantity_not_requested_basis():
+    # Requested 50 contracts, but the budget approves only 25. At the
+    # REQUESTED basis vega would breach: 50*100*0.03 = $150 -> 900 + 150 =
+    # $1,050 > $1,000. At the APPROVED 25: 25*100*0.03 = $75 -> $975 <=
+    # $1,000 -> no breach. The engine must scale to the approved quantity.
+    result = assess(
+        req(
+            edge=90.0,
+            entry_price=250.0,
+            stop_distance=50.0,
+            quantity_requested=50,
+        ),
+        snap(),
+        portfolio_greeks=flat_greeks(vega=900.0),
+        new_position_greeks=candidate(vega=0.03, quantity=50),
+    )
+    assert result.decision is RiskDecision.APPROVE
+    assert result.approved_quantity == 25
+    assert not any("PORTFOLIO" in c for c in result.reason_codes)
+
+
+def test_exactly_at_greek_limit_passes():
+    # 25 * 100 * 0.04 = $100 -> post vega 900 + 100 = $1,000 == cap:
+    # exactly AT a greek limit is allowed; only strictly above rejects.
+    result = assess(
+        req(edge=90.0, entry_price=250.0, stop_distance=50.0),
+        snap(),
+        portfolio_greeks=flat_greeks(vega=900.0),
+        new_position_greeks=candidate(vega=0.04),
+    )
+    assert result.decision is RiskDecision.APPROVE
+    assert result.approved_quantity == 25
+    assert result.reason_codes == []
+
+
+def test_greek_limits_are_parameters():
+    # Tighter vega cap 0.1% of NAV = $100: contribution 25*100*0.1 = $250
+    # now breaches on an otherwise-empty book (thresholds parameterized).
+    limits = RiskLimits(max_net_vega_pct_nav=0.001)
+    result = assess(
+        req(edge=90.0, entry_price=250.0, stop_distance=50.0),
+        snap(),
+        limits,
+        portfolio_greeks=flat_greeks(),
+        new_position_greeks=candidate(vega=0.1),
+    )
+    assert result.decision is RiskDecision.REJECT
+    assert result.reason_codes == ["PORTFOLIO_VEGA_LIMIT"]
+
+
+# --- zero behavior change when the new params are omitted ------------------
+
+
+def test_omitted_new_params_leave_reference_cases_identical():
+    # A plain approve and a bucket-resize case, each computed with the new
+    # parameters omitted and with their explicit defaults: the assessments
+    # must be IDENTICAL (dataclass equality over every field).
+    positions = [PositionRisk("NVDA", 10_000.0, 2_500.0)]
+    for request, snapshot in (
+        (req(edge=90.0), snap()),
+        (req(ticker="AMD", edge=90.0), snap(positions=positions)),
+    ):
+        reference = assess(request, snapshot)
+        explicit = assess(
+            request,
+            snapshot,
+            budget_multiplier=1.0,
+            portfolio_greeks=None,
+            new_position_greeks=None,
+        )
+        assert reference == explicit
+
+
+def test_greek_checks_require_both_arguments():
+    # Supplying only ONE of the two greeks inputs runs no checks — the
+    # post-trade book would be unknowable — so the result is identical to
+    # omitting both, even with an absurd book exposure.
+    reference = assess(req(edge=90.0), snap())
+    only_portfolio = assess(
+        req(edge=90.0),
+        snap(),
+        portfolio_greeks=flat_greeks(delta_notional=1e9),
+    )
+    only_candidate = assess(
+        req(edge=90.0),
+        snap(),
+        new_position_greeks=candidate(
+            delta=1.0, quantity=1_250, multiplier=1, instrument="LONG_STOCK"
+        ),
+    )
+    assert only_portfolio == reference
+    assert only_candidate == reference

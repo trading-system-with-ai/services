@@ -5,7 +5,44 @@ decisions, test/audit status, and what's next.
 
 ---
 
-## 2026-08-10 — Iteration 10: Options in the decision chain — vol regime, §8 matrix, option execution & exits
+## 2026-08-10 — Iteration 11: Portfolio Greeks, dynamic correlation buckets, vol targeting, replay test
+
+**Built (pure libs → gateway chain + parallel UI, 2 adversarial verifiers):**
+- `libs/trading_core/greeks.py` (§16): equivalent-shares aggregation
+  (qty×mult×delta), delta-adjusted notional, net gamma/theta/vega with
+  per-position contributions.
+- `libs/trading_core/correlation.py` (§12.4): rolling Pearson over trailing
+  log returns + union-find connected-component dynamic buckets (corr > 0.70,
+  60d window — documented as requiring validation).
+- `libs/trading_core/allocation.py` (§14): exposure multiplier clamp
+  [0.25, 1.2], honest 1.0 on missing forecast.
+- Risk engine (additive only, 471 prior tests byte-identical): greek limits
+  (delta notional 150% NAV, |theta| 0.1% NAV/day, vega 1% NAV) with
+  PORTFOLIO_*_LIMIT reject codes checked at the APPROVED quantity;
+  `budget_multiplier` scales tier budget but `min(…, abs_max_trade_risk)`
+  keeps §14 subordinate to hard caps.
+- `/api/portfolio/risk` gains greeks (chain-resolved option greeks, honest
+  data_ok flags), vol_targeting (crude v0 NAV-weighted RV20 forecast proxy,
+  documented), and STATIC/DYNAMIC bucket kinds. RISK_APPROVAL gate feeds all
+  three into assess(); detail names the multiplier when ≠ 1.
+- **§42 replay test**: 60-day bar-by-bar replay through the real HTTP API
+  (preview → approve → daily check-exits) asserting single-position
+  invariant, gated approves, per-day cash-change == audited fills, complete
+  ORDER_* chains, ≥1 entry + ≥1 mechanical ATR_TRAIL exit, and
+  final_cash == initial + Σ realized_pnl to the cent. Runs in ~1s.
+
+**Verified:** 519/519 green. Independent hand-recomputation of a mixed
+3-position book matched aggregate_greeks exactly; correlation cross-checked;
+multiplier fuzz never exceeded the absolute cap; replay test audited as
+genuinely asserting (not vacuous).
+
+**Next (iteration 12):**
+1. Observability slice (§41): request-ID middleware + structured request
+   logs; /metrics endpoint (simple counters/latency histograms, no external
+   deps); market_data_lag + option_chain_age surfacing.
+2. Settings page v1 (§28): read-only view of account permissions, risk
+   limits, exit params from actual config objects (no editing yet).
+3. Symbol News tab placeholder→real once news ingestion lands (defer).
 
 **Built (pure libs → gateway chain + parallel UI, 2 adversarial verifiers, zero fixes):**
 - `libs/trading_core/volatility.py` — §7 vol regime v0 (LOW/NORMAL/HIGH/

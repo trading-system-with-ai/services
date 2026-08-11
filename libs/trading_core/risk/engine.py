@@ -14,12 +14,14 @@ truth. Decision pipeline (each step cites its plan section):
 1. Kill switch (plan §18) — trading disabled rejects everything.
 2. Portfolio heat gate (plan §12.5) — heat >= ``heat_reject`` rejects all
    NEW risk; existing positions are untouched.
-3. Signal strength tier -> risk budget (plan §12.2), hard-capped by
-   ``abs_max_trade_risk``.
+3. Signal strength tier -> risk budget (plan §12.2), optionally scaled by
+   the §14 vol-targeting ``budget_multiplier`` and ALWAYS hard-capped by
+   ``abs_max_trade_risk`` (§14 never overrides hard caps).
 4. Base sizing from stop distance (plan §12.1).
 5. Quantity clamps: single-name risk & capital (plan §12.3), correlation
    bucket (plan §12.4), heat headroom (plan §12.5), regime cash floor
-   (plan §13).
+   (plan §13); then, when the caller supplies greeks, the post-trade
+   portfolio greek limits (plan §16) at the approved quantity.
 6. Decision + human-readable explanations with real numbers (plan §36).
 
 The gateway records every risk decision as an audit event in the same
@@ -32,6 +34,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
+from libs.trading_core.greeks import PortfolioGreeks, PositionGreeksInput
 from libs.trading_core.models import MarketRegime, RiskDecision
 
 # Tolerance used when flooring float ratios into share counts, so that
@@ -88,6 +91,12 @@ class RiskLimits:
       strength tier; below ``strength_weak`` there is no valid signal.
     - ``cash_floors``: regime -> minimum cash fraction of NAV (plan §13).
     - ``correlation_buckets``: bucket name -> member tickers (plan §12.4).
+    - ``max_delta_notional_pct_nav`` / ``max_net_theta_pct_nav`` /
+      ``max_net_vega_pct_nav``: portfolio greek limits (plan §16), as
+      fractions of NAV, checked post-trade by :func:`assess` when the caller
+      supplies portfolio and candidate greeks. Delta: |delta-adjusted
+      notional| <= 150% of NAV. Theta: |net theta| per day <= 0.1% of NAV.
+      Vega: |net vega| per IV point <= 1% of NAV.
     """
 
     # Per-tier risk budgets, fraction of NAV (plan §12.2).
@@ -117,6 +126,10 @@ class RiskLimits:
     correlation_buckets: Mapping[str, tuple[str, ...]] = field(
         default_factory=_default_correlation_buckets
     )
+    # Portfolio greek limits as fractions of NAV (plan §16).
+    max_delta_notional_pct_nav: float = 1.50
+    max_net_theta_pct_nav: float = 0.001
+    max_net_vega_pct_nav: float = 0.01
 
 
 @dataclass
@@ -269,12 +282,34 @@ def assess(
     request: RiskRequest,
     snapshot: PortfolioSnapshot,
     limits: RiskLimits = RiskLimits(),
+    *,
+    budget_multiplier: float = 1.0,
+    portfolio_greeks: PortfolioGreeks | None = None,
+    new_position_greeks: PositionGreeksInput | None = None,
 ) -> RiskAssessment:
     """Approve, resize, or reject a proposed entry (plan §12, §13, §17).
 
     Deterministic pipeline; risk limits have PRIORITY over strategy
     confidence (plan §44 rule 20). Steps and citations are inline below.
+
+    Optional inputs (all defaults leave behavior EXACTLY as before):
+
+    - ``budget_multiplier`` (plan §14, vol targeting): scales the tier
+      budget BEFORE the absolute cap — ``effective_budget = min(tier_budget
+      * budget_multiplier, abs_max_trade_risk)`` — so vol targeting can
+      never raise a hard cap (§14: hard caps are NEVER overridden). Must be
+      > 0; 1.0 means no adjustment.
+    - ``portfolio_greeks`` + ``new_position_greeks`` (plan §16): when BOTH
+      are supplied, the post-trade net delta notional / theta / vega are
+      checked against the ``max_*_pct_nav`` limits AFTER the sizing clamps,
+      using the APPROVED quantity (step 5f below). Supplying only one of
+      the two runs no greek checks (the post-trade book would be unknowable
+      — honest skip, not a guess).
     """
+    if budget_multiplier <= 0:
+        raise ValueError(
+            f"budget_multiplier must be > 0, got {budget_multiplier}"
+        )
     nav = snapshot.nav
     heat_before = portfolio_heat(snapshot.positions, nav)  # validates nav > 0
 
@@ -312,6 +347,10 @@ def assess(
     # Step 3 — signal strength tier -> risk budget (plan §12.2). Below the
     # weak threshold there is no valid signal. The budget NEVER exceeds
     # abs_max_trade_risk: "No confidence score may override" (plan §12.2).
+    # The §14 vol-targeting multiplier scales the tier budget BEFORE the
+    # absolute cap, so it can shrink risk freely but can never push the
+    # effective budget above abs_max_trade_risk (§14 never overrides hard
+    # caps; with the default multiplier 1.0 this line is unchanged).
     # ------------------------------------------------------------------
     abs_edge = abs(request.edge)
     strength = strength_tier(request.edge, limits)
@@ -325,7 +364,10 @@ def assess(
             ],
             heat_before,
         )
-    budget = min(_tier_budget(strength, limits), limits.abs_max_trade_risk)
+    budget = min(
+        _tier_budget(strength, limits) * budget_multiplier,
+        limits.abs_max_trade_risk,
+    )
 
     # ------------------------------------------------------------------
     # Step 4 — base sizing (plan §12.1): shares = floor(allowed risk /
@@ -453,6 +495,63 @@ def assess(
         f"{floor_pct:.0%} cash floor for regime {snapshot.regime.value}; "
         f"quantity reduced from {qty} to {max(cap_e, 0)}.",
     )
+
+    # ------------------------------------------------------------------
+    # Step 5f — portfolio greek limits (plan §16), only when the caller
+    # supplied BOTH the current book's greeks and the candidate's per-share
+    # greeks. The checks run AFTER the sizing clamps: the candidate's
+    # contribution is its PER-SHARE greeks scaled by the APPROVED quantity
+    # (qty * multiplier * greek), which is exactly the candidate's
+    # full-position greeks scaled by approved qty / requested basis — the
+    # ``quantity`` field on ``new_position_greeks`` is the requested basis
+    # and is deliberately not used here. A breach REJECTS outright (plan
+    # §44 rule 20: limits outrank everything); exactly at a limit passes,
+    # strictly above it rejects.
+    # ------------------------------------------------------------------
+    if portfolio_greeks is not None and new_position_greeks is not None and qty > 0:
+        g = new_position_greeks
+        scale = qty * g.multiplier
+        post_delta_notional = (
+            portfolio_greeks.delta_adjusted_notional + scale * g.delta * g.spot
+        )
+        post_theta = (
+            portfolio_greeks.net_theta_per_day + scale * g.theta_per_day
+        )
+        post_vega = portfolio_greeks.net_vega + scale * g.vega
+        breaches: list[tuple[str, str]] = []
+        delta_cap = nav * limits.max_delta_notional_pct_nav
+        if abs(post_delta_notional) > delta_cap:
+            breaches.append((
+                "PORTFOLIO_DELTA_LIMIT",
+                f"Post-trade |delta-adjusted notional| would be "
+                f"${abs(post_delta_notional):,.2f} "
+                f"({abs(post_delta_notional) / nav:.2%} of NAV), above the "
+                f"{limits.max_delta_notional_pct_nav:.2%}-of-NAV limit "
+                f"(${delta_cap:,.2f}); {request.ticker} entry rejected.",
+            ))
+        theta_cap = nav * limits.max_net_theta_pct_nav
+        if abs(post_theta) > theta_cap:
+            breaches.append((
+                "PORTFOLIO_THETA_LIMIT",
+                f"Post-trade |net theta| would be ${abs(post_theta):,.2f}/day "
+                f"({abs(post_theta) / nav:.4%} of NAV), above the "
+                f"{limits.max_net_theta_pct_nav:.4%}-of-NAV limit "
+                f"(${theta_cap:,.2f}/day); {request.ticker} entry rejected.",
+            ))
+        vega_cap = nav * limits.max_net_vega_pct_nav
+        if abs(post_vega) > vega_cap:
+            breaches.append((
+                "PORTFOLIO_VEGA_LIMIT",
+                f"Post-trade |net vega| would be ${abs(post_vega):,.2f} per "
+                f"IV point ({abs(post_vega) / nav:.2%} of NAV), above the "
+                f"{limits.max_net_vega_pct_nav:.2%}-of-NAV limit "
+                f"(${vega_cap:,.2f}); {request.ticker} entry rejected.",
+            ))
+        if breaches:
+            for code, sentence in breaches:
+                reason_codes.append(code)
+                explanations.append(sentence)
+            qty = 0  # step 6 turns this into a REJECT with these reasons
 
     # ------------------------------------------------------------------
     # Step 6 — decision (plan §12): zero -> REJECT, reduced -> RESIZE,

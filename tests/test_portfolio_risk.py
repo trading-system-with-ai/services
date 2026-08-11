@@ -24,6 +24,8 @@ CONTRACT_KEYS = {
     "max_new_risk_pct",
     "positions",
     "buckets",
+    "greeks",  # §16 portfolio greeks block (tests/test_portfolio_greeks_api.py)
+    "vol_targeting",  # §14 vol-targeting block (tests/test_portfolio_greeks_api.py)
     "limits",
 }
 
