@@ -29,6 +29,7 @@ from libs.common.telemetry import REGISTRY, request_id_var
 
 from .db import StockBarDaily, WatchlistItem, get_session, init_db
 from .routers import (
+    alerts,
     analysis,
     audit_log,
     backtests,
@@ -204,6 +205,7 @@ def create_app() -> FastAPI:
     app.include_router(positions.router)
     app.include_router(recommendations.router)
     app.include_router(audit_log.router)
+    app.include_router(alerts.router)
     app.include_router(config.router)
     return app
 

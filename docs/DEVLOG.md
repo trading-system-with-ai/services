@@ -5,7 +5,34 @@ decisions, test/audit status, and what's next.
 
 ---
 
-## 2026-08-10 — Iteration 13: §20.2 fill-model variants + Docker E2E regression
+## 2026-08-10 — Iteration 14: Audit-driven alerts feed
+
+**Built:**
+- `apps/gateway/alerts.py`: declarative ALERT_RULES over audit actions —
+  alerts are a classified VIEW of the audit trail (no new table; the audit
+  log is already the event source of truth). CRITICAL: TRADING_PAUSED /
+  KILL_SWITCH_TRIGGERED / ORDER_REJECTED; WARNING: rejected-or-vetoed
+  RISK_DECISION (predicate keys off the single detail shape orders.py writes
+  for both veto and assess paths), EXIT_GENERATED, BACKTEST_FAILED; INFO:
+  ORDER_FILLED / TRADING_RESUMED. Human titles with real numbers; order-
+  scoped alerts enrich ticker/qty/price by batch-fetching the Order rows.
+- `GET /api/alerts` (limit 1..200, newest-first, read-only).
+
+**Verified:** 565/565 green. Live rule-coverage audit: veto preview alerts
+WARNING with the gate named; approving previews (4 audit rows) produce
+exactly the 2 genuine alerts; a REAL engine REJECT was reached through the
+API (full-size position then re-preview → single-name caps clamp to zero)
+and alerted with the engine's actual reason codes; pause/resume/fill/exit
+titles all verified; WATCHLIST_ADD/DATA_BACKFILL never surface.
+
+**Next (iteration 15):**
+1. Promotion checks on Trading Pool add (§4.3): minimum history + backtest-
+   exists + OOS-stats-present validation with an explicit user override
+   acknowledging risk (audited) — closes a §4.3 gap.
+2. Position monitor cron-style sweep: a lightweight periodic check-exits
+   scheduler inside the gateway (asyncio task, interval configurable,
+   disabled in tests) so exits stop depending on manual sweeps.
+3. UI: promotion-check dialog + monitor status indicator.
 
 **Built:**
 - BacktestParams gains `fill_model` (OPTIMISTIC / CONSERVATIVE default /
