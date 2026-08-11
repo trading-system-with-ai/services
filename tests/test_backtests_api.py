@@ -26,6 +26,8 @@ PARAM_KEYS = {
     "min_move_atr",
     "oos_split",
     "warmup_bars",
+    "fill_model",
+    "worst_slippage_bps",
 }
 SEG_KEYS = {
     "total_return_pct",
@@ -60,6 +62,7 @@ SUMMARY_KEYS = {
     "total_return_pct",
     "profit_factor",
     "oos_start_date",
+    "fill_model",
 }
 
 
@@ -207,3 +210,77 @@ async def test_get_by_id_roundtrip_and_404(client):
 
     r = await client.get("/api/backtests/999999")
     assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Fill-model variants (plan §20.2): round-trip, summaries, defaults, 422s.
+# ---------------------------------------------------------------------------
+
+
+async def test_fill_model_round_trips_through_post_and_get(client):
+    """POST with fill_model WORST -> the stored resolved params echo it, the
+    detail GET returns it, and the list summary chips it (plan §20.2)."""
+    posted = (
+        await run_backtest_for(client, "NVDA", {"fill_model": "WORST"})
+    ).json()
+    assert posted["status"] == "COMPLETED"
+    assert posted["params"]["fill_model"] == "WORST"
+    assert posted["params"]["worst_slippage_bps"] == 25.0  # default preserved
+
+    detail = (await client.get(f"/api/backtests/{posted['id']}")).json()
+    assert detail["params"]["fill_model"] == "WORST"
+
+    rows = (await client.get("/api/backtests")).json()
+    row = next(r for r in rows if r["id"] == posted["id"])
+    assert set(row) == SUMMARY_KEYS
+    assert row["fill_model"] == "WORST"
+
+
+async def test_fill_model_defaults_to_conservative(client):
+    """A run posted without fill-model params resolves to CONSERVATIVE — the
+    pre-change engine behavior (plan §20.2) — in both the stored params and
+    the list summary."""
+    posted = (await run_backtest_for(client, "NVDA")).json()
+    assert set(posted["params"]) == PARAM_KEYS
+    assert posted["params"]["fill_model"] == "CONSERVATIVE"
+    assert posted["params"]["worst_slippage_bps"] == 25.0
+
+    rows = (await client.get("/api/backtests")).json()
+    assert rows[0]["fill_model"] == "CONSERVATIVE"
+
+
+async def test_fill_model_worst_never_beats_conservative_via_api(client):
+    """§20.2 monotonicity holds through the API: the same symbol backtested
+    under WORST cannot out-return the CONSERVATIVE default run."""
+    conservative = (await run_backtest_for(client, "NVDA")).json()
+    worst = (
+        await run_backtest_for(client, "NVDA", {"fill_model": "WORST"})
+    ).json()
+    assert conservative["status"] == worst["status"] == "COMPLETED"
+    assert (
+        worst["metrics"]["full"]["total_return_pct"]
+        <= conservative["metrics"]["full"]["total_return_pct"]
+    )
+
+
+async def test_fill_model_invalid_values_422_with_engine_message(client):
+    """Bad fill_model / negative worst_slippage_bps 422 with the engine's own
+    ValueError message (plan §6.2), before any state or audit write."""
+    await client.post("/api/watchlist", json={"ticker": "NVDA"})
+
+    r = await client.post(
+        "/api/backtests",
+        json={"ticker": "NVDA", "params": {"fill_model": "MIDPOINT"}},
+    )
+    assert r.status_code == 422
+    assert "fill_model must be one of" in r.json()["detail"]
+
+    r = await client.post(
+        "/api/backtests",
+        json={"ticker": "NVDA", "params": {"worst_slippage_bps": -1.0}},
+    )
+    assert r.status_code == 422
+    assert "worst_slippage_bps must be >= 0" in r.json()["detail"]
+
+    # 422s happen before any record is written.
+    assert (await client.get("/api/backtests")).json() == []

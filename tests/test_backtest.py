@@ -410,3 +410,136 @@ def test_every_trade_has_a_populated_entry_reason():
         # Reasons carry real numbers (edge value) and the regime context.
         assert "edge" in trade.entry_reason.lower()
         assert any(ch.isdigit() for ch in trade.entry_reason)
+
+
+# ---------------------------------------------------------------------------
+# Fill-model variants (plan §20.2: "Never treat historical mid as guaranteed
+# fill"). Mapped to daily-bar data as effective slippage: OPTIMISTIC -> 0 bps,
+# CONSERVATIVE -> slippage_bps, WORST -> max(slippage_bps, worst_slippage_bps).
+# ---------------------------------------------------------------------------
+
+
+def test_fill_model_monotonicity_optimistic_conservative_worst():
+    """§20.2 MONOTONICITY: on the same wavy series, more pessimistic fills
+    can never do better — total_return OPTIMISTIC >= CONSERVATIVE >= WORST,
+    strictly so here because trades exist and the effective slippages differ
+    (0 bps vs 5 bps vs 25 bps at defaults)."""
+    bars = make_bars(wavy_closes(400))
+    results = {
+        model: run_short(bars, BacktestParams(warmup_bars=25, fill_model=model))
+        for model in ("OPTIMISTIC", "CONSERVATIVE", "WORST")
+    }
+    for result in results.values():
+        assert result.trades, "the wavy series must produce trades"
+
+    r_opt = results["OPTIMISTIC"].metrics["full"].total_return_pct
+    r_con = results["CONSERVATIVE"].metrics["full"].total_return_pct
+    r_wor = results["WORST"].metrics["full"].total_return_pct
+    assert r_opt > r_con > r_wor
+
+    # The decision path is price-driven, not equity-driven, so the FIRST
+    # trade enters on the same bar under all three models — its entry price
+    # (open * (1 + effective_slip)) is ordered by pessimism.
+    e_opt = results["OPTIMISTIC"].trades[0]
+    e_con = results["CONSERVATIVE"].trades[0]
+    e_wor = results["WORST"].trades[0]
+    assert e_opt.entry_index == e_con.entry_index == e_wor.entry_index
+    assert e_opt.entry_price < e_con.entry_price < e_wor.entry_price
+
+
+def test_fill_model_optimistic_entry_is_exactly_the_raw_next_open():
+    """OPTIMISTIC is the frictionless best case (plan §20.2): the buy fills
+    at EXACTLY the raw next open — zero slippage — and the sell at exactly
+    the raw exit-bar open. Hand-checked on the single-trade series."""
+    dates, opens, highs, lows, closes, volumes = fill_model_bars()
+    params = BacktestParams(warmup_bars=25, fill_model="OPTIMISTIC")
+    result = run_short((dates, opens, highs, lows, closes, volumes), params)
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.entry_index == 26
+    # Exact equality, not approx: no slippage means the raw open itself.
+    assert trade.entry_price == opens[26]
+    assert trade.exit_price == opens[trade.exit_index]
+    # Commission is unchanged by the fill model (plan §20.2).
+    cost = trade.shares * (opens[26] + params.commission_per_share)
+    proceeds = trade.shares * (
+        opens[trade.exit_index] - params.commission_per_share
+    )
+    assert trade.pnl == pytest.approx(proceeds - cost, rel=1e-12)
+
+
+def test_fill_model_worst_uses_max_of_slippage_and_worst_slippage():
+    """WORST -> max(slippage_bps, worst_slippage_bps): with slippage_bps=50
+    already above the worst floor of 25, WORST and CONSERVATIVE resolve to
+    the same 50 bps and the whole results are identical."""
+    assert (
+        BacktestParams(fill_model="WORST", slippage_bps=50.0).effective_slippage_bps()
+        == 50.0
+    )
+    bars = make_bars(wavy_closes(400))
+    worst = run_short(
+        bars,
+        BacktestParams(warmup_bars=25, slippage_bps=50.0, fill_model="WORST"),
+    )
+    conservative = run_short(
+        bars,
+        BacktestParams(warmup_bars=25, slippage_bps=50.0, fill_model="CONSERVATIVE"),
+    )
+    assert worst.trades  # slippage this high still trades on this series
+    assert worst == conservative
+
+    # And when slippage_bps is below the floor, the floor wins.
+    assert (
+        BacktestParams(fill_model="WORST", slippage_bps=5.0).effective_slippage_bps()
+        == 25.0
+    )
+
+
+def test_fill_model_defaults_and_effective_slippage_mapping():
+    """New fields default to the pre-change behavior: CONSERVATIVE with a
+    25 bps worst floor; the effective-slippage mapping is exactly §20.2's
+    daily-bar mapping."""
+    p = BacktestParams()
+    assert (p.fill_model, p.worst_slippage_bps) == ("CONSERVATIVE", 25.0)
+    assert p.effective_slippage_bps() == p.slippage_bps == 5.0
+    assert BacktestParams(fill_model="OPTIMISTIC").effective_slippage_bps() == 0.0
+    assert BacktestParams(fill_model="WORST").effective_slippage_bps() == 25.0
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"fill_model": "midpoint"},
+        {"fill_model": "conservative"},  # case-sensitive: exact names only
+        {"fill_model": ""},
+        {"worst_slippage_bps": -1.0},
+    ],
+)
+def test_invalid_fill_model_params_raise_value_error(kwargs):
+    with pytest.raises(ValueError):
+        BacktestParams(**kwargs)
+
+
+def test_fill_model_conservative_regression_bit_identical_to_default():
+    """REGRESSION (plan §20.2): an explicit CONSERVATIVE run is bit-identical
+    to the default-params run, and the default run still matches the same
+    hand-computed numbers test_fill_model_matches_hand_computed_trade pins —
+    adding fill models changed nothing about the existing behavior."""
+    bars = fill_model_bars()
+    default_run = run_short(bars, SHORT_PARAMS)
+    conservative_run = run_short(
+        bars, BacktestParams(warmup_bars=25, fill_model="CONSERVATIVE")
+    )
+    # Dataclass equality: trades, equity, drawdown, metrics — everything.
+    assert default_run == conservative_run
+
+    # The same hard-coded expectations as the pre-change fill-model test.
+    opens = bars[1]
+    trade = default_run.trades[0]
+    slip = SHORT_PARAMS.slippage_bps / 10_000.0
+    assert trade.entry_index == 26
+    assert trade.entry_price == pytest.approx(opens[26] * (1.0 + slip), rel=1e-12)
+    assert trade.exit_price == pytest.approx(
+        opens[trade.exit_index] * (1.0 - slip), rel=1e-12
+    )

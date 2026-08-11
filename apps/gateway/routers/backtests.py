@@ -87,7 +87,12 @@ def _record_json(rec: BacktestRecord) -> dict:
 
 
 def _summary_json(rec: BacktestRecord) -> dict:
-    """List-endpoint summary: identity plus headline full-segment metrics."""
+    """List-endpoint summary: identity plus headline full-segment metrics.
+
+    ``fill_model`` (plan §20.2) is surfaced from the stored resolved params
+    so history rows can chip the model without fetching the full record;
+    records persisted before fill models existed report ``None``.
+    """
     full = (rec.metrics or {}).get("full") or {}
     return {
         "id": rec.id,
@@ -98,6 +103,7 @@ def _summary_json(rec: BacktestRecord) -> dict:
         "total_return_pct": full.get("total_return_pct"),
         "profit_factor": full.get("profit_factor"),
         "oos_start_date": rec.oos_start_date,
+        "fill_model": (rec.params or {}).get("fill_model"),
     }
 
 

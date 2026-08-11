@@ -62,6 +62,11 @@ TRADING_DAYS_PER_YEAR: int = 252
 #: Regimes in which a long-stock entry is allowed (plan §5, §11.1).
 _BULL_REGIMES = frozenset({MarketRegime.STRONG_BULL, MarketRegime.MILD_BULL})
 
+#: Valid fill-model names (plan §20.2). Order is the optimism ordering:
+#: OPTIMISTIC (frictionless best case) -> CONSERVATIVE (default slippage) ->
+#: WORST (adversarial slippage floor).
+FILL_MODELS: tuple[str, ...] = ("OPTIMISTIC", "CONSERVATIVE", "WORST")
+
 
 @dataclass(frozen=True)
 class BacktestParams:
@@ -95,6 +100,23 @@ class BacktestParams:
     - ``warmup_bars``: bars withheld from trading at the start of the series
       so every indicator is fully formed before the first decision
       (plan §20.3).
+    - ``fill_model``: how pessimistic the fill price is (plan §20.2 — "Never
+      treat historical mid as guaranteed fill"). One of :data:`FILL_MODELS`,
+      mapped onto daily-bar data (we have no historical bid/ask yet) as an
+      effective slippage in bps applied both ways around the next open:
+
+      - ``"OPTIMISTIC"``   -> 0 bps (frictionless best case: the raw next open),
+      - ``"CONSERVATIVE"`` -> ``slippage_bps`` (the pre-existing default
+        behavior — a CONSERVATIVE run is bit-identical to the engine before
+        fill models existed),
+      - ``"WORST"``        -> ``max(slippage_bps, worst_slippage_bps)``
+        (an adversarial floor; never better than CONSERVATIVE).
+
+      Once real quote data lands, ``"WORST"`` becomes buy-at-ask /
+      sell-at-bid instead of a bps proxy (plan §20.2). Commission is
+      unchanged by the fill model.
+    - ``worst_slippage_bps``: the slippage floor (bps, >= 0) the ``"WORST"``
+      model enforces via ``max(slippage_bps, worst_slippage_bps)``.
     """
 
     position_pct: float = 1.0
@@ -107,6 +129,8 @@ class BacktestParams:
     min_move_atr: float = 1.0
     oos_split: float = 0.7
     warmup_bars: int = 200
+    fill_model: str = "CONSERVATIVE"
+    worst_slippage_bps: float = 25.0
 
     def __post_init__(self) -> None:
         if not (0.0 < self.position_pct <= 1.0):
@@ -140,6 +164,26 @@ class BacktestParams:
             raise ValueError(
                 f"warmup_bars must be an integer >= 1, got {self.warmup_bars!r}"
             )
+        if self.fill_model not in FILL_MODELS:
+            raise ValueError(
+                f"fill_model must be one of {list(FILL_MODELS)}, got "
+                f"{self.fill_model!r}"
+            )
+        if self.worst_slippage_bps < 0.0:
+            raise ValueError(
+                f"worst_slippage_bps must be >= 0, got {self.worst_slippage_bps!r}"
+            )
+
+    def effective_slippage_bps(self) -> float:
+        """Effective slippage in bps under this params' ``fill_model``
+        (plan §20.2 mapped to daily-bar data — see the class docstring):
+        OPTIMISTIC -> 0, CONSERVATIVE -> ``slippage_bps``, WORST ->
+        ``max(slippage_bps, worst_slippage_bps)``."""
+        if self.fill_model == "OPTIMISTIC":
+            return 0.0
+        if self.fill_model == "WORST":
+            return max(self.slippage_bps, self.worst_slippage_bps)
+        return self.slippage_bps
 
 
 @dataclass
@@ -338,9 +382,15 @@ def run_backtest(
       slices ``closes[:t+1]`` / ``highs[:t+1]`` / ``lows[:t+1]`` /
       ``volumes[:t+1]`` ONLY — the engines never see a future bar.
     - A decision at the close of ``t`` fills at the OPEN of ``t+1``
-      (plan §44 rule 11): buys at ``open * (1 + slippage_bps/10000)``, sells
-      at ``open * (1 - slippage_bps/10000)``, plus ``commission_per_share``
-      each way.
+      (plan §44 rule 11): buys at ``open * (1 + slip)``, sells at
+      ``open * (1 - slip)``, plus ``commission_per_share`` each way, where
+      ``slip`` is the EFFECTIVE slippage chosen by ``params.fill_model``
+      (plan §20.2 — "Never treat historical mid as guaranteed fill"):
+      OPTIMISTIC -> 0 bps, CONSERVATIVE -> ``slippage_bps``, WORST ->
+      ``max(slippage_bps, worst_slippage_bps)``. The mapping is a bps proxy
+      because only daily OHLCV exists — there is no historical bid/ask yet;
+      when real quote data lands, WORST becomes buy-at-ask / sell-at-bid
+      (plan §20.2). Commission is identical across fill models.
     - ENTRY (only when flat): regime in {STRONG_BULL, MILD_BULL} AND
       bias == BULL AND ``directional_edge >= entry_edge_threshold``
       (plan §11.1). Shares = ``floor(equity * position_pct / fill_price)``
@@ -376,7 +426,9 @@ def run_backtest(
     if n < 1:
         raise ValueError("run_backtest needs at least 1 bar")
 
-    slip = params.slippage_bps / 10_000.0
+    # Effective slippage from the fill model (plan §20.2), computed ONCE and
+    # applied symmetrically to buy and sell fills below.
+    slip = params.effective_slippage_bps() / 10_000.0
     commission = params.commission_per_share
 
     # ATR is a recursive (Wilder) indicator seeded at a fixed index, so the

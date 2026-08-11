@@ -5,7 +5,40 @@ decisions, test/audit status, and what's next.
 
 ---
 
-## 2026-08-10 — Iteration 12: Observability slice (§41) + read-only config API
+## 2026-08-10 — Iteration 13: §20.2 fill-model variants + Docker E2E regression
+
+**Built:**
+- BacktestParams gains `fill_model` (OPTIMISTIC / CONSERVATIVE default /
+  WORST) + `worst_slippage_bps` (25): effective slippage 0 / slippage_bps /
+  max(slippage, worst) mapped onto daily-bar data (§20.2 "never treat
+  historical mid as guaranteed fill"); documented that WORST becomes
+  ask-to-buy/bid-to-sell once real quote data lands. CONSERVATIVE proven
+  **bit-identical** to the pre-change engine via before/after reference-run
+  JSON diff. Monotonicity pinned: OPTIMISTIC ≥ CONSERVATIVE ≥ WORST returns
+  (strict when trades exist). API round-trips + summaries carry fill_model.
+- UI: three-option segmented control with §20.2 descriptions,
+  worst-bps input gated to WORST, fill-model chips on history + results,
+  "historical mid is never a guaranteed fill" reminder.
+
+**Docker E2E regression: PASS — and it caught the predicted defect:**
+`008_option_execution.sql` was missing from the compose per-file migration
+mounts (added in iteration 10 without the matching volume line). Fixed; db
+init logs prove 001–008 all ran. Full smoke through the composed stack on an
+override port (8000 still squatted by an unrelated container): analysis,
+bars, options chain, preview reaching CONTRACT_SELECTION with a LONG_PUT +
+contract proposal, backtest with fill_model=WORST echoed, portfolio greeks +
+vol targeting, /api/config secret-absence, /metrics route-template labels,
+X-Request-ID → audit correlation round-trip, psql schema checks (opt_*
+columns, stock_bars_daily, recommendations evidence). Clean teardown.
+
+**Verified:** 557/557 green (544 → +13).
+
+**Next (iteration 14):**
+1. Notification/alerts groundwork (§24 notification-service slice): audit-
+   driven alert rules (kill switch triggered, EXIT_GENERATED, risk REJECT)
+   surfaced as an in-app alerts feed on the Dashboard (no email/push yet).
+2. Watchlist symbol page Overview tab: add regime/vol context strip.
+3. Housekeeping: address any CI drift; consider pinning dependency versions.
 
 **Built:**
 - `libs/common/telemetry.py` — zero-dependency metrics (Counter / Histogram

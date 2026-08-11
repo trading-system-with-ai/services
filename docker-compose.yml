@@ -21,6 +21,7 @@ services:
       - ./migrations/005_orders.sql:/docker-entrypoint-initdb.d/005_orders.sql:ro
       - ./migrations/006_recommendations_evidence.sql:/docker-entrypoint-initdb.d/006_recommendations_evidence.sql:ro
       - ./migrations/007_stock_bars_daily.sql:/docker-entrypoint-initdb.d/007_stock_bars_daily.sql:ro
+      - ./migrations/008_option_execution.sql:/docker-entrypoint-initdb.d/008_option_execution.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U trading"]
       interval: 5s
