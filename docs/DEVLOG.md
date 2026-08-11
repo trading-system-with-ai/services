@@ -5,7 +5,38 @@ decisions, test/audit status, and what's next.
 
 ---
 
-## 2026-08-10 — Iteration 11: Portfolio Greeks, dynamic correlation buckets, vol targeting, replay test
+## 2026-08-10 — Iteration 12: Observability slice (§41) + read-only config API
+
+**Built:**
+- `libs/common/telemetry.py` — zero-dependency metrics (Counter / Histogram
+  with cumulative buckets / Gauge with scrape callbacks) + Prometheus text
+  exposition renderer + `request_id_var` ContextVar.
+- Request-ID middleware: X-Request-ID honored/generated/echoed; one
+  structured log line per request; `http_requests_total` +
+  `http_request_duration_ms` labeled by ROUTE TEMPLATE (cardinality control);
+  /metrics excluded from its own counters.
+- **Correlation closure**: audit.record() now defaults `correlation_id` from
+  the ambient request ID — every audit row traces to the exact HTTP request
+  that caused it (§38 + §41). Explicit IDs still win.
+- `GET /metrics`: uptime, watchlist bar freshness (scrape-time), honest
+  option_chain_age_seconds=0 with stub explanation.
+- `GET /api/config` — read-only serialization of the REAL engine dataclasses
+  (permissions, risk limits, exit/selector/vol-target/signal/backtest params,
+  paper fill model, kill switch). Secret-absence enforced by test: dummy env
+  secrets planted, recursive walk finds no key/secret/token/password names
+  and no secret values anywhere.
+
+**Verified:** 544/544 green. Live audit: 37/37 checks including exact request
+accounting in counters, route-template-only labels (no concrete tickers),
+verbatim client correlation ID landing in the audit row, FAKELEAK secret hunt
+across all endpoints (zero hits), and code-vs-API config drift diff (zero).
+
+**Next (iteration 13):**
+1. Docker E2E re-run to cover migrations 007+ and the new endpoints through
+   the composed stack (regression of the Phase 0 acceptance).
+2. Backtest engine option-aware upgrade research note OR §20.2 fill-model
+   variants (optimistic/conservative/worst) as backtest params + UI toggle.
+3. Watchlist symbol page News tab groundwork if news ingestion is prioritized.
 
 **Built (pure libs → gateway chain + parallel UI, 2 adversarial verifiers):**
 - `libs/trading_core/greeks.py` (§16): equivalent-shares aggregation
