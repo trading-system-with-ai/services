@@ -27,7 +27,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from libs.trading_core.features import macd, pivot_highs, pivot_lows, rsi, sma
-from libs.trading_core.models import DirectionalBias
+from libs.trading_core.models import DirectionalBias, DirectionalEdgeClass
+
+from .classification import EdgeClassificationParams, classify_edge
 
 
 @dataclass(frozen=True)
@@ -83,16 +85,34 @@ class DirectionalParams:
     volume_sma_period: int = 20
     # Decision threshold.
     bias_threshold: float = 25.0
-    # Feature weights (default 1.0 each).
-    weight_sma_fast: float = 1.0
-    weight_sma_mid: float = 1.0
-    weight_sma_slow: float = 1.0
-    weight_sma_slope: float = 1.0
-    weight_macd_cross: float = 1.0
-    weight_macd_zero: float = 1.0
-    weight_rsi_zone: float = 1.0
-    weight_structure: float = 1.0
-    weight_volume: float = 1.0
+    # Feature weights — §6 GROUPED research defaults (v1). Groups and their
+    # §6 percentages, split evenly inside each group:
+    #   Trend / SMA alignment   20%  -> the three close-vs-SMA components
+    #   SMA slope               10%
+    #   Market structure        20%  -> pivot_structure
+    #   MACD                    10%  -> macd_cross + macd_zero
+    #   RSI                      5%
+    #   Volume                  10%
+    # The §6 VWAP (10%) and market/sector-confirmation (15%) groups have no
+    # engine features yet — scores normalize over the weights PRESENT, so the
+    # implemented groups keep §6's relative proportions until those features
+    # land (documented gap, never silently faked).
+    # Research defaults, not truths (§6) — versioned below.
+    weight_sma_fast: float = 20.0 / 3.0
+    weight_sma_mid: float = 20.0 / 3.0
+    weight_sma_slow: float = 20.0 / 3.0
+    weight_sma_slope: float = 10.0
+    weight_macd_cross: float = 5.0
+    weight_macd_zero: float = 5.0
+    weight_rsi_zone: float = 5.0
+    weight_structure: float = 20.0
+    weight_volume: float = 10.0
+    #: Identifies this weight configuration in API payloads, backtest records
+    #: and audit trails (upgrade §6: score weights must be versioned, single
+    #: source of truth). Change the version string whenever default weights
+    #: change meaning. History: "score-weights-v0-equal" (all 1.0) until
+    #: 2026-08-12; v1 introduces the §6 grouped defaults above.
+    weights_version: str = "score-weights-v1-grouped"
 
 
 @dataclass
@@ -103,6 +123,14 @@ class SignalComponent:
     plan §6.2), e.g. ``"close 123.4500 > sma20 120.1000"``; components whose
     inputs are still in warmup say ``"insufficient data: ..."`` and are never
     triggered.
+
+    Contribution fields (upgrade §5 — the "BULL SCORE CONTRIBUTION" table):
+
+    - ``max_contribution``: this component's weight share of its side's
+      0-100 scale (``weight / side total weight * 100``).
+    - ``contribution``: ``max_contribution`` if triggered, else 0.0. A side's
+      score is EXACTLY the sum of its components' contributions (§44
+      reconciliation is by construction, not approximation).
     """
 
     name: str
@@ -110,6 +138,8 @@ class SignalComponent:
     triggered: bool
     weight: float
     detail: str
+    contribution: float = 0.0
+    max_contribution: float = 0.0
 
 
 @dataclass
@@ -122,8 +152,13 @@ class DirectionalResult:
     - ``directional_edge``: ``bull_score - bear_score``.
     - ``bias``: BULL if ``edge >= bias_threshold``, BEAR if
       ``edge <= -bias_threshold``, else NEUTRAL.
-    - ``components``: ALL evaluated components, triggered or not, so any
-      score can be audited and recomputed from this list alone.
+    - ``classification``: the seven-band §7 label for the edge (STRONG_BULL …
+      STRONG_BEAR), including the minimum-side-score requirement for STRONG.
+    - ``components``: ALL evaluated components, triggered or not, each with
+      its contribution in points, so any score can be audited and recomputed
+      from this list alone.
+    - ``weights_version`` / ``classification_version``: which configuration
+      produced these numbers (upgrade §6 — versioned, auditable).
     """
 
     bull_score: float
@@ -131,6 +166,9 @@ class DirectionalResult:
     directional_edge: float
     bias: DirectionalBias
     components: list[SignalComponent] = field(default_factory=list)
+    classification: DirectionalEdgeClass = DirectionalEdgeClass.NEUTRAL
+    weights_version: str = ""
+    classification_version: str = ""
 
 
 def _f(value: float) -> str:
@@ -144,6 +182,7 @@ def score_direction(
     lows: list[float],
     volumes: list[float] | None = None,
     params: DirectionalParams = DirectionalParams(),
+    classification_params: EdgeClassificationParams = EdgeClassificationParams(),
 ) -> DirectionalResult:
     """Score directional bull/bear evidence from aligned OHLC(V) series
     (plan §6.2).
@@ -378,13 +417,21 @@ def score_direction(
     # else: volumes not given -> component skipped entirely from BOTH sides'
     # denominators (plan §6.2).
 
-    # --- Scores, edge, bias ---------------------------------------------
+    # --- Contributions, scores, edge, bias, classification --------------
+    # Each component's contribution in points (upgrade §5); a side's score is
+    # the SUM of its contributions, so the §44 reconciliation "displayed
+    # contributions total exactly the displayed score" holds by construction.
     def side_score(side: str) -> float:
-        total = sum(c.weight for c in components if c.side == side)
+        side_components = [c for c in components if c.side == side]
+        total = sum(c.weight for c in side_components)
         if total <= 0.0:
             return 0.0
-        hit = sum(c.weight for c in components if c.side == side and c.triggered)
-        return hit / total * 100.0
+        for c in side_components:
+            c.max_contribution = c.weight / total * 100.0
+            c.contribution = c.max_contribution if c.triggered else 0.0
+        # builtin sum(), so any consumer summing the displayed contributions
+        # the ordinary way reproduces the score bit-for-bit (§44).
+        return sum(c.contribution for c in side_components)
 
     bull_score = side_score("bull")
     bear_score = side_score("bear")
@@ -403,4 +450,9 @@ def score_direction(
         directional_edge=edge,
         bias=bias,
         components=components,
+        classification=classify_edge(
+            bull_score, bear_score, edge, params=classification_params
+        ),
+        weights_version=params.weights_version,
+        classification_version=classification_params.version,
     )

@@ -44,8 +44,10 @@ exactly: positions contribute nothing rather than a synthetic mark.
 Read-only: the endpoint changes no state and makes no decision, so it writes
 no audit event (rule 12 covers state changes and decisions).
 """
-from collections.abc import Iterable, Mapping
-from datetime import datetime, timezone
+import asyncio
+import math
+from collections.abc import Iterable, Mapping, Sequence
+from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import select
@@ -60,21 +62,51 @@ from libs.trading_core.greeks import (
     PositionGreeksInput,
     aggregate_greeks,
 )
-from libs.trading_core.models import InstrumentType
+from libs.trading_core.models import ActorType, AuditAction, InstrumentType
 from libs.trading_core.risk import PositionRisk, RiskLimits, heat_state, portfolio_heat
+# §14 EWMA side-by-side (Phase C contract §7.5), SHADOW: the conditional-vol
+# forecast reported NEXT TO the crude v0 proxy. The multiplier actually used
+# stays the proxy's until an explicit promotion (audit §11 Q3).
+from libs.trading_core.risk.models.base import ModelHealth
+from libs.trading_core.risk.models.volatility import ewma_volatility_forecast
 
+from .. import audit
 from ..db import (
+    Portfolio,
     Position,
     StockBarDaily,
     get_or_create_portfolio,
     get_or_create_system_state,
     get_session,
 )
-from ..deps import market_data_configured, market_data_status
+from ..deps import (
+    broker_configured,
+    broker_mode,
+    broker_unavailable_reason,
+    market_data_configured,
+    market_data_status,
+    resolve_broker,
+    simulated_broker_mode,
+)
+from ..risk_snapshot import (
+    RISK_SNAPSHOT_FAILURES_TOTAL,
+    TRIGGER_ON_DEMAND,
+    build_risk_snapshot,
+)
 from .analysis import market_regime_from_spy
 from .options import REALIZED_VOL_PERIOD, option_chain_or_none
 
 router = APIRouter(prefix="/api/portfolio", tags=["portfolio"])
+
+# The singleton local-ledger row id (mirrors db.get_or_create_portfolio).
+PORTFOLIO_ID = 1
+
+
+async def _to_thread_get_account():
+    """The broker's live account snapshot, off the event loop."""
+    broker = resolve_broker()
+    return await asyncio.to_thread(broker.get_account)
+
 
 # Position lifecycle states (positions.status column).
 POSITION_OPEN = "OPEN"
@@ -82,6 +114,22 @@ POSITION_OPEN = "OPEN"
 # Option instruments (the §8 matrix outputs that carry an opt_* contract).
 _OPTION_INSTRUMENTS = frozenset(
     {InstrumentType.LONG_CALL.value, InstrumentType.LONG_PUT.value}
+)
+# Defined-risk spread instruments (roadmap Phase 1): opt_* = long leg,
+# short_occ_symbol/short_strike = short leg, avg_price = NET debit/share.
+_SPREAD_INSTRUMENTS = frozenset(
+    {
+        InstrumentType.BULL_CALL_SPREAD.value,
+        InstrumentType.BEAR_PUT_SPREAD.value,
+    }
+)
+# Phase 2 — collateralized short premium: opt_* identify the SHORT contract;
+# avg_price is the CREDIT received; greeks contribute NEGATIVELY.
+_INCOME_INSTRUMENTS = frozenset(
+    {
+        InstrumentType.COVERED_CALL.value,
+        InstrumentType.CASH_SECURED_PUT.value,
+    }
 )
 
 # --- Parameter seams (plan §6.2: parameters, never hardcoded truths) --------
@@ -94,8 +142,28 @@ DYNAMIC_BUCKET_WINDOW = 60
 
 
 def is_option_position(position: Position) -> bool:
-    """True when `position` holds a long option (LONG_CALL / LONG_PUT)."""
+    """True when `position` holds a SINGLE long option (LONG_CALL/LONG_PUT).
+
+    Deliberately FALSE for spreads: single-leg code paths (one-contract
+    chain lookups, single-leg closes) must never run on a two-leg position
+    — spreads have their own branches keyed on :func:`is_spread_position`.
+    """
     return position.instrument in _OPTION_INSTRUMENTS
+
+
+def is_spread_position(position: Position) -> bool:
+    """True when `position` is a defined-risk vertical (roadmap Phase 1)."""
+    return position.instrument in _SPREAD_INSTRUMENTS
+
+
+def is_income_position(position: Position) -> bool:
+    """True for collateralized short premium (covered call / CSP, Phase 2)."""
+    return position.instrument in _INCOME_INSTRUMENTS
+
+
+def is_short_stock_position(position: Position) -> bool:
+    """True for a margin-backed stock short (roadmap Phase 3)."""
+    return position.instrument == InstrumentType.SHORT_STOCK.value
 
 
 def position_market_value(
@@ -119,11 +187,39 @@ def position_market_value(
     """
     if not market_data:
         return None
-    if is_option_position(position):
+    if is_income_position(position):
+        # Short premium is a LIABILITY: booked at the credit received (the
+        # cash already holds that credit, so NAV is flat at open — a
+        # documented V1 book-value approximation, like the long-option one).
+        return -position.quantity * position.avg_price * (position.multiplier or 1)
+    if is_short_stock_position(position):
+        # Phase 3: short stock is a LIABILITY marked at the LIVE close —
+        # cash already holds the sale proceeds, so NAV moves by
+        # qty × (entry − close), exactly the short's P&L. No price -> honest
+        # null (the liability exists but cannot be marked).
+        if price is None:
+            return None
+        return -position.quantity * price
+    if is_option_position(position) or is_spread_position(position):
+        # Spreads: avg_price is the NET debit/share — book value, exact for
+        # heat because the net debit IS the max loss (§12.1).
         return position.quantity * position.avg_price * (position.multiplier or 1)
     if price is None:
         return None
     return position.quantity * price
+
+
+def open_csp_cash_reserved(pairs: list[tuple[Position, float | None]]) -> float:
+    """Σ ``cash_reserved`` over the OPEN CASH_SECURED_PUT rows in ``pairs`` —
+    collateral pledged to open puts, NOT deployable (risk-engine audit §8
+    item 3). 0.0 when none: a real zero, nothing is pledged. Shared by this
+    view (``cash_reserved_usd``) and the write paths' risk snapshot
+    (apps/gateway/risk_inputs.py), which nets it out of usable cash."""
+    return math.fsum(
+        (pos.cash_reserved or 0.0)
+        for pos, _price in pairs
+        if pos.instrument == InstrumentType.CASH_SECURED_PUT.value
+    )
 
 
 def find_option_contract(
@@ -139,6 +235,23 @@ def find_option_contract(
             and c.right == position.opt_right
             and position.opt_strike is not None
             and abs(c.strike - position.opt_strike) < 1e-9
+        ):
+            return c
+    return None
+
+
+def find_spread_short_leg(
+    chain: list[ContractQuote], position: Position
+) -> ContractQuote | None:
+    """Locate a spread position's SHORT leg (same expiry/right as the long
+    leg, strike = short_strike) in a regenerated chain; None when unquoted."""
+    if position.short_strike is None:
+        return None
+    for c in chain:
+        if (
+            c.expiry.isoformat() == position.opt_expiry
+            and c.right == position.opt_right
+            and abs(c.strike - position.short_strike) < 1e-9
         ):
             return c
     return None
@@ -197,6 +310,37 @@ async def stored_closes_by_ticker(
     return out
 
 
+async def stored_bars_by_ticker(
+    session: AsyncSession,
+    tickers: Iterable[str],
+    *,
+    lookback_bars: int = 600,
+) -> dict[str, list[tuple[date, float]]]:
+    """Stored ``(bar_date, close)`` daily bars per ticker, OLDEST FIRST — the
+    input series for the Phase B return matrix (risk spec §3).
+
+    The dated sibling of :func:`stored_closes_by_ticker`: VaR/ES/covariance
+    need the DATE of every observation, because returns are inner-joined on
+    return dates across tickers (Phase B contract §2.1) and a bare list of
+    closes cannot say which day is missing for whom.
+
+    Reads only what is already stored (no lazy backfill: this is a portfolio
+    read, not a data request), keeping the NEWEST ``lookback_bars`` bars and
+    returning them in ascending date order. A ticker with no stored bars maps
+    to an empty list — an honest gap the caller names, never zeros.
+    """
+    out: dict[str, list[tuple[date, float]]] = {}
+    for ticker in sorted(set(tickers)):
+        rows = await session.execute(
+            select(StockBarDaily.ts, StockBarDaily.close)
+            .where(StockBarDaily.ticker == ticker)
+            .order_by(StockBarDaily.ts.desc())
+            .limit(lookback_bars)
+        )
+        out[ticker] = [(ts, close) for ts, close in reversed(rows.all())]
+    return out
+
+
 def portfolio_greeks_read(
     pairs: list[tuple[Position, float | None]],
 ) -> tuple[PortfolioGreeks, list[dict]]:
@@ -237,6 +381,63 @@ def portfolio_greeks_read(
                     "unknown; no greeks can be computed for this position"
                 )
             )
+        elif is_income_position(pos):
+            # Phase 2: the SHORT leg's greeks, NEGATED (short premium is
+            # short delta-sign exposure of its contract). Missing contract
+            # or greeks -> zeros-with-note, same honesty as the others.
+            if pos.ticker not in chains:
+                chains[pos.ticker] = option_chain_or_none(pos.ticker, price) or []
+            contract = find_option_contract(chains[pos.ticker], pos)
+            if contract is None:
+                note = (
+                    f"DATA_ISSUE: short {pos.opt_right} {pos.opt_strike} exp "
+                    f"{pos.opt_expiry} missing from today's chain; greeks "
+                    "contribute zeros"
+                )
+            elif None in (
+                contract.delta, contract.gamma, contract.theta, contract.vega
+            ):
+                note = (
+                    f"DATA_ISSUE: provider reports no greeks for short "
+                    f"{pos.opt_right} {pos.opt_strike} exp {pos.opt_expiry}; "
+                    "greeks contribute zeros"
+                )
+            else:
+                per_share = (
+                    -contract.delta,
+                    -contract.gamma,
+                    -contract.theta,
+                    -contract.vega,
+                )
+        elif is_spread_position(pos):
+            # §16 for spreads: NET per-share greeks (long − short) when BOTH
+            # legs report greeks; zeros-with-note otherwise (honest gap).
+            if pos.ticker not in chains:
+                chains[pos.ticker] = option_chain_or_none(pos.ticker, price) or []
+            long_leg = find_option_contract(chains[pos.ticker], pos)
+            short_leg = find_spread_short_leg(chains[pos.ticker], pos)
+            if long_leg is None or short_leg is None:
+                note = (
+                    f"DATA_ISSUE: spread leg(s) missing from today's chain "
+                    f"(long {pos.opt_strike} / short {pos.short_strike} exp "
+                    f"{pos.opt_expiry}); greeks contribute zeros"
+                )
+            elif None in (
+                long_leg.delta, long_leg.gamma, long_leg.theta, long_leg.vega,
+                short_leg.delta, short_leg.gamma, short_leg.theta, short_leg.vega,
+            ):
+                note = (
+                    "DATA_ISSUE: provider reports no greeks for one spread "
+                    f"leg (long {pos.opt_strike} / short {pos.short_strike} "
+                    f"exp {pos.opt_expiry}); greeks contribute zeros"
+                )
+            else:
+                per_share = (
+                    long_leg.delta - short_leg.delta,
+                    long_leg.gamma - short_leg.gamma,
+                    long_leg.theta - short_leg.theta,
+                    long_leg.vega - short_leg.vega,
+                )
         elif is_option_position(pos):
             if pos.ticker not in chains:
                 chains[pos.ticker] = option_chain_or_none(pos.ticker, price) or []
@@ -247,6 +448,17 @@ def portfolio_greeks_read(
                     f"exp {pos.opt_expiry} missing from today's chain (e.g. "
                     "expired); greeks contribute zeros"
                 )
+            elif None in (
+                contract.delta, contract.gamma, contract.theta, contract.vega
+            ):
+                # The provider serves this contract's quote but no greeks
+                # (deep ITM/OTM on some feeds) — honest data gap, same
+                # zeros-with-note contribution as a missing contract.
+                note = (
+                    f"DATA_ISSUE: provider reports no greeks for "
+                    f"{pos.opt_right} {pos.opt_strike} exp {pos.opt_expiry}; "
+                    "greeks contribute zeros"
+                )
             else:
                 per_share = (
                     contract.delta,
@@ -254,6 +466,9 @@ def portfolio_greeks_read(
                     contract.theta,
                     contract.vega,
                 )
+        elif is_short_stock_position(pos):
+            # Phase 3: short stock is delta −1 per share, no optionality.
+            per_share = (-1.0, 0.0, 0.0, 0.0)
         else:
             per_share = (1.0, 0.0, 0.0, 0.0)
 
@@ -312,12 +527,49 @@ def portfolio_greeks_read(
     return greeks, rows
 
 
+#: Trading days per year — the annualization factor for a daily σ (√252).
+TRADING_DAYS_PER_YEAR = 252
+
+
+def _ewma_vol_targeting_side_by_side(
+    nav: float, book_pnl: Sequence[float] | None
+) -> tuple[float | None, float | None]:
+    """The EWMA side-by-side pair ``(sigma_annualized_pct_nav, multiplier)``
+    (spec §14; Phase C contract §7.5) — SHADOW.
+
+    The crude v0 proxy above is a NAV-weighted average of per-ticker RV20:
+    it ignores correlation entirely and treats cash as zero-vol. The EWMA
+    forecast instead reads the BOOK's own realised P&L series — correlation,
+    option deltas and hedging already inside it — as
+    ``σ_next(P&L, USD/day) ÷ NAV × √252``, an annualized fraction of NAV
+    directly comparable with ``forecast_vol``.
+
+    The multiplier is the SAME :func:`exposure_multiplier` with the SAME
+    clamps, so the two numbers differ only by the forecast behind them —
+    which is the whole point of logging them side by side before any
+    promotion (audit §11 Q3).
+
+    **The multiplier actually USED is unchanged**: this pair is reported and
+    logged, never returned as ``multiplier``. Honest nulls: no book P&L, a
+    non-positive NAV, or an EWMA forecast that is not ACTIVE ⇒ ``(None,
+    None)`` — never a fabricated forecast feeding a sizing decision.
+    """
+    if not book_pnl or nav <= 0:
+        return None, None
+    forecast = ewma_volatility_forecast(book_pnl)
+    if forecast.health is not ModelHealth.ACTIVE or forecast.value is None:
+        return None, None
+    sigma_pct_nav = forecast.value / nav * math.sqrt(TRADING_DAYS_PER_YEAR)
+    return sigma_pct_nav, exposure_multiplier(sigma_pct_nav, VOL_TARGET_PARAMS)
+
+
 def vol_targeting_block(
     nav: float,
     pairs: list[tuple[Position, float | None]],
     closes_by_ticker: Mapping[str, list[float]],
     *,
     market_data: bool = True,
+    book_pnl: Sequence[float] | None = None,
 ) -> dict:
     """The §14 vol-targeting read: forecast vol -> exposure multiplier.
 
@@ -351,6 +603,10 @@ def vol_targeting_block(
             "forecast_vol": None,
             "multiplier": exposure_multiplier(None, params),
             "max_multiplier": params.max_multiplier,
+            # ADDITIVE (Phase C §7.5): the EWMA side-by-side. Null here for
+            # the same reason the proxy is — no market data, no forecast.
+            "ewma_sigma_p_annualized_pct_nav": None,
+            "multiplier_ewma": None,
             "note": (
                 "no market data provider is configured — no vol forecast is "
                 "available (honest null); multiplier 1.0 means no adjustment "
@@ -388,11 +644,21 @@ def vol_targeting_block(
             "no open positions — no vol forecast (honest null); "
             "multiplier 1.0 means no adjustment (§14)"
         )
+    ewma_sigma, ewma_multiplier = _ewma_vol_targeting_side_by_side(nav, book_pnl)
     return {
         "target_vol": params.target_vol,
         "forecast_vol": forecast,
+        # THE MULTIPLIER IN FORCE — the crude proxy's, unchanged. The EWMA
+        # pair below is SHADOW: reported and logged for the side-by-side
+        # review, never applied (spec §14; audit §11 Q3).
         "multiplier": multiplier,
         "max_multiplier": params.max_multiplier,
+        # ADDITIVE (Phase C contract §7.5): EWMA sigma of the BOOK P&L
+        # series, annualized as a fraction of NAV, and the multiplier it
+        # WOULD imply under the same clamps. Both null when there is no book
+        # P&L series to read (honest nulls, never a fabricated forecast).
+        "ewma_sigma_p_annualized_pct_nav": ewma_sigma,
+        "multiplier_ewma": ewma_multiplier,
         "note": note,
     }
 
@@ -406,8 +672,76 @@ async def get_portfolio_risk(session: AsyncSession = Depends(get_session)) -> di
     """
     limits = RiskLimits()
     have_market_data = market_data_configured()
-    portfolio = await get_or_create_portfolio(session)
     state = await get_or_create_system_state(session)
+
+    # THE ACCOUNT IS THE BROKER'S — the platform stores NO copy of it (user
+    # rule: the only account API is Alpaca). With a real broker connected,
+    # cash is read LIVE from the broker on every request; nothing is ever
+    # written to the local portfolio table in broker mode. With no venue
+    # there is no account and every number is an honest null. Only the
+    # dev/test simulator (whose account is DEFINED by paper_initial_cash)
+    # keeps a local ledger row.
+    venue = {
+        "configured": broker_configured(),
+        "provider": broker_mode(),
+        "message": broker_unavailable_reason(),
+    }
+    live_cash: float | None = None
+    if venue["configured"] and simulated_broker_mode():
+        portfolio = await get_or_create_portfolio(session)
+        live_cash = portfolio.cash
+    elif venue["configured"]:
+        try:
+            account = await _to_thread_get_account()
+        except Exception as exc:
+            venue["message"] = f"the broker account could not be read: {exc}"
+        else:
+            live_cash = account.cash
+
+    if live_cash is None:
+        # No account to report. Same shape, honest nulls, reason attached.
+        regime_empty = (
+            (await market_regime_from_spy(session)).classification
+            if have_market_data
+            else None
+        )
+        return {
+            "as_of": datetime.now(timezone.utc).isoformat(),
+            "market_data": market_data_status(),
+            "venue": venue,
+            "nav": None,
+            "cash": None,
+            "cash_reserved_usd": None,
+            "cash_pct": None,
+            "market_regime": regime_empty.value if regime_empty is not None else None,
+            "cash_floor_pct": (
+                limits.cash_floors[regime_empty] if regime_empty is not None else None
+            ),
+            "trading_enabled": state.trading_enabled,
+            "portfolio_heat_pct": None,
+            "heat_state": None,
+            "max_new_risk_usd": None,
+            "max_new_risk_pct": None,
+            "positions": [],
+            "buckets": [],
+            "greeks": None,
+            "vol_targeting": None,
+            # Phase B (contract §6): both blocks are null ONLY here — the
+            # no-account branch. There is no book, no NAV and no cash to
+            # measure anything against, and an object full of nulls would
+            # imply a measurement was attempted.
+            "statistical": None,
+            "drawdown": None,
+            "limits": {
+                "single_name_risk_pct": limits.single_name_risk,
+                "single_name_capital_pct": limits.single_name_capital,
+                "bucket_risk_pct": limits.bucket_risk,
+                "heat_elevated_pct": limits.heat_elevated,
+                "heat_high_pct": limits.heat_high,
+                "heat_reject_pct": limits.heat_reject,
+                "abs_max_trade_risk_pct": limits.abs_max_trade_risk,
+            },
+        }
     # Broad-market regime from SPY via the shared helper (plan §6.1, ADR-005).
     # SPY bars ARE market data, so with no provider the regime is an honest
     # null — and so is the regime-dependent cash floor it selects (§13).
@@ -426,7 +760,7 @@ async def get_portfolio_risk(session: AsyncSession = Depends(get_session)) -> di
         position_market_value(pos, price, market_data=have_market_data)
         for pos, price in pairs
     ]
-    nav = portfolio.cash + sum(v for v in values if v is not None)
+    nav = live_cash + sum(v for v in values if v is not None)
     position_risks = [
         PositionRisk(
             ticker=pos.ticker,
@@ -559,19 +893,64 @@ async def get_portfolio_risk(session: AsyncSession = Depends(get_session)) -> di
         "per_position": greeks_rows,
     }
 
+    # --- Phase B statistical layer (SHADOW; design contract §6) ----------
+    # Built from the SAME book this payload just described (shared helpers,
+    # plan §21) and PERSISTED as an ON_DEMAND snapshot so today's numbers stay
+    # reproducible (spec §44) and the drawdown NAV series has company. The
+    # builder degrades every gap to a typed honest null and never raises for
+    # data reasons; a genuine fault is caught here too, because this view has
+    # one job it must never fail at — showing the user their own book.
+    # STILL NO AUDIT EVENT: a snapshot is a measurement, not a decision.
+    statistical_block: dict | None = None
+    drawdown_block: dict | None = None
+    # Read off the ORM row FIRST: the rollback below expires every loaded
+    # instance, and the payload still needs this fact (which is a DB truth,
+    # not a statistical one — a broken shadow layer must not blank it).
+    trading_enabled = state.trading_enabled
+    # The book P&L series the EWMA side-by-side reads (Phase C §7.5) — the
+    # SAME series the statistical block was measured on, so the two can never
+    # describe different books. None when the build failed or had no book.
+    book_pnl: list[float] | None = None
+    try:
+        build = await build_risk_snapshot(
+            session,
+            trigger=TRIGGER_ON_DEMAND,
+            cash=live_cash,
+            trading_enabled=trading_enabled,
+            persist=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — the risk view must never 5xx
+        RISK_SNAPSHOT_FAILURES_TOTAL.inc()
+        # Discard whatever half-written snapshot rows the failed build left
+        # pending, so a partial measurement never reaches the table.
+        await session.rollback()
+        statistical_block = {"mode": "SHADOW", "note": f"{type(exc).__name__}: {exc}"}
+        drawdown_block = None
+    else:
+        await session.commit()
+        statistical_block = build.api
+        drawdown_block = build.drawdown_api
+        book_pnl = list(build.book.total) if build.book is not None else None
+
     return {
         "as_of": datetime.now(timezone.utc).isoformat(),
         # Honest status of the one dependency this view degrades on, stated
         # outright so a client never has to infer it from the nulls.
         "market_data": market_data_status(),
+        "venue": venue,
         "nav": nav,
-        "cash": portfolio.cash,
-        "cash_pct": portfolio.cash / nav,
+        "cash": live_cash,
+        # ADDITIVE (audit §8 item 3): Σ cash_reserved over open cash-secured
+        # puts — collateral pledged, not deployable. ``cash`` / ``nav`` keep
+        # their existing semantics (account cash; the write-path snapshot
+        # nets this out, see apps/gateway/risk_inputs.py).
+        "cash_reserved_usd": open_csp_cash_reserved(pairs),
+        "cash_pct": live_cash / nav,
         # Both null without market data: the regime is computed from SPY bars,
         # and the §13 cash floor is selected BY the regime.
         "market_regime": regime.value if regime is not None else None,
         "cash_floor_pct": limits.cash_floors[regime] if regime is not None else None,
-        "trading_enabled": state.trading_enabled,
+        "trading_enabled": trading_enabled,
         "portfolio_heat_pct": heat,
         "heat_state": heat_state(heat, limits),
         "max_new_risk_usd": max_new_risk_usd,
@@ -580,8 +959,16 @@ async def get_portfolio_risk(session: AsyncSession = Depends(get_session)) -> di
         "buckets": buckets_out,
         "greeks": greeks_block,
         "vol_targeting": vol_targeting_block(
-            nav, pairs, closes_by_ticker, market_data=have_market_data
+            nav,
+            pairs,
+            closes_by_ticker,
+            market_data=have_market_data,
+            book_pnl=book_pnl,
         ),
+        # ADDITIVE (Phase B contract §6): the SHADOW statistical block and the
+        # drawdown block. Nothing here alters a Tier 0 decision.
+        "statistical": statistical_block,
+        "drawdown": drawdown_block,
         "limits": {
             "single_name_risk_pct": limits.single_name_risk,
             "single_name_capital_pct": limits.single_name_capital,

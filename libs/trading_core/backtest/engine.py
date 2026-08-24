@@ -18,8 +18,12 @@ Bias controls (plan §20.3), the heart of the replay loop:
 - A decision at the close of ``t`` fills at the OPEN of ``t+1`` (explicit
   fill model, plan §44 rule 11 — never same-bar, never midpoint), with
   slippage and per-share commission applied both ways.
-- The engine only REPORTS in-sample / out-of-sample metrics; it never
-  optimizes anything on the OOS segment (plan §44 rule 16).
+- Exits run the SHARED live exit engine (libs.trading_core.exits) with the
+  SHARED §12.1 stop sizing (ATR_STOP_MULTIPLE) — backtest and live cannot
+  drift apart (§21; user parity mandate 2026-08-16).
+- IS/OOS segmentation was REMOVED 2026-08-16 (user decision): with purely
+  manual parameter iteration the platform reports full-period metrics only;
+  the split returns if/when ML-driven parameter search is introduced.
 - NO TRADE is a valid output (plan §44 rule 18): a series that never
   qualifies produces zero trades and honest null metrics.
 
@@ -35,8 +39,10 @@ from datetime import date
 from statistics import mean, stdev
 from typing import Sequence
 
+from libs.trading_core.exits import ExitParams, PositionState, evaluate_exit
 from libs.trading_core.features import atr
 from libs.trading_core.models import DirectionalBias, MarketRegime
+from libs.trading_core.risk.engine import ATR_STOP_MULTIPLE
 from libs.trading_core.signals import (
     DirectionalParams,
     RegimeParams,
@@ -61,6 +67,8 @@ TRADING_DAYS_PER_YEAR: int = 252
 
 #: Regimes in which a long-stock entry is allowed (plan §5, §11.1).
 _BULL_REGIMES = frozenset({MarketRegime.STRONG_BULL, MarketRegime.MILD_BULL})
+#: Bear-side mirror (2026-08-17): the LONG_PUT / BEAR_PUT_SPREAD entry gate.
+_BEAR_REGIMES = frozenset({MarketRegime.STRONG_BEAR, MarketRegime.MILD_BEAR})
 
 #: Valid fill-model names (plan §20.2). Order is the optimism ordering:
 #: OPTIMISTIC (frictionless best case) -> CONSERVATIVE (default slippage) ->
@@ -94,9 +102,6 @@ class BacktestParams:
       abandoned (plan §11.6).
     - ``min_move_atr``: the "has not moved" bar for the time stop — the trade
       must be up at least ``min_move_atr * atr14`` to escape it (plan §11.6).
-    - ``oos_split``: in-sample fraction of the series, in ``(0, 1)``; the
-      out-of-sample segment starts at bar ``floor(n_bars * oos_split)`` and
-      is only ever reported on, never optimized against (plan §44 rule 16).
     - ``warmup_bars``: bars withheld from trading at the start of the series
       so every indicator is fully formed before the first decision
       (plan §20.3).
@@ -127,10 +132,30 @@ class BacktestParams:
     atr_trail_k: float = 3.0
     time_stop_bars: int = 20
     min_move_atr: float = 1.0
-    oos_split: float = 0.7
     warmup_bars: int = 200
     fill_model: str = "CONSERVATIVE"
     worst_slippage_bps: float = 25.0
+    # --- Instrument leg (user mandate 2026-08-17: options join the backtest).
+    # "LONG_STOCK" (V1 engine), "LONG_CALL", or "BULL_CALL_SPREAD" (options
+    # engine over REAL historical contract bars — see backtest/options.py).
+    # LONG_PUT / BEAR_PUT_SPREAD arrive with the bear-side signal mirror.
+    instrument: str = "LONG_STOCK"
+    # LONG_CALL leg parameters (research parameters, §6.2). Contract choice
+    # is moneyness/DTE-based because historical greeks/OI do not exist
+    # (data-source-architecture.md) — deterministic from REAL strike grids
+    # and REAL underlying closes, never invented data.
+    target_dte_min: int = 30
+    target_dte_max: int = 90
+    strike_otm_pct: float = 0.0  # 0 = ATM; 0.05 = 5% OTM
+    option_premium_pct: float = 0.10  # equity fraction spent on premium
+    commission_per_contract: float = 0.65
+    # §20.2 proxy for option spreads (NO historical NBBO exists): bps applied
+    # both ways around the option bar price, by fill model.
+    option_slippage_bps: float = 100.0
+    worst_option_slippage_bps: float = 300.0
+    # BULL_CALL_SPREAD leg: short strike ≈ long strike + this fraction of
+    # spot (nearest REAL strike, same expiry) — mirrors §9-S width_pct_target.
+    spread_width_pct: float = 0.05
 
     def __post_init__(self) -> None:
         if not (0.0 < self.position_pct <= 1.0):
@@ -158,8 +183,64 @@ class BacktestParams:
             )
         if self.min_move_atr < 0.0:
             raise ValueError(f"min_move_atr must be >= 0, got {self.min_move_atr!r}")
-        if not (0.0 < self.oos_split < 1.0):
-            raise ValueError(f"oos_split must be in (0, 1), got {self.oos_split!r}")
+        if self.instrument not in (
+            "LONG_STOCK",
+            "LONG_CALL",
+            "LONG_PUT",
+            "BULL_CALL_SPREAD",
+            "BEAR_PUT_SPREAD",
+            "COVERED_CALL",
+            "CASH_SECURED_PUT",
+            "SHORT_STOCK",
+            # AUTO: the §8 matrix picks the instrument daily from the live
+            # signal stack (backtest/auto.py, Phase B 2026-08-20).
+            "AUTO",
+        ):
+            raise ValueError(
+                "instrument must be one of ('LONG_STOCK', 'LONG_CALL', "
+                "'LONG_PUT', 'BULL_CALL_SPREAD', 'BEAR_PUT_SPREAD', "
+                "'COVERED_CALL', 'CASH_SECURED_PUT', 'SHORT_STOCK', 'AUTO'), "
+                f"got {self.instrument!r}"
+            )
+        if not isinstance(self.target_dte_min, int) or self.target_dte_min < 1:
+            raise ValueError(
+                f"target_dte_min must be an integer >= 1, got {self.target_dte_min!r}"
+            )
+        if (
+            not isinstance(self.target_dte_max, int)
+            or self.target_dte_max < self.target_dte_min
+        ):
+            raise ValueError(
+                "target_dte_max must be an integer >= target_dte_min, got "
+                f"{self.target_dte_max!r}"
+            )
+        if not (-0.5 <= self.strike_otm_pct <= 0.5):
+            raise ValueError(
+                f"strike_otm_pct must be in [-0.5, 0.5], got {self.strike_otm_pct!r}"
+            )
+        if not (0.0 < self.option_premium_pct <= 1.0):
+            raise ValueError(
+                f"option_premium_pct must be in (0, 1], got {self.option_premium_pct!r}"
+            )
+        if self.commission_per_contract < 0.0:
+            raise ValueError(
+                "commission_per_contract must be >= 0, got "
+                f"{self.commission_per_contract!r}"
+            )
+        if self.option_slippage_bps < 0.0:
+            raise ValueError(
+                f"option_slippage_bps must be >= 0, got {self.option_slippage_bps!r}"
+            )
+        if self.worst_option_slippage_bps < 0.0:
+            raise ValueError(
+                "worst_option_slippage_bps must be >= 0, got "
+                f"{self.worst_option_slippage_bps!r}"
+            )
+        if not (0.0 < self.spread_width_pct <= 0.5):
+            raise ValueError(
+                f"spread_width_pct must be in (0, 0.5], got "
+                f"{self.spread_width_pct!r}"
+            )
         if not isinstance(self.warmup_bars, int) or self.warmup_bars < 1:
             raise ValueError(
                 f"warmup_bars must be an integer >= 1, got {self.warmup_bars!r}"
@@ -184,6 +265,16 @@ class BacktestParams:
         if self.fill_model == "WORST":
             return max(self.slippage_bps, self.worst_slippage_bps)
         return self.slippage_bps
+
+    def effective_option_slippage_bps(self) -> float:
+        """§20.2 option-spread proxy under this params' fill model — same
+        optimism ordering as the stock helper (no historical NBBO exists;
+        see data-source-architecture.md)."""
+        if self.fill_model == "OPTIMISTIC":
+            return 0.0
+        if self.fill_model == "WORST":
+            return max(self.option_slippage_bps, self.worst_option_slippage_bps)
+        return self.option_slippage_bps
 
 
 @dataclass
@@ -261,18 +352,15 @@ class BacktestResult:
 
     ``dates`` / ``equity`` / ``drawdown`` are aligned per-bar arrays over the
     ENTIRE input series (daily mark-to-market ``cash + shares * close``;
-    ``drawdown = equity / running_max - 1``). ``metrics`` holds exactly the
-    keys ``"full"``, ``"in_sample"`` and ``"out_of_sample"``;
-    ``oos_start_date`` is the first bar of the out-of-sample segment
-    (plan §44 rule 16: the OOS segment is report-only).
+    ``drawdown = equity / running_max - 1``). ``metrics`` covers the whole
+    period (IS/OOS segmentation removed 2026-08-16 — see module docstring).
     """
 
     trades: list[Trade]
     dates: list[date]
     equity: list[float]
     drawdown: list[float]
-    metrics: dict[str, SegmentMetrics]
-    oos_start_date: date | None
+    metrics: SegmentMetrics
 
 
 def _downside_deviation(returns: Sequence[float]) -> float:
@@ -393,24 +481,22 @@ def run_backtest(
       (plan §20.2). Commission is identical across fill models.
     - ENTRY (only when flat): regime in {STRONG_BULL, MILD_BULL} AND
       bias == BULL AND ``directional_edge >= entry_edge_threshold``
-      (plan §11.1). Shares = ``floor(equity * position_pct / fill_price)``
-      (trimmed only if the commission would push cash below zero — the
-      account never borrows, plan §5).
-    - EXIT (any position, first match wins, in priority order):
-      SIGNAL_FLIP (bias == BEAR) -> SIGNAL_DECAY
-      (``edge < exit_edge_threshold``, easier than entry, plan §11.1) ->
-      ATR_TRAIL (``close < highest_close_since_entry - atr_trail_k * atr14``,
-      plan §11.5) -> TIME_STOP (``bars_held >= time_stop_bars`` and the move
-      since entry is ``< min_move_atr * atr14``, plan §11.6). At the FINAL
-      bar an open position is marked to that bar's close with exit_reason
-      END_OF_DATA (a valuation, not a fill: no slippage, no exit commission).
+      (plan §11.1) AND atr14 is computable (the §12.1 stop must be sizable —
+      live refuses an unsized stock entry, so the replay does too). Shares =
+      ``floor(equity * position_pct / fill_price)`` (trimmed only if the
+      commission would push cash below zero — the account never borrows,
+      plan §5). The stop distance is fixed at entry:
+      ``ATR_STOP_MULTIPLE * atr14`` at the decision bar (§12.1, the SAME
+      shared constant the live gate chain uses).
+    - EXIT: the SHARED live exit engine (libs.trading_core.exits
+      .evaluate_exit — §21, never reimplemented), first match in live
+      priority order: HARD_STOP (close <= entry - stop_distance, §11.3) ->
+      SIGNAL_FLIP -> SIGNAL_DECAY (easier than entry, §11.1) -> ATR_TRAIL
+      (§11.5) -> TIME_STOP (§11.6). At the FINAL bar an open position is
+      marked to that bar's close with exit_reason END_OF_DATA (a valuation,
+      not a fill: no slippage, no exit commission).
     - Equity is marked to market daily (``cash + shares * close``);
       ``drawdown = equity / running_max - 1``.
-    - IS/OOS (plan §44 rule 16): the OOS segment starts at bar
-      ``floor(n_bars * oos_split)``; a trade belongs to the segment of its
-      ENTRY bar; segment equity metrics are computed over the segment's slice
-      of the equity curve. The engine only reports OOS results — nothing is
-      ever fitted or optimized on them.
 
     ``regime_params`` / ``directional_params`` pass through to the shared
     signal engines (plan §21: same code as live; plan §6.2: every threshold a
@@ -437,14 +523,27 @@ def run_backtest(
     # an optimization, not look-ahead (plan §20.3).
     atr14 = atr(highs, lows, closes, period=ATR_PERIOD)
 
+    # Exit rules: the SHARED live engine's parameters, mapped 1:1 from
+    # BacktestParams (§21 — same logic, same knobs as live).
+    exit_params = ExitParams(
+        exit_edge_threshold=params.exit_edge_threshold,
+        atr_trail_k=params.atr_trail_k,
+        time_stop_bars=params.time_stop_bars,
+        min_move_atr=params.min_move_atr,
+        atr_period=ATR_PERIOD,
+    )
+
     cash = INITIAL_EQUITY
     shares = 0
     entry_index = -1
     entry_price = 0.0
     entry_cost = 0.0
     entry_reason = ""
+    entry_edge = 0.0
+    entry_stop_distance = 0.0
     peak_close = -math.inf
-    pending_entry: str | None = None
+    # (reason, edge_at_decision, stop_distance sized at the decision bar)
+    pending_entry: tuple[str, float, float] | None = None
     pending_exit: str | None = None
 
     trades: list[Trade] = []
@@ -492,7 +591,7 @@ def run_backtest(
                 entry_index = t
                 entry_price = fill
                 entry_cost = qty * (fill + commission)
-                entry_reason = pending_entry
+                entry_reason, entry_edge, entry_stop_distance = pending_entry
                 peak_close = -math.inf
             pending_entry = None
         elif pending_exit is not None and shares > 0:
@@ -514,23 +613,44 @@ def run_backtest(
                     f"END_OF_DATA: marked to final close {closes[t]:.4f}",
                 )
             else:
-                pending_exit = _evaluate_exit(
-                    t,
-                    closes,
-                    highs,
-                    lows,
-                    volumes,
-                    atr14,
-                    params,
-                    directional_params,
-                    entry_index,
-                    entry_price,
-                    peak_close,
+                # SHARED live exit engine (§21): peak_close already folds in
+                # the current close, matching the live caller convention
+                # documented on PositionState.highest_close_since_entry.
+                decision = evaluate_exit(
+                    PositionState(
+                        entry_price=entry_price,
+                        stop_distance=entry_stop_distance,
+                        entry_edge=entry_edge,
+                        bars_held=t - entry_index,
+                        highest_close_since_entry=peak_close,
+                    ),
+                    closes[: t + 1],
+                    highs[: t + 1],
+                    lows[: t + 1],
+                    volumes=volumes[: t + 1],
+                    params=exit_params,
+                    directional_params=directional_params,
+                )
+                pending_exit = (
+                    next(
+                        r
+                        for r in decision.reasons
+                        if r.startswith(decision.triggered_rule or "")
+                    )
+                    if decision.should_exit
+                    else None
                 )
         elif pending_entry is None and params.warmup_bars <= t < n - 1:
-            pending_entry = _evaluate_entry(
-                t, closes, highs, lows, volumes, params, regime_params, directional_params
-            )
+            # §12.1 parity: live refuses a LONG_STOCK entry whose stop cannot
+            # be sized (no ATR) — the replay refuses identically.
+            atr_t = atr14[t]
+            if atr_t is not None:
+                entry_eval = _evaluate_entry(
+                    t, closes, highs, lows, volumes, params, regime_params, directional_params
+                )
+                if entry_eval is not None:
+                    reason, edge = entry_eval
+                    pending_entry = (reason, edge, ATR_STOP_MULTIPLE * atr_t)
 
         equity.append(cash + shares * closes[t])
         held_flags.append(held_during_bar)
@@ -542,30 +662,199 @@ def run_backtest(
         running_max = max(running_max, value)
         drawdown.append(value / running_max - 1.0 if running_max > 0.0 else 0.0)
 
-    # --- IS/OOS segmentation (plan §44 rule 16: report-only) ----------------
-    boundary = math.floor(n * params.oos_split)
-    oos_start_date = dates[boundary] if boundary < n else None
-    metrics = {
-        "full": _segment_metrics(equity, held_flags, trades),
-        "in_sample": _segment_metrics(
-            equity[:boundary],
-            held_flags[:boundary],
-            [tr for tr in trades if tr.entry_index < boundary],
-        ),
-        "out_of_sample": _segment_metrics(
-            equity[boundary:],
-            held_flags[boundary:],
-            [tr for tr in trades if tr.entry_index >= boundary],
-        ),
-    }
+    return BacktestResult(
+        trades=trades,
+        dates=list(dates),
+        equity=equity,
+        drawdown=drawdown,
+        metrics=_segment_metrics(equity, held_flags, trades),
+    )
+
+
+def run_short_stock_backtest(
+    dates: list[date],
+    opens: list[float],
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    volumes: list[float],
+    params: BacktestParams = BacktestParams(instrument="SHORT_STOCK"),
+    *,
+    regime_params: RegimeParams = RegimeParams(),
+    directional_params: DirectionalParams = DirectionalParams(),
+) -> BacktestResult:
+    """Replay margin-backed SHORT STOCK (roadmap Phase 3) — the exact bear
+    mirror of :func:`run_backtest`, same shared engines (§21).
+
+    - ENTRY (only when flat): the bear mirror — regime in {STRONG_BEAR,
+      MILD_BEAR} AND bias == BEAR AND ``directional_edge <=
+      -entry_edge_threshold`` (:func:`_evaluate_entry_bear`, the same
+      helper the LONG_PUT leg replays) AND atr14 computable. The short
+      SELL fills at ``open * (1 - slip)`` (slippage against the seller)
+      and the PROCEEDS are credited to cash; shares =
+      ``floor(equity * position_pct / fill)`` — the shorted notional is
+      capped by the same position_pct that caps a long, the replay's
+      margin-usage model.
+    - EXIT: the SHARED live exit engine with ``direction="BEAR"`` — the
+      hard stop sits ABOVE entry (``close >= entry + stop_distance``), the
+      ATR trail hangs above the running trough, signal exits fire on the
+      OPPOSING (BULL) bias. The cover BUY fills at ``open * (1 + slip)``
+      and cash is debited. END_OF_DATA marks to the final close.
+    - Equity while short = ``cash - shares * close`` (the liability is
+      marked live), so equity moves by exactly the short's P&L.
+    - ``return_pct`` is measured on the SHORTED NOTIONAL at entry
+      (qty * fill) — the capital the position_pct cap allocated.
+    """
+    n = len(closes)
+    if not (len(dates) == len(opens) == len(highs) == len(lows) == n == len(volumes)):
+        raise ValueError(
+            "dates, opens, highs, lows, closes and volumes must have equal "
+            f"length, got {len(dates)}/{len(opens)}/{len(highs)}/{len(lows)}/"
+            f"{n}/{len(volumes)}"
+        )
+    if n < 1:
+        raise ValueError("run_short_stock_backtest needs at least 1 bar")
+
+    slip = params.effective_slippage_bps() / 10_000.0
+    commission = params.commission_per_share
+    atr14 = atr(highs, lows, closes, period=ATR_PERIOD)
+    exit_params = ExitParams(
+        exit_edge_threshold=params.exit_edge_threshold,
+        atr_trail_k=params.atr_trail_k,
+        time_stop_bars=params.time_stop_bars,
+        min_move_atr=params.min_move_atr,
+        atr_period=ATR_PERIOD,
+    )
+
+    cash = INITIAL_EQUITY
+    shares = 0
+    entry_index = -1
+    entry_price = 0.0
+    entry_notional = 0.0
+    entry_commission_paid = 0.0
+    entry_reason = ""
+    entry_edge = 0.0
+    entry_stop_distance = 0.0
+    trough_close = math.inf
+    pending_entry: tuple[str, float, float] | None = None
+    pending_exit: str | None = None
+
+    trades: list[Trade] = []
+    equity: list[float] = []
+    held_flags: list[bool] = []
+
+    def cover_trade(t: int, exit_price: float, exit_commission: float, reason: str) -> None:
+        nonlocal cash, shares
+        cost = shares * exit_price + shares * exit_commission
+        cash -= cost
+        pnl = (
+            shares * (entry_price - exit_price)
+            - entry_commission_paid
+            - shares * exit_commission
+        )
+        trades.append(
+            Trade(
+                entry_index=entry_index,
+                entry_date=dates[entry_index],
+                entry_price=entry_price,
+                exit_index=t,
+                exit_date=dates[t],
+                exit_price=exit_price,
+                shares=shares,
+                bars_held=t - entry_index,
+                return_pct=(
+                    pnl / entry_notional * 100.0 if entry_notional > 0.0 else 0.0
+                ),
+                pnl=pnl,
+                entry_reason=entry_reason,
+                exit_reason=reason,
+            )
+        )
+        shares = 0
+
+    for t in range(n):
+        # --- 1. Fill the decision made at the close of t-1 at this open ----
+        if pending_entry is not None:
+            fill = opens[t] * (1.0 - slip)  # the short SELL fills lower
+            qty = math.floor(cash * params.position_pct / fill) if fill > 0.0 else 0
+            if qty > 0:
+                cash += qty * fill - qty * commission  # proceeds credited
+                shares = qty
+                entry_index = t
+                entry_price = fill
+                entry_notional = qty * fill
+                entry_commission_paid = qty * commission
+                entry_reason, entry_edge, entry_stop_distance = pending_entry
+                trough_close = math.inf
+            pending_entry = None
+        elif pending_exit is not None and shares > 0:
+            cover_trade(t, opens[t] * (1.0 + slip), commission, pending_exit)
+            pending_exit = None
+
+        held_during_bar = shares > 0
+
+        # --- 2. Decide at the close of t (fills at the open of t+1) --------
+        if shares > 0:
+            trough_close = min(trough_close, closes[t])
+            if t == n - 1:
+                cover_trade(
+                    t,
+                    closes[t],
+                    0.0,
+                    f"END_OF_DATA: marked to final close {closes[t]:.4f}",
+                )
+            else:
+                decision = evaluate_exit(
+                    PositionState(
+                        entry_price=entry_price,
+                        stop_distance=entry_stop_distance,
+                        entry_edge=entry_edge,
+                        bars_held=t - entry_index,
+                        highest_close_since_entry=max(closes[entry_index : t + 1]),
+                        direction="BEAR",
+                        lowest_close_since_entry=trough_close,
+                    ),
+                    closes[: t + 1],
+                    highs[: t + 1],
+                    lows[: t + 1],
+                    volumes=volumes[: t + 1],
+                    params=exit_params,
+                    directional_params=directional_params,
+                )
+                pending_exit = (
+                    next(
+                        r
+                        for r in decision.reasons
+                        if r.startswith(decision.triggered_rule or "")
+                    )
+                    if decision.should_exit
+                    else None
+                )
+        elif pending_entry is None and params.warmup_bars <= t < n - 1:
+            atr_t = atr14[t]
+            if atr_t is not None:
+                entry_eval = _evaluate_entry_bear(
+                    t, closes, highs, lows, volumes, params, regime_params, directional_params
+                )
+                if entry_eval is not None:
+                    reason, edge = entry_eval
+                    pending_entry = (reason, edge, ATR_STOP_MULTIPLE * atr_t)
+
+        equity.append(cash - shares * closes[t])
+        held_flags.append(held_during_bar)
+
+    drawdown: list[float] = []
+    running_max = -math.inf
+    for value in equity:
+        running_max = max(running_max, value)
+        drawdown.append(value / running_max - 1.0 if running_max > 0.0 else 0.0)
 
     return BacktestResult(
         trades=trades,
         dates=list(dates),
         equity=equity,
         drawdown=drawdown,
-        metrics=metrics,
-        oos_start_date=oos_start_date,
+        metrics=_segment_metrics(equity, held_flags, trades),
     )
 
 
@@ -578,9 +867,10 @@ def _evaluate_entry(
     params: BacktestParams,
     regime_params: RegimeParams,
     directional_params: DirectionalParams,
-) -> str | None:
+) -> tuple[str, float] | None:
     """Entry decision at the close of bar ``t`` on data ``[:t+1]`` ONLY
-    (plan §20.3). Returns the human-readable entry reason, or ``None``.
+    (plan §20.3). Returns ``(human-readable entry reason, edge)`` — the edge
+    seeds PositionState.entry_edge for the shared exit engine — or ``None``.
 
     Long stock only (plan §5): regime in {STRONG_BULL, MILD_BULL} AND
     bias == BULL AND ``directional_edge >= entry_edge_threshold``
@@ -605,37 +895,31 @@ def _evaluate_entry(
         return (
             f"edge {direction.directional_edge:.1f} >= "
             f"{params.entry_edge_threshold:.1f}, regime "
-            f"{regime.classification.value}, bias BULL"
+            f"{regime.classification.value}, bias BULL",
+            direction.directional_edge,
         )
     return None
 
 
-def _evaluate_exit(
+def _evaluate_entry_bear(
     t: int,
     closes: list[float],
     highs: list[float],
     lows: list[float],
     volumes: list[float],
-    atr14: list[float | None],
     params: BacktestParams,
+    regime_params: RegimeParams,
     directional_params: DirectionalParams,
-    entry_index: int,
-    entry_price: float,
-    peak_close: float,
-) -> str | None:
-    """Exit decision at the close of bar ``t`` on data ``[:t+1]`` ONLY
-    (plan §20.3). First match wins, in priority order (plan §11):
-
-    1. SIGNAL_FLIP  — bias == BEAR.
-    2. SIGNAL_DECAY — ``edge < exit_edge_threshold`` (easier than entry,
-       plan §11.1).
-    3. ATR_TRAIL    — ``close < peak_close - atr_trail_k * atr14`` (plan §11.5).
-    4. TIME_STOP    — held ``>= time_stop_bars`` bars without a
-       ``min_move_atr * atr14`` move (plan §11.6).
-
-    (Priority 5, END_OF_DATA, is handled by the replay loop at the final
-    bar.) Returns the human-readable exit reason, or ``None``.
-    """
+) -> tuple[str, float] | None:
+    """The bear-side mirror of :func:`_evaluate_entry` (2026-08-17): regime
+    in {STRONG_BEAR, MILD_BEAR} AND bias == BEAR AND ``directional_edge <=
+    -entry_edge_threshold`` — the LONG_PUT / BEAR_PUT_SPREAD entry gate,
+    with the same §20.3 no-look-ahead slices."""
+    regime = classify_regime(
+        closes[: t + 1], highs[: t + 1], lows[: t + 1], params=regime_params
+    )
+    if regime.classification not in _BEAR_REGIMES:
+        return None
     direction = score_direction(
         closes[: t + 1],
         highs[: t + 1],
@@ -643,36 +927,16 @@ def _evaluate_exit(
         volumes=volumes[: t + 1],
         params=directional_params,
     )
-    edge = direction.directional_edge
-
-    # (1) SIGNAL_FLIP — the directional evidence now points down.
-    if direction.bias is DirectionalBias.BEAR:
-        return f"SIGNAL_FLIP: bias BEAR, edge {edge:.1f}"
-
-    # (2) SIGNAL_DECAY — the edge no longer justifies holding (plan §11.1).
-    if edge < params.exit_edge_threshold:
+    if (
+        direction.bias is DirectionalBias.BEAR
+        and direction.directional_edge <= -params.entry_edge_threshold
+    ):
         return (
-            f"SIGNAL_DECAY: edge {edge:.1f} < {params.exit_edge_threshold:.1f}"
+            f"edge {direction.directional_edge:.1f} <= "
+            f"-{params.entry_edge_threshold:.1f}, regime "
+            f"{regime.classification.value}, bias BEAR",
+            direction.directional_edge,
         )
-
-    atr_t = atr14[t]
-    if atr_t is not None:
-        # (3) ATR_TRAIL (plan §11.5).
-        trail = peak_close - params.atr_trail_k * atr_t
-        if closes[t] < trail:
-            return (
-                f"ATR_TRAIL: close {closes[t]:.4f} < trail {trail:.4f} "
-                f"(peak {peak_close:.4f} - {params.atr_trail_k:.2f} * "
-                f"atr14 {atr_t:.4f})"
-            )
-
-        # (4) TIME_STOP (plan §11.6).
-        bars_held = t - entry_index
-        move = closes[t] - entry_price
-        if bars_held >= params.time_stop_bars and move < params.min_move_atr * atr_t:
-            return (
-                f"TIME_STOP: held {bars_held} bars >= {params.time_stop_bars}, "
-                f"move {move:.4f} < {params.min_move_atr:.2f} * atr14 {atr_t:.4f}"
-            )
-
     return None
+
+

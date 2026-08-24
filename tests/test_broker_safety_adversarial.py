@@ -217,7 +217,10 @@ async def _client(monkeypatch, broker: _Broker | None):
     os.environ["MARKET_DATA_PROVIDER"] = "stub"
     os.environ["LLM_PROVIDER"] = "stub"
     if broker is None:
-        os.environ.pop("BROKER_PROVIDER", None)
+        # Explicit empty, never pop: Settings falls back to the .env FILE for
+        # absent variables, and a developer's real .env (broker + keys filled)
+        # would silently give this "unset" harness a working broker.
+        os.environ["BROKER_PROVIDER"] = ""
     else:
         os.environ["BROKER_PROVIDER"] = "alpaca_paper"
         monkeypatch.setattr(

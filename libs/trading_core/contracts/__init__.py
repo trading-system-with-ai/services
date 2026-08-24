@@ -13,10 +13,20 @@ from .selector import (  # noqa: F401
     SelectorParams,
     select_contracts,
 )
+from .spreads import (  # noqa: F401
+    SpreadCandidate,
+    SpreadParams,
+    SpreadSelection,
+    select_vertical_spread,
+)
 
 __all__ = [
     "ContractQuote",
     "ScoredContract",
     "SelectorParams",
+    "SpreadCandidate",
+    "SpreadParams",
+    "SpreadSelection",
     "select_contracts",
+    "select_vertical_spread",
 ]

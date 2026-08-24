@@ -37,22 +37,82 @@ from libs.trading_core.models import DirectionalBias, InstrumentType, IVRegime
 # strength_tier() (libs.trading_core.risk.engine, plan §12.2).
 _VALID_STRENGTHS = ("WEAK", "MODERATE", "STRONG", "VERY_STRONG")
 
+# The DISPLAY-AND-REFUSE permission fields (guide §2, §33) with the §33 name
+# of the capability each one would describe. These are hard account
+# constraints, enforced in ALL environments including Alpaca Paper: the
+# platform has no code path for any of them (no Sell-to-Open exists anywhere,
+# no margin model exists anywhere), so the fields exist only so the
+# restriction is EXPLICIT and visible — constructing them True is a
+# programming error, refused at construction (see AccountPermissions).
+# 2026-08-17 Phase 3 UNLOCK: short_stock / margin moved OUT — the
+# margin-backed short chain exists (mirrored exits, stop-based risk with a
+# gap factor, broker short/cover orders, backtest leg). ONLY the naked
+# shorts remain, PERMANENTLY: Alpaca offers them at no approval level
+# (broker refusal) and the §4 charter forbids unbounded premium risk.
+FORBIDDEN_PERMISSION_FIELDS: dict[str, str] = {
+    "naked_short_call": "naked short calls",
+    "naked_short_put": "naked short puts",
+}
+
 
 @dataclass(frozen=True)
 class AccountPermissions:
-    """What the account is allowed to trade (plan §5, as configurable flags).
+    """What the account is allowed to trade (guide §2/§5, as explicit flags).
 
-    §5 hard constraints are the DEFAULTS here, not assumptions baked into
-    logic: no short stock ever (there is no flag for it — short stock does
-    not exist in this system), and spreads are off until the account is
-    approved for them. Flipping a flag re-derives the matrix; it never
-    edits the matrix itself.
+    §2/§5 hard constraints are the DEFAULTS here, not assumptions baked into
+    logic. Two kinds of field exist:
+
+    - REAL flags (``long_stock``, ``long_call``, ``long_put``,
+      ``defined_risk_spreads``): flipping one re-derives the §8 matrix; it
+      never edits the matrix itself. ``defined_risk_spreads`` is a genuine
+      deferred capability — off until the account is explicitly approved.
+    - DISPLAY-AND-REFUSE fields (:data:`FORBIDDEN_PERMISSION_FIELDS` —
+      ``short_stock``, ``naked_short_call``, ``naked_short_put``,
+      ``covered_call``, ``cash_secured_put``, ``margin``): the guide's §2
+      permission block names them so the restriction is explicit, but the
+      platform has NO code path for any of them (Sell-to-Open does not exist
+      in this system, and neither does a margin model). They therefore
+      default False and CANNOT be constructed True: ``__post_init__`` raises
+      ``ValueError`` citing guide §33. They are rendered (e.g. by
+      GET /api/config) so the constraint is visible, never so it can be
+      lifted.
+
+    Alpaca Paper capability does NOT override platform permissions (§2):
+    the source of truth is this object, never what Alpaca Paper technically
+    permits — paper mode mirrors the intended real cash-account restrictions
+    (§23), in all environments.
     """
 
     long_stock: bool = True
     long_call: bool = True
     long_put: bool = True
     defined_risk_spreads: bool = False
+    # Display-and-refuse (guide §2, §33): always False, enforced below.
+    short_stock: bool = False
+    naked_short_call: bool = False
+    naked_short_put: bool = False
+    covered_call: bool = False
+    cash_secured_put: bool = False
+    margin: bool = False
+
+    def __post_init__(self) -> None:
+        """Refuse any forbidden permission at construction (guide §33).
+
+        These are non-negotiable: the platform cannot execute them (no
+        Sell-to-Open, no margin model), so a True value is not a
+        configuration — it is a bug, and it fails loudly here rather than
+        pretending a capability exists.
+        """
+        for name, capability in FORBIDDEN_PERMISSION_FIELDS.items():
+            if getattr(self, name):
+                raise ValueError(
+                    f"AccountPermissions.{name}=True violates guide §33 "
+                    f"(non-negotiable rules): this platform cannot execute "
+                    f"{capability} — no code path for it exists (no "
+                    "Sell-to-Open, no margin). The field exists to make the "
+                    "restriction explicit, not to lift it, and Alpaca Paper "
+                    "capability does not override platform permissions (§2)."
+                )
 
 
 @dataclass
@@ -85,6 +145,34 @@ def _finalize(
     cell falls back straight to NO_TRADE — there is NO short stock in this
     system (§5), so no stock fallback exists on the bear side.
     """
+    if (
+        instrument is InstrumentType.BULL_CALL_SPREAD
+        and not permissions.defined_risk_spreads
+    ):
+        rationale.append(
+            "§5 permissions: defined-risk spreads not permitted -> degraded "
+            "to LONG_STOCK (bull exposure without the short leg)."
+        )
+        instrument = InstrumentType.LONG_STOCK
+    if (
+        instrument is InstrumentType.BEAR_PUT_SPREAD
+        and not permissions.defined_risk_spreads
+    ):
+        rationale.append(
+            "§5 permissions: defined-risk spreads not permitted -> degraded "
+            "to LONG_PUT, preferring a higher-|delta| (deeper ITM) strike to "
+            "cut the premium/theta paid (§9); short stock does not exist in "
+            "this system (§5)."
+        )
+        instrument = InstrumentType.LONG_PUT
+    if instrument is InstrumentType.SHORT_STOCK and not (
+        permissions.short_stock and permissions.margin
+    ):
+        rationale.append(
+            "§5 permissions: short stock requires BOTH short_stock and "
+            "margin enabled -> NO_TRADE."
+        )
+        instrument = InstrumentType.NO_TRADE
     if instrument is InstrumentType.LONG_CALL and not permissions.long_call:
         rationale.append(
             "§5 permissions: long calls not permitted -> degraded to "
@@ -105,18 +193,13 @@ def _finalize(
     return InstrumentDecision(
         instrument=instrument,
         contract_needed=instrument
-        in (InstrumentType.LONG_CALL, InstrumentType.LONG_PUT),
+        in (
+            InstrumentType.LONG_CALL,
+            InstrumentType.LONG_PUT,
+            InstrumentType.BULL_CALL_SPREAD,
+            InstrumentType.BEAR_PUT_SPREAD,
+        ),
         rationale=rationale,
-    )
-
-
-def _spread_degradation_note(permissions: AccountPermissions) -> str:
-    """Why a §8 spread cell cannot be taken literally in v1 (§5)."""
-    if not permissions.defined_risk_spreads:
-        return "spreads not permitted (§5)"
-    return (
-        "spreads permitted but not implemented in v1 "
-        "(InstrumentType has no spread instrument yet)"
     )
 
 
@@ -188,13 +271,18 @@ def select_instrument(
                 "-> LONG_STOCK for bull exposure without paying it."
             )
             return _finalize(InstrumentType.LONG_STOCK, rationale, permissions)
+        if permissions.short_stock and permissions.margin:
+            rationale.append(
+                f"§8 {cell}: EXTREME IV — premium unbuyable (§7); short "
+                "stock expresses the bear WITHOUT paying it (Phase 3; "
+                "margin-backed, stop-based risk)."
+            )
+            return _finalize(InstrumentType.SHORT_STOCK, rationale, permissions)
         rationale.append(
             f"§8 {cell}: EXTREME IV — never buy extreme premium (§7), and "
-            "no short stock exists in this system (§5) -> NO_TRADE."
+            "short stock is not enabled (§5/Phase 3) -> NO_TRADE."
         )
         return _finalize(InstrumentType.NO_TRADE, rationale, permissions)
-
-    degradation = _spread_degradation_note(permissions)
 
     # --- BULL column (§8 table, §5 degradations) ---------------------------
     if direction is DirectionalBias.BULL:
@@ -208,10 +296,12 @@ def select_instrument(
                     InstrumentType.LONG_CALL, rationale, permissions
                 )
             rationale.append(
-                f"§8 {cell} maps to Bull Call Spread; {degradation} "
-                "-> degraded to LONG_STOCK."
+                f"§8 {cell} maps to Bull Call Spread — defined-risk bull "
+                "premium with the vega cost hedged by the short leg."
             )
-            return _finalize(InstrumentType.LONG_STOCK, rationale, permissions)
+            return _finalize(
+                InstrumentType.BULL_CALL_SPREAD, rationale, permissions
+            )
         if effective_strength == "MODERATE":
             rationale.append(
                 f"§8 {cell}: moderate bull maps to Stock — not enough "
@@ -234,24 +324,40 @@ def select_instrument(
             )
             return _finalize(InstrumentType.LONG_PUT, rationale, permissions)
         rationale.append(
-            f"§8 {cell} maps to Bear Put Spread; {degradation} -> degraded "
-            "to LONG_PUT, preferring a higher-|delta| (deeper ITM) strike "
-            "to cut the premium/theta paid in richer IV (§9)."
+            f"§8 {cell} maps to Bear Put Spread — defined-risk bear premium "
+            "in richer IV."
         )
-        return _finalize(InstrumentType.LONG_PUT, rationale, permissions)
+        return _finalize(InstrumentType.BEAR_PUT_SPREAD, rationale, permissions)
     if effective_strength == "MODERATE":
         if vol_regime is IVRegime.HIGH:
+            if permissions.defined_risk_spreads:
+                rationale.append(
+                    f"§8 {cell} maps to Bear Put Spread — expensive premium "
+                    "made affordable by the short leg."
+                )
+                return _finalize(
+                    InstrumentType.BEAR_PUT_SPREAD, rationale, permissions
+                )
+            if permissions.short_stock and permissions.margin:
+                rationale.append(
+                    f"§8 {cell}: expensive premium and no spreads — short "
+                    "stock expresses the bear without paying it (Phase 3)."
+                )
+                return _finalize(
+                    InstrumentType.SHORT_STOCK, rationale, permissions
+                )
             rationale.append(
                 f"§8 {cell}: the 'Higher-delta Long Put / No Trade' cell — "
-                "expensive premium with no spreads available (§5) -> pass; "
-                "NO TRADE is a valid output."
+                "expensive premium with no spreads available and short "
+                "stock is not enabled (§5/Phase 3) -> pass; NO TRADE is a "
+                "valid output."
             )
             return _finalize(InstrumentType.NO_TRADE, rationale, permissions)
         rationale.append(
-            f"§8 {cell} maps to Bear Put Spread; {degradation} -> degraded "
-            "to LONG_PUT (short stock does not exist in this system, §5)."
+            f"§8 {cell} maps to Bear Put Spread — moderate bear expressed "
+            "with defined risk."
         )
-        return _finalize(InstrumentType.LONG_PUT, rationale, permissions)
+        return _finalize(InstrumentType.BEAR_PUT_SPREAD, rationale, permissions)
     # WEAK
     rationale.append(
         f"§8 {cell}: weak bear is explicitly No Trade — a weak edge does "

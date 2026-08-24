@@ -147,6 +147,33 @@ def _backtest_failed_title(details: Mapping, entity_id: str) -> str:
     return f"Backtest failed {entity_id} — {error}"
 
 
+def _event_approaching_title(details: Mapping, entity_id: str) -> str:
+    """"NVDA event in 3 days" / "FOMC_DECISION event in 7 days".
+
+    The subject is the TICKER when the event has one and the event TYPE
+    otherwise — a macro print has no symbol to name, and "event in 5 days"
+    alone tells the user nothing. ``days_to_event`` is written by the
+    ingestion tick as a float; it is floored to whole days here because
+    "in 2 days" is what a T-minus badge means, and rounding 2.9 up to 3 would
+    quietly move the event a day further away than it is. A row missing the
+    field degrades to the horizon it was raised at rather than crashing —
+    same tolerance every builder above applies to sparse details.
+    """
+    ticker = details.get("ticker")
+    subject = ticker if isinstance(ticker, str) and ticker else details.get("type")
+    # entity_id is the numeric events.id; the readable natural key travels in
+    # details.event_key, so prefer it before falling back to the raw id.
+    subject = subject or details.get("event_key") or entity_id or "Event"
+    days = details.get("days_to_event")
+    if not isinstance(days, (int, float)) or isinstance(days, bool):
+        days = details.get("horizon")
+    if isinstance(days, (int, float)) and not isinstance(days, bool):
+        whole = int(days)
+        unit = "day" if whole == 1 else "days"
+        return f"{subject} event in {whole} {unit}"
+    return f"{subject} event approaching"
+
+
 # --- the declarative table (§18/§29/§38) -----------------------------------
 
 ALERT_RULES: dict[str, AlertRule] = {
@@ -160,6 +187,14 @@ ALERT_RULES: dict[str, AlertRule] = {
     AuditAction.BACKTEST_FAILED.value: AlertRule(WARNING, _backtest_failed_title),
     AuditAction.ORDER_FILLED.value: AlertRule(INFO, _order_filled_title),
     AuditAction.TRADING_RESUMED.value: AlertRule(INFO, _trading_resumed_title),
+    # Catalyst & Event Intelligence (event spec §11): a CONFIRMED/REVISED
+    # event entering the T-minus horizon. INFO — a scheduled catalyst is
+    # information to plan around, not a capability change or a failure.
+    # The ingestion tick writes this row exactly once per (event, horizon)
+    # and NEVER for an ESTIMATED date, so this rule needs no predicate:
+    # the honesty guarantee lives at the writer (ADR-006 keeps alerts a
+    # pure classification OVER the audit trail, never a second source).
+    AuditAction.EVENT_APPROACHING.value: AlertRule(INFO, _event_approaching_title),
 }
 
 # The SQL IN filter for the feed query — everything else is not an alert.

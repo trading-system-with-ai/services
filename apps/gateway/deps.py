@@ -35,11 +35,25 @@ from libs.broker import BrokerNotConfigured, BrokerProvider, get_broker
 from libs.common.config import get_settings
 from libs.llm import LLMProviderNotConfigured, get_recommendation_provider
 from libs.market_data import ProviderNotConfigured, get_provider
+from libs.prediction_markets import (
+    PREDICTION_MARKETS_NOT_CONFIGURED_MESSAGE,
+    get_provider as get_prediction_markets_provider,
+)
+from libs.trading_core.strategies import AccountPermissions
+from libs.web_search import (
+    WEB_SEARCH_NOT_CONFIGURED_MESSAGE,
+    get_provider as get_web_search_provider,
+)
 
 # Machine-readable error codes carried in the 503 detail block.
 MARKET_DATA_NOT_CONFIGURED = "MARKET_DATA_NOT_CONFIGURED"
 LLM_NOT_CONFIGURED = "LLM_NOT_CONFIGURED"
 BROKER_NOT_CONFIGURED = "BROKER_NOT_CONFIGURED"
+# Research capabilities (Catalyst research upgrade): carried in the honest
+# `available: false` research payloads, never a 503 — an unconfigured
+# research provider degrades ONLY the research section, never a page.
+WEB_SEARCH_NOT_CONFIGURED = "WEB_SEARCH_NOT_CONFIGURED"
+PREDICTION_MARKETS_NOT_CONFIGURED = "PREDICTION_MARKETS_NOT_CONFIGURED"
 
 # The ONE gateway-level execution mode that is not a broker: the internal §11
 # paper fill model. It lives HERE and not in the libs.broker registry on
@@ -47,6 +61,39 @@ BROKER_NOT_CONFIGURED = "BROKER_NOT_CONFIGURED"
 # an explicit, documented development / backtest-comparison opt-in; nothing
 # defaults to it.
 SIMULATED_BROKER = "simulated"
+
+
+def account_permissions_from_settings() -> AccountPermissions:
+    """The platform's effective AccountPermissions, built from Settings (§8).
+
+    THE one place environment configuration (``ALLOW_*``, guide §8) becomes
+    the engine's :class:`AccountPermissions` — the §10 gate chain's
+    ``select_instrument`` call and GET /api/config both read THIS, so what is
+    enforced and what is displayed can never drift apart.
+
+    Two layers of §33 enforcement stand behind it: the Settings validator has
+    already hard-rejected any forbidden ``ALLOW_*`` flag set true at startup,
+    and ``AccountPermissions.__post_init__`` refuses the forbidden fields True
+    at construction. ``margin`` has no env flag at all (§33 rule 7 — nothing
+    margin-dependent exists to enable), so it is pinned False here. Alpaca
+    Paper capability does not override platform permissions (§2): nothing in
+    this factory ever consults the broker.
+    """
+    settings = get_settings()
+    return AccountPermissions(
+        long_stock=settings.allow_long_stock,
+        long_call=settings.allow_long_call,
+        long_put=settings.allow_long_put,
+        defined_risk_spreads=settings.allow_defined_risk_spreads,
+        # Display-and-refuse fields (§2, §33): the validator guarantees these
+        # are False; passing them through keeps the wiring honest end to end.
+        short_stock=settings.allow_short_stock,
+        naked_short_call=settings.allow_naked_short_call,
+        naked_short_put=settings.allow_naked_short_put,
+        covered_call=settings.allow_covered_call,
+        cash_secured_put=settings.allow_cash_secured_put,
+        margin=settings.allow_margin,  # Phase 3: a real flag now
+    )
 
 
 def market_data_unavailable_reason() -> str | None:
@@ -97,6 +144,58 @@ def llm_unavailable_reason() -> str | None:
 def llm_configured() -> bool:
     """True when an LLM provider is configured AND usable."""
     return llm_unavailable_reason() is None
+
+
+def web_search_unavailable_reason() -> str | None:
+    """Why web-search research is unusable right now, or None when it works.
+
+    RESEARCH ONLY (Catalyst research upgrade): unavailable degrades the
+    web-research section of event research — never an event page, never a
+    503 on an unrelated route. Same resolve-not-just-non-blank discipline as
+    the three core providers above.
+    """
+    name = get_settings().web_search_provider
+    if not name or not name.strip():
+        return WEB_SEARCH_NOT_CONFIGURED_MESSAGE
+    try:
+        get_web_search_provider(name)
+    except ProviderNotConfigured as exc:
+        return str(exc)
+    except ValueError as exc:
+        return f"{exc} (WEB_SEARCH_PROVIDER={name!r})"
+    except Exception as exc:
+        return f"web search provider {name!r} could not be initialised: {exc}"
+    return None
+
+
+def web_search_configured() -> bool:
+    """True when a web search provider is configured AND usable."""
+    return web_search_unavailable_reason() is None
+
+
+def prediction_markets_unavailable_reason() -> str | None:
+    """Why prediction-market research is unusable right now, or None when it
+    works. Same research-only degradation contract as web search."""
+    name = get_settings().prediction_markets_provider
+    if not name or not name.strip():
+        return PREDICTION_MARKETS_NOT_CONFIGURED_MESSAGE
+    try:
+        get_prediction_markets_provider(name)
+    except ProviderNotConfigured as exc:
+        return str(exc)
+    except ValueError as exc:
+        return f"{exc} (PREDICTION_MARKETS_PROVIDER={name!r})"
+    except Exception as exc:
+        return (
+            f"prediction markets provider {name!r} could not be "
+            f"initialised: {exc}"
+        )
+    return None
+
+
+def prediction_markets_configured() -> bool:
+    """True when a prediction markets provider is configured AND usable."""
+    return prediction_markets_unavailable_reason() is None
 
 
 def market_data_unavailable(exc: ProviderNotConfigured) -> HTTPException:

@@ -89,11 +89,22 @@ class ContractQuote:
     last: float | None
     volume: int
     open_interest: int
-    iv: float
-    delta: float
-    gamma: float
-    theta: float
-    vega: float
+    #: Greeks/IV are the PROVIDER's values or honest None (some feeds omit
+    #: them on deep ITM/OTM contracts). None is never zero-filled: the §9
+    #: selector rejects such contracts with a named reason, and displays
+    #: render "—". A contract with a real quote but no greeks is still real
+    #: chain data the user may want to SEE (§completeness).
+    iv: float | None
+    delta: float | None
+    gamma: float | None
+    theta: float | None
+    vega: float | None
+    #: How ``mid`` was priced: "quote" (NBBO bid/ask or reported midpoint) or
+    #: "day_close" (quotes-less plan: the session bar's close — a real traded
+    #: price, but bid/ask/spread are then UNKNOWN; the recorded worst-case
+    #: spread exists for the selector's fail-closed filter, and the API layer
+    #: reports the unknowns as nulls, never as 0.00).
+    price_basis: str = "quote"
 
 
 @dataclass
@@ -135,12 +146,24 @@ def _fail_reasons(
         reasons.append(
             f"DTE {c.dte} outside [{params.dte_min}, {params.dte_max}]"
         )
-    abs_delta = abs(c.delta)
-    if not (params.abs_delta_min <= abs_delta <= params.abs_delta_max):
-        reasons.append(
-            f"|delta| {abs_delta:.2f} outside "
-            f"[{params.abs_delta_min:.2f}, {params.abs_delta_max:.2f}]"
-        )
+    if c.delta is None or c.theta is None or c.iv is None:
+        # Provider served the quote but no greeks/IV (deep ITM/OTM on some
+        # feeds): selection REQUIRES them and never fabricates them.
+        reasons.append("greeks/IV not provided for this contract")
+    else:
+        abs_delta = abs(c.delta)
+        if not (params.abs_delta_min <= abs_delta <= params.abs_delta_max):
+            reasons.append(
+                f"|delta| {abs_delta:.2f} outside "
+                f"[{params.abs_delta_min:.2f}, {params.abs_delta_max:.2f}]"
+            )
+        if c.mid > 0.0:
+            burden = abs(c.theta) / c.mid
+            if burden > params.max_theta_premium_pct:
+                reasons.append(
+                    f"theta burden {burden:.4f}/day > "
+                    f"{params.max_theta_premium_pct:.4f}"
+                )
     if c.open_interest < params.min_open_interest:
         reasons.append(
             f"open interest {c.open_interest} < {params.min_open_interest}"
@@ -153,13 +176,6 @@ def _fail_reasons(
         )
     if c.mid <= 0.0:
         reasons.append(f"mid {c.mid:.4f} <= 0")
-    else:
-        burden = abs(c.theta) / c.mid
-        if burden > params.max_theta_premium_pct:
-            reasons.append(
-                f"theta burden {burden:.4f}/day > "
-                f"{params.max_theta_premium_pct:.4f}"
-            )
     return reasons
 
 

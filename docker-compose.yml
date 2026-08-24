@@ -6,7 +6,10 @@ services:
       POSTGRES_PASSWORD: trading
       POSTGRES_DB: trading
     ports:
-      - "5432:5432"
+      # Host port 5433 (was 5432): another local project (platform-services)
+      # binds host 5432. In-network traffic (gateway -> db:5432) is unaffected;
+      # external psql from the host now uses -p 5433.
+      - "5433:5432"
     volumes:
       - db-data:/var/lib/postgresql/data
       # Migrations are mounted as INDIVIDUAL files (not the whole directory):
@@ -23,6 +26,28 @@ services:
       - ./migrations/007_stock_bars_daily.sql:/docker-entrypoint-initdb.d/007_stock_bars_daily.sql:ro
       - ./migrations/008_option_execution.sql:/docker-entrypoint-initdb.d/008_option_execution.sql:ro
       - ./migrations/009_broker.sql:/docker-entrypoint-initdb.d/009_broker.sql:ro
+      - ./migrations/010_order_lifecycle.sql:/docker-entrypoint-initdb.d/010_order_lifecycle.sql:ro
+      - ./migrations/011_runtime_config.sql:/docker-entrypoint-initdb.d/011_runtime_config.sql:ro
+      - ./migrations/012_news_articles.sql:/docker-entrypoint-initdb.d/012_news_articles.sql:ro
+      - ./migrations/013_trade_plans.sql:/docker-entrypoint-initdb.d/013_trade_plans.sql:ro
+      - ./migrations/014_recommendation_llm_model.sql:/docker-entrypoint-initdb.d/014_recommendation_llm_model.sql:ro
+      - ./migrations/015_position_spread_legs.sql:/docker-entrypoint-initdb.d/015_position_spread_legs.sql:ro
+      - ./migrations/016_covered_short_legs.sql:/docker-entrypoint-initdb.d/016_covered_short_legs.sql:ro
+      - ./migrations/017_orders_side_vocabulary.sql:/docker-entrypoint-initdb.d/017_orders_side_vocabulary.sql:ro
+      - ./migrations/018_risk_snapshots.sql:/docker-entrypoint-initdb.d/018_risk_snapshots.sql:ro
+      - ./migrations/019_stress_runs.sql:/docker-entrypoint-initdb.d/019_stress_runs.sql:ro
+      - ./migrations/020_risk_model_backtests.sql:/docker-entrypoint-initdb.d/020_risk_model_backtests.sql:ro
+      - ./migrations/021_events.sql:/docker-entrypoint-initdb.d/021_events.sql:ro
+      - ./migrations/022_fundamental_statements.sql:/docker-entrypoint-initdb.d/022_fundamental_statements.sql:ro
+      - ./migrations/023_news_evidence.sql:/docker-entrypoint-initdb.d/023_news_evidence.sql:ro
+      - ./migrations/024_event_analyses.sql:/docker-entrypoint-initdb.d/024_event_analyses.sql:ro
+      - ./migrations/025_event_options.sql:/docker-entrypoint-initdb.d/025_event_options.sql:ro
+      - ./migrations/026_macro_data.sql:/docker-entrypoint-initdb.d/026_macro_data.sql:ro
+      - ./migrations/027_fed_documents.sql:/docker-entrypoint-initdb.d/027_fed_documents.sql:ro
+      - ./migrations/028_portfolio_backtests.sql:/docker-entrypoint-initdb.d/028_portfolio_backtests.sql:ro
+      - ./migrations/029_portfolio_journal_advice.sql:/docker-entrypoint-initdb.d/029_portfolio_journal_advice.sql:ro
+      - ./migrations/030_web_research.sql:/docker-entrypoint-initdb.d/030_web_research.sql:ro
+      - ./migrations/031_prediction_markets.sql:/docker-entrypoint-initdb.d/031_prediction_markets.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U trading"]
       interval: 5s
@@ -57,7 +82,10 @@ services:
       DATABASE_URL: postgresql+asyncpg://trading:trading@db:5432/trading
       REDIS_URL: redis://redis:6379/0
     ports:
-      - "8000:8000"
+      # Host port is configurable because 8000 is a popular default and may
+      # already be taken locally: set GATEWAY_PORT in .env to move it. The
+      # CONTAINER port is always 8000 — only the host side varies.
+      - "${GATEWAY_PORT:-8000}:8000"
     depends_on:
       db:
         condition: service_healthy
@@ -71,7 +99,7 @@ services:
     environment:
       # The browser (not the container) calls the API, so the base URL is the
       # host-published gateway port, baked in at page load via NEXT_PUBLIC_*.
-      NEXT_PUBLIC_API_BASE: http://localhost:8000
+      NEXT_PUBLIC_API_BASE: http://localhost:${GATEWAY_PORT:-8000}
     ports:
       - "3000:3000"
     depends_on:

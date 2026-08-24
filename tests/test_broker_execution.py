@@ -41,6 +41,13 @@ from libs.common.config import get_settings
 # and a BULL bias, so the §10 chain approves — the same property the existing
 # execution tests rely on.
 BULL_TICKER = "GOOGL"
+# Under the §6 grouped weights (v1) GOOGL reads WEAK (+33.3): fine for the
+# stock happy paths, but the option/clamp tests need a MODERATE tier — VZ
+# reads +42.2 MODERATE in a NEUTRAL_RANGE regime with NORMAL stub vol, and
+# its ~$25 underlying keeps ATM premiums inside the MODERATE 0.75%-of-NAV
+# budget, so AUTO sizes stock and a BEAR override selects an affordable
+# LONG_PUT (§8 matrix).
+MODERATE_TICKER = "VZ"
 
 PAPER_ACCOUNT = {
     "account_number": "PA3ABCDEF",
@@ -80,13 +87,18 @@ class FakeAlpaca:
         # to exercise the adopt-instead-of-resubmit path.
         self.existing: dict[str, dict] = {}
         self.positions: list[dict] = []
+        # What GET /v2/account answers with: a dict payload, or an
+        # httpx.Response to script an account-fetch FAULT (§14/§28 tests).
+        self.account_payload: dict | httpx.Response = dict(PAPER_ACCOUNT)
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.calls.append((request.method, request.url.path))
         path = request.url.path
 
         if path == "/v2/account":
-            return httpx.Response(200, json=PAPER_ACCOUNT)
+            if isinstance(self.account_payload, httpx.Response):
+                return self.account_payload
+            return httpx.Response(200, json=self.account_payload)
         if path == "/v2/positions":
             return httpx.Response(200, json=self.positions)
         if path == "/v2/orders:by_client_order_id":
@@ -263,8 +275,9 @@ async def test_unconfigured_approve_writes_no_rows(unconfigured_client):
 
     assert await rows(Order) == []
     assert await rows(Position) == []
-    # …and cash is untouched.
-    assert await cash(unconfigured_client) == get_settings().paper_initial_cash
+    # …and there is no account at all: with no venue connected the platform
+    # reports null rather than a fabricated default balance.
+    assert await cash(unconfigured_client) is None
 
 
 async def test_broker_unconfigured_alone_still_refuses(monkeypatch):
@@ -511,7 +524,10 @@ async def test_full_fill_opens_position_and_audits_broker_order_id(monkeypatch):
         position = body["position"]
         assert position["quantity"] == 10
         assert position["avg_price"] == pytest.approx(200.00)
-        assert await cash(client) == pytest.approx(cash_before - 10 * 200.00)
+        # NO LOCAL CASH LEDGER: the debit happened in the (fake) broker's
+        # real account; the platform reports the broker's live number, which
+        # this static double never changes.
+        assert await cash(client) == pytest.approx(cash_before)
 
         # Every broker interaction is auditable with the BROKER's own ids and
         # its own status word (§38, rule 12).
@@ -557,7 +573,7 @@ async def test_partial_fill_opens_a_partial_position(monkeypatch):
         assert position.quantity == 4
 
         # Cash reflects only what actually filled.
-        assert await cash(client) == pytest.approx(cash_before - 4 * 199.50)
+        assert await cash(client) == pytest.approx(cash_before)  # broker live number; no local ledger
 
         events = await audit_actions_for(client, order["id"])
         filled = next(e for e in events if e["action"] == "ORDER_FILLED")
@@ -615,8 +631,16 @@ async def test_rejected_order_writes_no_position_and_audits_rejection(monkeypatc
         assert await rows(Position) == []
         assert await cash(client) == pytest.approx(cash_before)
 
-        # NB: the audit filter upper-cases entity_id, hence the uppercase key.
-        events = await audit_actions_for(client, "REJ-1")
+        # §11 lifecycle: the PENDING_SUBMIT row was committed BEFORE the
+        # submit, so the rejection settles it to a stored terminal REJECTED
+        # row — auditable, replayable, never an invisible attempt.
+        orders = await rows(Order)
+        assert len(orders) == 1
+        assert orders[0].client_order_id == "REJ-1"
+        assert orders[0].status == "REJECTED"
+        assert orders[0].filled_quantity == 0
+
+        events = await audit_actions_for(client, str(orders[0].id))
         rejected = [e for e in events if e["action"] == "ORDER_REJECTED"]
         assert len(rejected) == 1
         assert "insufficient buying power" in rejected[0]["details"]["reason"]
@@ -685,11 +709,11 @@ async def test_long_put_submits_the_occ_contract_symbol(monkeypatch):
         order_body(status="filled", qty="1", filled_qty="1", filled_avg_price="4.20")
     )
     async with _broker_client(fake, monkeypatch) as client:
-        await authorize(client)
+        await authorize(client, MODERATE_TICKER)
         # A BEAR view on a long-only account can only be a long put (§5).
         r = await client.post(
             "/api/orders/approve",
-            json={"ticker": BULL_TICKER, "quantity": 1, "direction": "BEAR"},
+            json={"ticker": MODERATE_TICKER, "quantity": 1, "direction": "BEAR"},
         )
 
         assert r.status_code == 200, r.text
@@ -697,12 +721,12 @@ async def test_long_put_submits_the_occ_contract_symbol(monkeypatch):
 
         assert fake.submit_count == 1
         symbol = fake.posted[0]["symbol"]
-        # OCC layout: 6-char padded root, YYMMDD, C/P, strike in thousandths.
-        assert symbol.startswith(f"{BULL_TICKER:<6}"), symbol
-        assert len(symbol) == 21, symbol
-        assert symbol[12] == "P", symbol  # a put, not a call
-        assert symbol[13:].isdigit(), symbol
-        assert symbol != BULL_TICKER  # never the bare underlying
+        # Compact OCC (2026-08-17): ROOT + YYMMDD + C/P + 8-digit strike.
+        assert symbol.startswith(MODERATE_TICKER), symbol
+        assert len(symbol) == 15 + len(MODERATE_TICKER), symbol
+        assert symbol[len(MODERATE_TICKER) + 6] == "P", symbol  # a put
+        assert symbol[len(MODERATE_TICKER) + 7 :].isdigit(), symbol
+        assert symbol != MODERATE_TICKER  # never the bare underlying
 
         # The audit trail records the exact string sent to the broker, so the
         # contract that traded is identifiable after the fact (§38).
@@ -886,30 +910,32 @@ async def test_broker_status_never_echoes_credentials(monkeypatch):
 
 
 async def test_option_round_trip_conserves_cash_with_the_100x_multiplier(monkeypatch):
-    """Open and close a long put at the broker; cash must reconcile exactly.
+    """Open and close a long put at the broker; the ECONOMICS must reconcile.
 
     An option is quoted PER SHARE and trades in 100-share contracts, so every
-    cash movement carries the multiplier. This is the arithmetic most likely to
-    be wrong by 100x in either direction, so it is pinned end to end rather
-    than per-leg: buy 2 contracts at 4.20, sell them at 6.50, and the account
-    must end up exactly 2 * (6.50 - 4.20) * 100 = $460 richer.
+    number carries the multiplier — the arithmetic most likely to be wrong by
+    100x in either direction. CASH ITSELF lives only in the broker's account
+    (the platform stores no copy), so what is pinned end to end is the
+    platform's own record: max_loss = premium * 100 at open, and realized
+    P&L = 2 * (6.50 - 4.20) * 100 = exactly $460 at close.
     """
     fake = FakeAlpaca(
         order_body(status="filled", qty="2", filled_qty="2", filled_avg_price="4.20")
     )
     async with _broker_client(fake, monkeypatch) as client:
-        await authorize(client)
+        await authorize(client, MODERATE_TICKER)
         cash_before = (await client.get("/api/portfolio/risk")).json()["cash"]
 
         r = await client.post(
             "/api/orders/approve",
-            json={"ticker": BULL_TICKER, "quantity": 2, "direction": "BEAR"},
+            json={"ticker": MODERATE_TICKER, "quantity": 2, "direction": "BEAR"},
         )
         assert r.status_code == 200, r.text
 
+        # Cash is the BROKER's live number — the platform tracks no copy,
+        # so the static fake's account value is unchanged by the fill.
         cash_after_buy = (await client.get("/api/portfolio/risk")).json()["cash"]
-        # 2 contracts * $4.20/share * 100 shares = $840 debited, not $8.40.
-        assert cash_after_buy == pytest.approx(cash_before - 840.0, abs=0.01)
+        assert cash_after_buy == pytest.approx(cash_before)
 
         position = (await rows(Position))[0]
         assert position.multiplier == 100
@@ -926,7 +952,7 @@ async def test_option_round_trip_conserves_cash_with_the_100x_multiplier(monkeyp
         )
         fake.posted.clear()
         c = await client.post(
-            "/api/orders/close", json={"ticker": BULL_TICKER}
+            "/api/orders/close", json={"ticker": MODERATE_TICKER}
         )
         assert c.status_code == 200, c.text
 
@@ -934,8 +960,10 @@ async def test_option_round_trip_conserves_cash_with_the_100x_multiplier(monkeyp
         assert fake.posted[0]["symbol"] == fake_symbol_of(position)
         assert fake.posted[0]["side"] == "sell"
 
-        cash_final = (await client.get("/api/portfolio/risk")).json()["cash"]
-        assert cash_final == pytest.approx(cash_before + 460.0, abs=0.01)
+        closed = (await rows(Position))[0]
+        assert closed.status == "CLOSED"
+        # 2 * (6.50 - 4.20) * 100 — the multiplier pinned end to end.
+        assert closed.realized_pnl == pytest.approx(460.0, abs=0.01)
 
         closed = (await rows(Position))[0]
         assert closed.status == "CLOSED"
@@ -954,3 +982,110 @@ def fake_symbol_of(position) -> str:
         position.opt_strike,
         position.opt_right,
     )
+
+
+# ===========================================================================
+# 4. §14 CASH-ACCOUNT SIZING — deployable cash = min(local, broker CASH)
+# ===========================================================================
+
+
+async def test_sizing_clamps_to_broker_cash_never_buying_power(monkeypatch):
+    """Broker cash $500 against local cash $100,000: the risk gate must size
+    off $500. Buying power is scripted at $200,000 to prove it plays NO part
+    — §14: paper buying power may include margin-like capacity beyond the
+    platform cash model, and this is a cash account."""
+    fake = FakeAlpaca(
+        order_body(status="filled", qty="1", filled_qty="1", filled_avg_price="99.24")
+    )
+    fake.account_payload = dict(
+        PAPER_ACCOUNT, cash="500.00", buying_power="200000.00"
+    )
+    async with _broker_client(fake, monkeypatch) as client:
+        # MODERATE tier: a WEAK signal's 0.5% budget of $500 NAV buys zero
+        # shares, which would REJECT before the clamp this test is about.
+        await authorize(client, MODERATE_TICKER)
+        # The local ledger materialises FROM the broker's real cash on first
+        # sight (never a default): local == broker == $500, and the §14 clamp
+        # sizes off that same real number.
+        assert await cash(client) == pytest.approx(500.0)
+
+        r = await approve(client, MODERATE_TICKER, quantity=10, client_order_id="clamp-1")
+        assert r.status_code == 200, r.text
+        body = r.json()
+
+        # The submitted (risk-approved) quantity was sized off $500, not off
+        # local cash and not off the $200k buying power: at the stub's ~$99
+        # entry, $500 deployable cash cannot carry the 10 requested shares.
+        entry = body["preview"]["proposed"]["entry_price"]
+        submitted_qty = int(fake.posted[0]["qty"])
+        assert submitted_qty == body["preview"]["risk"]["approved_quantity"]
+        assert submitted_qty >= 1
+        assert submitted_qty < 10
+        assert submitted_qty * entry <= 500.0
+
+        # The resulting position's cost fits inside the broker's cash.
+        position = body["position"]
+        assert position["quantity"] * position["avg_price"] <= 500.0
+
+        # §14 transparency: the RISK_APPROVAL detail names the clamp with the
+        # real numbers and says which number was deliberately NOT used.
+        gates = {g["name"]: g for g in body["preview"]["gates"]}
+        detail = gates["RISK_APPROVAL"]["detail"]
+        assert "LIVE cash" in detail
+        assert "$500.00" in detail
+        assert "never buying power" in detail
+        assert "stores no copy" in detail
+
+
+async def test_account_fetch_failure_fails_closed_with_no_order_row(monkeypatch):
+    """A real broker whose ACCOUNT cannot be read must veto the entry (§28
+    fail closed): an unreachable broker means deployable cash cannot be
+    verified, and sizing from local cash alone could deploy cash the account
+    does not have. No order row, no position, no cash movement, no submit."""
+    fake = FakeAlpaca(order_body())
+    fake.account_payload = httpx.Response(
+        500, json={"message": "account service unavailable"}
+    )
+    async with _broker_client(fake, monkeypatch) as client:
+        await authorize(client)
+        cash_before = await cash(client)
+
+        r = await approve(client, quantity=10, client_order_id="acct-fail-1")
+
+        assert r.status_code == 422
+        detail = r.json()["detail"]
+        assert "RISK_APPROVAL" in detail["message"]
+        gates = {g["name"]: g for g in detail["preview"]["gates"]}
+        assert gates["RISK_APPROVAL"]["status"] == "FAIL"
+        gate_detail = gates["RISK_APPROVAL"]["detail"]
+        assert "502" in gate_detail  # a broker fault, named as one
+        assert "cannot be verified" in gate_detail
+        assert "Failing closed" in gate_detail
+        assert "§14" in gate_detail and "§28" in gate_detail
+
+        # FAIL CLOSED means fail closed: nothing was written or moved, and
+        # nothing was submitted to the broker.
+        assert await rows(Order) == []
+        assert await rows(Position) == []
+        assert await cash(client) == cash_before
+        assert fake.submit_count == 0
+
+
+async def test_simulated_mode_sizing_never_consults_a_broker(client):
+    """Simulated mode is UNCHANGED by the §14 clamp: there is no broker
+    account to honor, sizing stays off local portfolio cash, and the
+    RISK_APPROVAL detail carries no broker-cash clamp."""
+    assert get_settings().broker_provider == "simulated"
+    await authorize(client)
+
+    r = await approve(client, quantity=10)
+    assert r.status_code == 200
+    body = r.json()
+
+    # Sized off the full local cash: the 10 requested shares are approved.
+    assert body["order"]["quantity"] == 10
+    detail = {g["name"]: g for g in body["preview"]["gates"]}["RISK_APPROVAL"][
+        "detail"
+    ]
+    assert "min(local" not in detail
+    assert "deployable cash" not in detail

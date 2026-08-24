@@ -56,6 +56,10 @@ VOL_TARGETING_KEYS = {
     "multiplier",
     "max_multiplier",
     "note",
+    # ADDED in Phase C (contract §7.5): the EWMA side-by-side, reported next
+    # to the crude proxy. `multiplier` above stays the one in force.
+    "ewma_sigma_p_annualized_pct_nav",
+    "multiplier_ewma",
 }
 
 

@@ -77,11 +77,20 @@ class BrokerNotConfigured(RuntimeError):
         super().__init__(message)
 
 
-# The two order sides this platform can emit (§5). Sell-to-Open does not
-# exist: a sell is only ever the close of an existing long.
+# The two SINGLE-LEG order sides this platform can emit (§5). A lone
+# Sell-to-Open does not exist: a sell is only ever the close of an existing
+# long.
 BUY_TO_OPEN = "BUY_TO_OPEN"
 SELL_TO_CLOSE = "SELL_TO_CLOSE"
 ORDER_SIDES = (BUY_TO_OPEN, SELL_TO_CLOSE)
+
+# MLEG-ONLY leg sides (roadmap Phase 1): these exist EXCLUSIVELY inside the
+# atomic defined-risk pair an adapter's submit_mleg_order validates — the
+# single-leg submit has no vocabulary for them, so a naked short remains
+# unconstructable anywhere (§5).
+SELL_TO_OPEN = "SELL_TO_OPEN"
+BUY_TO_CLOSE = "BUY_TO_CLOSE"
+MLEG_LEG_SIDES = (BUY_TO_OPEN, SELL_TO_OPEN, SELL_TO_CLOSE, BUY_TO_CLOSE)
 
 # The normalised order lifecycle every adapter maps its broker's vocabulary
 # onto. Consumers switch on these and never on a broker-specific string.
@@ -122,6 +131,22 @@ class BrokerOrder:
 
 
 @dataclass(frozen=True)
+class BrokerOrderLeg:
+    """One leg of a multi-leg (mleg) option order (roadmap Phase 1).
+
+    ``side`` for OPENING a debit spread is ``BUY_TO_OPEN`` (long leg) or
+    ``SELL_TO_OPEN`` (short leg); for CLOSING it, ``SELL_TO_CLOSE`` /
+    ``BUY_TO_CLOSE``. SELL_TO_OPEN exists ONLY inside the atomic
+    defined-risk pair validated by the adapter — a lone short leg is
+    unconstructable through any code path (§5: no naked shorts, ever).
+    """
+
+    symbol: str  # bare OCC
+    side: str
+    ratio: int = 1
+
+
+@dataclass(frozen=True)
 class BrokerAccount:
     """The broker account snapshot.
 
@@ -155,7 +180,15 @@ class BrokerPosition:
 
 
 class BrokerProvider(Protocol):
-    """Structural interface every broker adapter must satisfy."""
+    """Structural interface every broker adapter must satisfy.
+
+    OPTIONAL capability (getattr-gated by callers, like the market-data
+    extras): ``submit_mleg_order(client_order_id, legs, quantity)`` — an
+    ATOMIC multi-leg option order for defined-risk spreads (roadmap
+    Phase 1). Adapters that implement it MUST enforce the defined-risk
+    shape (exactly two legs, short covered by long, same underlying/
+    expiry/right) so no naked short can be constructed through it.
+    """
 
     def submit_order(
         self, client_order_id: str, symbol: str, side: str, quantity: int

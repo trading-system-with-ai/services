@@ -16,8 +16,10 @@ from .engine import (  # noqa: F401
     ExitParams,
     OptionState,
     PositionState,
+    ShortPremiumState,
     evaluate_exit,
     evaluate_option_exit,
+    evaluate_short_premium_exit,
 )
 
 __all__ = [
@@ -25,6 +27,8 @@ __all__ = [
     "ExitParams",
     "OptionState",
     "PositionState",
+    "ShortPremiumState",
     "evaluate_exit",
     "evaluate_option_exit",
+    "evaluate_short_premium_exit",
 ]

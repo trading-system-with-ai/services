@@ -41,12 +41,16 @@ Failure policy:
 Credentials are never logged. The request logger redacts both header values.
 """
 import logging
+import re
 from datetime import date, datetime, timezone
 from urllib.parse import urlparse
 
 import httpx
 
 from .provider import (
+    BrokerOrderLeg,
+    SELL_TO_OPEN,
+    BUY_TO_CLOSE,
     BUY_TO_OPEN,
     SELL_TO_CLOSE,
     BrokerAccount,
@@ -77,6 +81,9 @@ _SIDE_TO_ALPACA = {
     SELL_TO_CLOSE: "sell",
 }
 
+# Bare OCC option symbol: UNDERLYING + yymmdd + C/P + strike*1000 (8 digits).
+_OCC_RE = re.compile(r"^([A-Z]{1,6})(\d{6})([CP])(\d{8})$")
+
 # Alpaca order status -> our normalised lifecycle. Anything absent from this
 # table maps to ACCEPTED with a WARNING (see _map_status).
 _STATUS_MAP = {
@@ -88,7 +95,12 @@ _STATUS_MAP = {
     "filled": "FILLED",
     "rejected": "REJECTED",
     "canceled": "CANCELED",
-    "pending_cancel": "CANCELED",
+    # A cancel REQUEST is not a cancel: Alpaca's pending_cancel order is
+    # still live and can still fill before the cancel lands. Mapping it
+    # terminal would drop it out of the order-sync sweep's watch and any
+    # last-moment fill would become invisible — so it stays non-terminal
+    # (the raw status is preserved verbatim alongside).
+    "pending_cancel": "ACCEPTED",
     "expired": "EXPIRED",
 }
 
@@ -136,11 +148,18 @@ def _to_int(value: object, default: int = 0) -> int:
 def occ_option_symbol(
     underlying: str, expiry: date, strike: float, right: str
 ) -> str:
-    """Build the OCC 21-character option symbol Alpaca expects.
+    """Build the COMPACT OCC option symbol Alpaca uses everywhere.
 
-    Layout: ``ROOT`` left-justified to 6 chars, ``YYMMDD`` expiry, ``C``/``P``,
-    then the strike in thousandths zero-padded to 8 digits — e.g. a 2026-09-18
-    NVDA 150 call is ``NVDA  260918C00150000``.
+    Layout: ``ROOT`` (NO padding — Alpaca's compact form, matching what its
+    data API chain snapshots and GET /v2/positions report), ``YYMMDD``
+    expiry, ``C``/``P``, then the strike in thousandths zero-padded to 8
+    digits — e.g. a 2026-09-18 NVDA 150 call is ``NVDA260918C00150000``.
+
+    2026-08-17 FIX: this helper used to left-pad the root to 6 chars (the
+    canonical exchange OCC layout). Alpaca does NOT: its positions and
+    chains report compact symbols, so padded local keys could never
+    string-match broker rows in §18 reconciliation, and the Phase-1/2 OCC
+    regex gates rejected our own symbols. One format everywhere: compact.
 
     Options ride the SAME ``POST /v2/orders`` endpoint as equities; only the
     symbol format and the contract-vs-share unit differ, which is why this is a
@@ -158,7 +177,7 @@ def occ_option_symbol(
     if strike <= 0:
         raise ValueError(f"option strike must be > 0, got {strike!r}")
     thousandths = int(round(round(strike, 4) * 1000))
-    return f"{root:<6}{expiry.strftime('%y%m%d')}{right}{thousandths:08d}"
+    return f"{root}{expiry.strftime('%y%m%d')}{right}{thousandths:08d}"
 
 
 def _parse_timestamp(value: object) -> datetime:
@@ -461,6 +480,458 @@ class AlpacaPaperBroker:
                 f"(status {order.raw_status!r})"
             )
         return order
+
+    def submit_short_open_order(
+        self,
+        client_order_id: str,
+        option_symbol: str,
+        quantity: int,
+        covered_by: str,
+    ) -> BrokerOrder:
+        """Sell-to-open ONE collateralized short option leg (Phase 2:
+        covered call / cash-secured put).
+
+        SAFETY SHAPE: OPTION symbols only (the OCC regex is the gate) — a
+        stock symbol here raises, so SHORT STOCK remains unconstructable
+        through every path until the margin phase builds it deliberately.
+        ``covered_by`` is the MANDATORY collateral attestation (the platform
+        position id / cash reservation backing this short); it must be
+        non-empty and is embedded in the client metadata trail. The REAL
+        collateral enforcement lives in the gateway BEFORE this call — this
+        parameter exists so a naked call site cannot even typecheck its way
+        past review.
+        """
+        if quantity <= 0:
+            raise ValueError(f"quantity must be > 0, got {quantity}")
+        if not covered_by or not str(covered_by).strip():
+            raise ValueError(
+                "covered_by attestation is required: a short open without "
+                "named collateral is a naked short and does not exist in "
+                "this platform (§5/§4)"
+            )
+        if _OCC_RE.match(option_symbol) is None:
+            raise ValueError(
+                f"{option_symbol!r} is not a bare OCC OPTION symbol — "
+                "sell-to-open exists ONLY for collateralized option legs "
+                "(no short stock, §5)"
+            )
+
+        account = self.get_account()
+        if not account.is_paper:
+            raise BrokerError(
+                "refusing to submit a short-open order: Alpaca reports "
+                f"account {account.account_number!r} is NOT a paper account."
+            )
+
+        payload = {
+            "symbol": option_symbol,
+            "qty": str(quantity),
+            "side": "sell",
+            "position_intent": "sell_to_open",
+            "type": "market",
+            "time_in_force": "day",
+            "client_order_id": client_order_id,
+        }
+        url = f"{self.base_url}/v2/orders"
+        try:
+            with httpx.Client(
+                timeout=self.timeout_seconds, transport=self._transport
+            ) as client:
+                response = client.post(url, json=payload, headers=self._headers())
+        except httpx.HTTPError as exc:
+            raise BrokerError(f"Alpaca API request failed: {exc!r}") from exc
+        if 400 <= response.status_code < 500:
+            raise BrokerRejected(
+                f"Alpaca rejected short-open {client_order_id!r} for "
+                f"{option_symbol} (HTTP {response.status_code}): "
+                f"{response.text[:500]}"
+            )
+        if response.status_code >= 500:
+            raise BrokerError(
+                f"Alpaca API returned HTTP {response.status_code} for "
+                f"POST /v2/orders (short open): {response.text[:500]}"
+            )
+        body = self._json(response)
+        if not isinstance(body, dict):
+            raise BrokerError(
+                "Alpaca /v2/orders (short open) returned an unexpected payload"
+            )
+        order = self._parse_order(body, fallback_side="SELL_TO_OPEN")
+        if order.status == "REJECTED":
+            raise BrokerRejected(
+                f"Alpaca rejected short-open {client_order_id!r} "
+                f"(status {order.raw_status!r})"
+            )
+        return order
+
+    def submit_short_close_order(
+        self, client_order_id: str, option_symbol: str, quantity: int
+    ) -> BrokerOrder:
+        """Buy BACK one short option leg (BUY_TO_CLOSE — Phase 2).
+
+        OCC-gated like the short open; closing a short strictly REDUCES
+        risk. Deliberately a separate method so the single-leg
+        ``submit_order`` keeps its exact two-word vocabulary
+        (BUY_TO_OPEN / SELL_TO_CLOSE) and the adversarial §5 tests stay
+        meaningful.
+        """
+        if quantity <= 0:
+            raise ValueError(f"quantity must be > 0, got {quantity}")
+        if _OCC_RE.match(option_symbol) is None:
+            raise ValueError(
+                f"{option_symbol!r} is not a bare OCC OPTION symbol — only "
+                "short OPTION legs can be bought back here"
+            )
+        account = self.get_account()
+        if not account.is_paper:
+            raise BrokerError(
+                "refusing to submit a buyback order: Alpaca reports account "
+                f"{account.account_number!r} is NOT a paper account."
+            )
+        payload = {
+            "symbol": option_symbol,
+            "qty": str(quantity),
+            "side": "buy",
+            "position_intent": "buy_to_close",
+            "type": "market",
+            "time_in_force": "day",
+            "client_order_id": client_order_id,
+        }
+        url = f"{self.base_url}/v2/orders"
+        try:
+            with httpx.Client(
+                timeout=self.timeout_seconds, transport=self._transport
+            ) as client:
+                response = client.post(url, json=payload, headers=self._headers())
+        except httpx.HTTPError as exc:
+            raise BrokerError(f"Alpaca API request failed: {exc!r}") from exc
+        if 400 <= response.status_code < 500:
+            raise BrokerRejected(
+                f"Alpaca rejected buyback {client_order_id!r} for "
+                f"{option_symbol} (HTTP {response.status_code}): "
+                f"{response.text[:500]}"
+            )
+        if response.status_code >= 500:
+            raise BrokerError(
+                f"Alpaca API returned HTTP {response.status_code} for "
+                f"POST /v2/orders (buyback): {response.text[:500]}"
+            )
+        body = self._json(response)
+        if not isinstance(body, dict):
+            raise BrokerError(
+                "Alpaca /v2/orders (buyback) returned an unexpected payload"
+            )
+        order = self._parse_order(body, fallback_side="BUY_TO_CLOSE")
+        if order.status == "REJECTED":
+            raise BrokerRejected(
+                f"Alpaca rejected buyback {client_order_id!r} "
+                f"(status {order.raw_status!r})"
+            )
+        return order
+
+    _STOCK_RE = re.compile(r"^[A-Z][A-Z.]{0,9}$")
+
+    def _post_simple_order(
+        self, payload: dict, label: str, fallback_side: str
+    ) -> BrokerOrder:
+        """Shared POST /v2/orders plumbing for the Phase 3 stock-short pair."""
+        account = self.get_account()
+        if not account.is_paper:
+            raise BrokerError(
+                f"refusing to submit a {label} order: Alpaca reports account "
+                f"{account.account_number!r} is NOT a paper account."
+            )
+        url = f"{self.base_url}/v2/orders"
+        try:
+            with httpx.Client(
+                timeout=self.timeout_seconds, transport=self._transport
+            ) as client:
+                response = client.post(url, json=payload, headers=self._headers())
+        except httpx.HTTPError as exc:
+            raise BrokerError(f"Alpaca API request failed: {exc!r}") from exc
+        if 400 <= response.status_code < 500:
+            raise BrokerRejected(
+                f"Alpaca rejected {label} {payload['client_order_id']!r} for "
+                f"{payload['symbol']} (HTTP {response.status_code}): "
+                f"{response.text[:500]}"
+            )
+        if response.status_code >= 500:
+            raise BrokerError(
+                f"Alpaca API returned HTTP {response.status_code} for "
+                f"POST /v2/orders ({label}): {response.text[:500]}"
+            )
+        body = self._json(response)
+        if not isinstance(body, dict):
+            raise BrokerError(
+                f"Alpaca /v2/orders ({label}) returned an unexpected payload"
+            )
+        order = self._parse_order(body, fallback_side=fallback_side)
+        if order.status == "REJECTED":
+            raise BrokerRejected(
+                f"Alpaca rejected {label} {payload['client_order_id']!r} "
+                f"(status {order.raw_status!r})"
+            )
+        return order
+
+    def submit_stock_short_order(
+        self,
+        client_order_id: str,
+        symbol: str,
+        quantity: int,
+        margin_attested_by: str,
+    ) -> BrokerOrder:
+        """Sell-to-open SHORT STOCK (roadmap Phase 3 — margin-backed).
+
+        SAFETY SHAPE — the exact mirror of ``submit_short_open_order``:
+        STOCK symbols only. An OCC option symbol here raises, so a naked
+        short OPTION remains unconstructable through every path, forever
+        (§4 charter + broker refusal). ``margin_attested_by`` is the
+        MANDATORY attestation naming the §10 gate-chain audit that sized
+        this short against margin buying power; the REAL enforcement lives
+        in the gateway before this call — the parameter exists so a naked
+        call site cannot typecheck its way past review. Alpaca enforces
+        locate/HTB and maintenance margin on its side.
+        """
+        if quantity <= 0:
+            raise ValueError(f"quantity must be > 0, got {quantity}")
+        if not margin_attested_by or not str(margin_attested_by).strip():
+            raise ValueError(
+                "margin_attested_by attestation is required: a stock short "
+                "not sized against margin buying power does not exist in "
+                "this platform (§5/Phase 3)"
+            )
+        if _OCC_RE.match(symbol) is not None:
+            raise ValueError(
+                f"{symbol!r} is an OCC OPTION symbol — naked short options "
+                "do not exist in this platform (§4/§5) and never will"
+            )
+        if self._STOCK_RE.match(symbol) is None:
+            raise ValueError(
+                f"{symbol!r} is not a stock symbol — short-stock opens "
+                "exist ONLY for equities (§5/Phase 3)"
+            )
+        payload = {
+            "symbol": symbol,
+            "qty": str(quantity),
+            "side": "sell",
+            "position_intent": "sell_to_open",
+            "type": "market",
+            "time_in_force": "day",
+            "client_order_id": client_order_id,
+        }
+        return self._post_simple_order(payload, "stock short", "SELL_TO_OPEN")
+
+    def submit_stock_cover_order(
+        self, client_order_id: str, symbol: str, quantity: int
+    ) -> BrokerOrder:
+        """Buy BACK short stock (buy-to-cover — Phase 3). Stock-gated like
+        the short open; covering strictly REDUCES risk, so it carries no
+        attestation and stays allowed under the kill switch (§18)."""
+        if quantity <= 0:
+            raise ValueError(f"quantity must be > 0, got {quantity}")
+        if _OCC_RE.match(symbol) is not None or self._STOCK_RE.match(symbol) is None:
+            raise ValueError(
+                f"{symbol!r} is not a stock symbol — only short STOCK can "
+                "be covered here"
+            )
+        payload = {
+            "symbol": symbol,
+            "qty": str(quantity),
+            "side": "buy",
+            "position_intent": "buy_to_close",
+            "type": "market",
+            "time_in_force": "day",
+            "client_order_id": client_order_id,
+        }
+        return self._post_simple_order(payload, "stock cover", "BUY_TO_CLOSE")
+
+    def submit_mleg_order(
+        self,
+        client_order_id: str,
+        legs: list[BrokerOrderLeg],
+        quantity: int,
+    ) -> BrokerOrder:
+        """Submit an ATOMIC two-leg option order (Alpaca ``order_class:
+        "mleg"``) for a DEFINED-RISK vertical (roadmap Phase 1).
+
+        THE SHAPE GUARD IS THE §5 SAFETY BOUNDARY: exactly two legs on the
+        same underlying, same expiry, same right, different strikes; ratios
+        1:1; the pair is either an OPEN (BUY_TO_OPEN long + SELL_TO_OPEN
+        short — the short strike must be the FARTHER-OTM one so the long
+        covers it) or a CLOSE (SELL_TO_CLOSE + BUY_TO_CLOSE). Anything else
+        — a lone SELL_TO_OPEN, mismatched quantities, a credit-shaped pair,
+        cross-expiry legs — raises before any network I/O. This is the ONLY
+        path that can emit a sell-to-open, and it cannot emit one naked.
+
+        Returns one BrokerOrder for the whole spread: ``symbol`` is
+        "LONG_OCC/SHORT_OCC" and ``filled_avg_price`` the NET per-share
+        debit/credit (buy legs minus sell legs) once every leg reports a
+        fill — None until then.
+        """
+        if quantity <= 0:
+            raise ValueError(f"quantity must be > 0, got {quantity}")
+        if len(legs) != 2:
+            raise ValueError(
+                f"mleg orders are exactly TWO legs (defined-risk vertical), "
+                f"got {len(legs)}"
+            )
+        sides = {leg.side for leg in legs}
+        if sides == {BUY_TO_OPEN, SELL_TO_OPEN}:
+            opening = True
+        elif sides == {SELL_TO_CLOSE, BUY_TO_CLOSE}:
+            opening = False
+        else:
+            raise ValueError(
+                "mleg pair must be {BUY_TO_OPEN, SELL_TO_OPEN} (open) or "
+                f"{{SELL_TO_CLOSE, BUY_TO_CLOSE}} (close), got {sorted(sides)} "
+                "— no other combination exists (§5)"
+            )
+        if any(leg.ratio != 1 for leg in legs):
+            raise ValueError("defined-risk vertical requires 1:1 leg ratios")
+
+        parsed = []
+        for leg in legs:
+            m = _OCC_RE.match(leg.symbol)
+            if m is None:
+                raise ValueError(f"leg symbol {leg.symbol!r} is not a bare OCC symbol")
+            parsed.append(
+                (leg, m.group(1), m.group(2), m.group(3), int(m.group(4)) / 1000.0)
+            )
+        (leg_a, und_a, exp_a, right_a, strike_a), (leg_b, und_b, exp_b, right_b, strike_b) = parsed
+        if und_a != und_b or exp_a != exp_b or right_a != right_b:
+            raise ValueError(
+                "defined-risk vertical requires SAME underlying, expiry and "
+                f"right, got {leg_a.symbol!r} vs {leg_b.symbol!r}"
+            )
+        if strike_a == strike_b:
+            raise ValueError("vertical legs must have different strikes")
+        # The long (bought-to-open / sold-to-close) leg must COVER the short:
+        # for calls the short strike sits ABOVE the long, for puts BELOW.
+        long_leg = next(
+            (l, s) for (l, u, e, r, s) in parsed if l.side in (BUY_TO_OPEN, SELL_TO_CLOSE)
+        )
+        short_leg = next(
+            (l, s) for (l, u, e, r, s) in parsed if l.side in (SELL_TO_OPEN, BUY_TO_CLOSE)
+        )
+        if right_a == "C" and not short_leg[1] > long_leg[1]:
+            raise ValueError(
+                "call vertical: the short strike must be ABOVE the long "
+                f"strike (covered), got long {long_leg[1]:g} / short {short_leg[1]:g}"
+            )
+        if right_a == "P" and not short_leg[1] < long_leg[1]:
+            raise ValueError(
+                "put vertical: the short strike must be BELOW the long "
+                f"strike (covered), got long {long_leg[1]:g} / short {short_leg[1]:g}"
+            )
+
+        # PAPER-ONLY GUARD, layer 2 (same as the single-leg path).
+        account = self.get_account()
+        if not account.is_paper:
+            raise BrokerError(
+                "refusing to submit an mleg order: Alpaca reports account "
+                f"{account.account_number!r} is NOT a paper account."
+            )
+
+        intent = {
+            BUY_TO_OPEN: ("buy", "buy_to_open"),
+            SELL_TO_OPEN: ("sell", "sell_to_open"),
+            SELL_TO_CLOSE: ("sell", "sell_to_close"),
+            BUY_TO_CLOSE: ("buy", "buy_to_close"),
+        }
+        payload = {
+            "order_class": "mleg",
+            "qty": str(quantity),
+            "type": "market",
+            "time_in_force": "day",
+            "client_order_id": client_order_id,
+            "legs": [
+                {
+                    "symbol": leg.symbol,
+                    "ratio_qty": str(leg.ratio),
+                    "side": intent[leg.side][0],
+                    "position_intent": intent[leg.side][1],
+                }
+                for leg in legs
+            ],
+        }
+
+        url = f"{self.base_url}/v2/orders"
+        logger.debug(
+            "Alpaca POST %s (mleg, headers redacted) payload=%s", url, payload
+        )
+        try:
+            with httpx.Client(
+                timeout=self.timeout_seconds, transport=self._transport
+            ) as client:
+                response = client.post(url, json=payload, headers=self._headers())
+        except httpx.HTTPError as exc:
+            raise BrokerError(f"Alpaca API request failed: {exc!r}") from exc
+
+        if 400 <= response.status_code < 500:
+            raise BrokerRejected(
+                f"Alpaca rejected mleg order {client_order_id!r} "
+                f"(HTTP {response.status_code}): {response.text[:500]}"
+            )
+        if response.status_code >= 500:
+            raise BrokerError(
+                f"Alpaca API returned HTTP {response.status_code} for "
+                f"POST /v2/orders (mleg): {response.text[:500]}"
+            )
+        body = self._json(response)
+        if not isinstance(body, dict):
+            raise BrokerError("Alpaca /v2/orders (mleg) returned an unexpected payload")
+        order = self._parse_mleg_order(body, legs, fallback_side=legs[0].side)
+        if order.status == "REJECTED":
+            raise BrokerRejected(
+                f"Alpaca rejected mleg order {client_order_id!r} "
+                f"(status {order.raw_status!r})"
+            )
+        return order
+
+    def _parse_mleg_order(
+        self, payload: dict, legs: list[BrokerOrderLeg], fallback_side: str
+    ) -> BrokerOrder:
+        """BrokerOrder for a whole spread: symbol "LONG/SHORT"; the net
+        per-share fill (buys minus sells) only when EVERY leg has filled —
+        None until then (an half-filled net would be an invented number)."""
+        base = self._parse_order(payload, fallback_side=fallback_side)
+        leg_rows = payload.get("legs")
+        net: float | None = None
+        filled = 0
+        if isinstance(leg_rows, list) and leg_rows:
+            total = 0.0
+            all_filled = True
+            for row in leg_rows:
+                if not isinstance(row, dict):
+                    all_filled = False
+                    break
+                price = row.get("filled_avg_price")
+                qty = row.get("filled_qty")
+                try:
+                    price_f = float(price) if price is not None else None
+                    qty_i = int(float(qty)) if qty is not None else 0
+                except (TypeError, ValueError):
+                    price_f, qty_i = None, 0
+                filled = max(filled, qty_i)
+                if price_f is None or qty_i <= 0:
+                    all_filled = False
+                    continue
+                total += price_f if str(row.get("side")) == "buy" else -price_f
+            if all_filled:
+                net = total
+        symbol = "/".join(l.symbol for l in legs)
+        return BrokerOrder(
+            broker_order_id=base.broker_order_id,
+            client_order_id=base.client_order_id,
+            symbol=symbol,
+            side=fallback_side,
+            status=base.status,
+            requested_quantity=base.requested_quantity,
+            filled_quantity=filled or base.filled_quantity,
+            filled_avg_price=net,
+            submitted_at=base.submitted_at,
+            raw_status=base.raw_status,
+        )
 
     def get_order(self, client_order_id: str) -> BrokerOrder | None:
         """Look an order up by OUR id (``GET /v2/orders:by_client_order_id``).

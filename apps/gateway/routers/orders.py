@@ -99,18 +99,29 @@ RISK_DECISION audit event — even when vetoed at gate one — in the same
 transaction, so every decision is auditable (§38, rule 12).
 """
 import asyncio
+import dataclasses
 import weakref
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Literal
+from collections.abc import Mapping, Sequence
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import Field
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from libs.common.config import get_settings
-from libs.trading_core.contracts import ContractQuote, SelectorParams, select_contracts
+# §65 decision-path counters (see the metric declarations below).
+from libs.common.telemetry import REGISTRY
+from libs.trading_core.contracts import (
+    ContractQuote,
+    SelectorParams,
+    SpreadCandidate,
+    SpreadParams,
+    select_contracts,
+    select_vertical_spread,
+)
 from libs.trading_core.features import atr
 from libs.trading_core.greeks import PositionGreeksInput
 from libs.trading_core.models import (
@@ -122,26 +133,69 @@ from libs.trading_core.models import (
     RiskDecision,
 )
 from libs.trading_core.risk import (
-    PortfolioSnapshot,
-    PositionRisk,
     RiskAssessment,
     RiskLimits,
     RiskRequest,
     assess,
 )
-from libs.trading_core.risk.engine import strength_tier
+from libs.trading_core.exits import ExitParams
+# ATR_STOP_MULTIPLE (§12.1): single source shared with the backtest engine —
+# live sizing and replayed sizing can never drift apart.
+from libs.trading_core.risk.engine import ATR_STOP_MULTIPLE, strength_tier
+# Underlying LIQUIDITY gate, REPORT mode (risk-engine audit §7.3 / B0): pure
+# evaluation over data the chain already holds; never vetoes until promoted.
+from libs.trading_core.risk.squeeze import (
+    SqueezeProxyParams,
+    assess_squeeze_proxy,
+)
+from libs.trading_core.risk.liquidity import (
+    LiquidityLimits,
+    evaluate_underlying_liquidity,
+    liquidity_report_detail,
+)
+# Phase C pre-trade statistical layer (design contract §7.1/§7.2), SHADOW:
+# the proposed-book comparison, the hypothetical quantity caps and the
+# verdict they imply. NOTHING here is passed to `assess` (no `extra_caps`)
+# — promotion out of SHADOW is an explicit, separate human step (§70).
+from libs.trading_core.risk.pretrade import (
+    CandidateSpec,
+    SizingV2Params,
+    StatisticalLimits,
+    compare as pretrade_compare,
+    shadow_verdict,
+    sizing_v2_shadow,
+    statistical_caps,
+)
+# §55: the staleness KIND the pre-trade caps are judged against. The
+# statistical TTL (a trading day) is the right one: these caps are derived
+# from daily-close VaR/ES, not from live greeks.
+from libs.trading_core.risk.snapshot import STALENESS_KIND_STATISTICAL
+# Phase D stress layer (design contract §8.3/§8.5), SHADOW: the candidate's
+# legs are revalued under the SAME catalogue the snapshot just ran over the
+# book, and the STRESS cap joins the SAME shadow verdict Phase C computes.
+# Still nothing reaches `assess` (`extra_caps` stays empty — §70).
+from libs.trading_core.options.reval import OptionLeg, StockLeg
+from libs.trading_core.risk.models.base import ModelHealth
+from libs.trading_core.risk.models.stress import StressLimits, run_stress, stress_caps
 from libs.trading_core.signals import RegimeParams, classify_regime, score_direction
-from libs.trading_core.strategies import AccountPermissions, select_instrument
+from libs.trading_core.strategies import select_instrument
+from libs.broker import BrokerOrderLeg
+from libs.broker.provider import BUY_TO_CLOSE, SELL_TO_OPEN
 from libs.broker.alpaca import occ_option_symbol
 from libs.trading_core.volatility import VolRegimeParams, classify_vol_regime
 
 from .. import audit
+from .. import event_risk  # Phase K §62-§67 event-risk seam, SHADOW ONLY
+from .. import market_stream  # live NBBO cache (data_source.md §5) for LIQUIDITY
 from ..broker_exec import (
     BrokerError,
     BrokerRejected,
     broker_order_details,
     new_client_order_id,
     submit_and_poll,
+    submit_mleg_and_poll,
+    submit_stock_cover_and_poll,
+    submit_stock_short_and_poll,
 )
 from ..db import (
     Order,
@@ -154,25 +208,42 @@ from ..db import (
     utcnow,
 )
 from ..deps import (
+    account_permissions_from_settings,
+    broker_mode,
     require_broker,
     require_market_data_provider,
     resolve_broker,
     simulated_broker_mode,
 )
+from ..risk_inputs import build_portfolio_snapshot
+from ..risk_snapshot import (
+    DAYS_PER_YEAR,
+    NEW_YORK,
+    STRESS_DIVIDEND_YIELD,
+    STRESS_RATE,
+    TRIGGER_PRE_TRADE,
+    build_risk_snapshot,
+    correlation_state_api,
+    correlation_state_for,
+    record_atm_iv,
+)
 from ..schemas import TickerRequest
-from .analysis import ensure_daily_bars, market_regime_from_spy
-from .options import build_option_chain, chain_iv_summary
+from .analysis import ensure_daily_bars
+from .options import CHAIN_CACHE_TTL_SECONDS, build_option_chain, chain_iv_summary
 
 # The portfolio-picture helpers live in routers/portfolio.py so the risk view
 # and this order path build the identical book (plan §21). find_option_contract
 # and is_option_position are also RE-EXPORTED through this module on purpose:
 # routers/positions.py imports them from here.
 from .portfolio import (
+    _ewma_vol_targeting_side_by_side,
     find_option_contract,
+    find_spread_short_leg,
     is_option_position,
-    open_positions_with_prices,
+    is_short_stock_position,
+    is_spread_position,
     portfolio_greeks_read,
-    position_market_value,
+    stored_bars_by_ticker,
     stored_closes_by_ticker,
     vol_targeting_block,
 )
@@ -181,710 +252,99 @@ router = APIRouter(prefix="/api/orders", tags=["orders"])
 
 # The only order sides that exist in this system (§5): a long-only account
 # BUYS to open and SELLS to close. Sell-to-Open does not exist, ever.
-BUY_TO_OPEN = "BUY_TO_OPEN"
-SELL_TO_CLOSE = "SELL_TO_CLOSE"
-
-# Position lifecycle states (positions.status column).
-POSITION_OPEN = "OPEN"
-POSITION_CLOSED = "CLOSED"
-
-# Single-user V1: fixed user identity until auth-service lands (matches
-# routers/trading_control.py).
-CURRENT_USER = "local-user"
 
 # ---------------------------------------------------------------------------
-# Execution serialization (§42 duplicate protection; V1 no-pyramiding).
+# THE GATE CHAIN LIVES IN ``apps/gateway/execution/gate_chain.py``.
 #
-# Every paper-execution mutation (approve, close, check-exits) runs its
-# check-then-act sequence — idempotency lookup, open-position check, cash
-# guard — and its fill inside ONE critical section. Without it, two rapid
-# approves can BOTH pass the open-position check before either commits and
-# double-fill (pyramiding, forbidden in V1), or a duplicate client_order_id
-# can crash into the UNIQUE constraint with a 500 instead of replaying the
-# existing order (§42). V1 runs a single process, so an in-process asyncio
-# lock closes the race completely; the UNIQUE constraint on
-# orders.client_order_id stays as the multi-process backstop.
+# It used to live here — 2,500 lines under four endpoints — and the shape
+# leaked: background loops imported from a router to reach the trading
+# decision, thirty-two test modules reached into an HTTP module for business
+# rules, and two sibling routers had to be imported inside functions to break
+# the resulting cycles. A router validates input, calls one function, and
+# turns the result into a status code.
 #
-# The lock is per event loop (test suites create one loop per test; asyncio
-# primitives may not be shared across loops).
+# The shared execution constants moved WITH it: defining them in both places
+# would give the two modules separate copies of ``_EXECUTION_LOCKS``, and an
+# execution mutex that is not the same object in every caller is not a mutex.
+#
+# TESTS: monkeypatch ``execution.gate_chain``, never this module. A patch
+# applied here rebinds only the re-exported reference while the code reading
+# it keeps the original value — a silent failure that looks like a gate veto.
 # ---------------------------------------------------------------------------
-_EXECUTION_LOCKS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
-    weakref.WeakKeyDictionary()
+from ..execution import gate_chain  # noqa: F401  (the patch target)
+from ..execution.gate_chain import (  # noqa: F401  (re-export)
+    ATR_PERIOD,
+    BUY_TO_OPEN,
+    CANDIDATE_KEY_SUFFIX,
+    CANDIDATE_LEG_KEY,
+    CANDIDATE_LONG_LEG_KEY,
+    CANDIDATE_SHORT_LEG_KEY,
+    CURRENT_USER,
+    FAIL,
+    GATE_ORDER,
+    GateChainResult,
+    LIQUIDITY_LIMITS,
+    MAX_BAR_AGE_DAYS,
+    OPTION_MULTIPLIER,
+    OrderPreviewRequest,
+    PASS,
+    PENDING_SUBMIT,
+    POSITION_CLOSED,
+    POSITION_OPEN,
+    RISK_REJECT_COUNT,
+    RISK_RESIZE_COUNT,
+    SELECTOR_PARAMS,
+    SELL_TO_CLOSE,
+    SHORT_STOCK_GAP_RISK_FACTOR,
+    SIZING_V2_PARAMS,
+    SKIPPED,
+    SKIP_EARLIER_FAIL,
+    SKIP_NO_OPTION_DATA,
+    SKIP_STOCK_ORDER,
+    SPREAD_PARAMS,
+    SQUEEZE_PROXY_PARAMS,
+    STATISTICAL_LIMITS,
+    STRESS_LIMITS,
+    STRESS_LIMIT_BLOCKS,
+    VOL_REGIME_PARAMS,
+    _BEAR_REGIMES,
+    _EXECUTION_LOCKS,
+    _broker_cash_for_sizing,
+    _candidate_spec,
+    _candidate_stress_legs,
+    _cap_api,
+    _comparison_api,
+    _metric_pair_row,
+    _pct_of_nav,
+    _pretrade_statistical_shadow,
+    _pretrade_stress_shadow,
+    _scalar_pair_row,
+    _sizing_v2_shadow_block,
+    _statistical_shadow_detail,
+    _stress_comparison_row,
+    _worst_row_api,
+    execution_lock,
+    run_gate_chain,
 )
 
+@router.get("/open")
+async def list_open_orders(session: AsyncSession = Depends(get_session)) -> dict:
+    """Non-terminal orders (§11/§26): what is still in flight at the broker.
 
-def execution_lock() -> asyncio.Lock:
-    """The current event loop's paper-execution lock (see block comment)."""
-    loop = asyncio.get_running_loop()
-    lock = _EXECUTION_LOCKS.get(loop)
-    if lock is None:
-        lock = asyncio.Lock()
-        _EXECUTION_LOCKS[loop] = lock
-    return lock
-
-# --- V1 parameters (plan §6.2: parameters, never hardcoded truths) ----------
-# Stop distance for a LONG_STOCK entry = ATR_STOP_MULTIPLE * ATR14 (plan §12.1).
-ATR_STOP_MULTIPLE = 2.0
-ATR_PERIOD = 14
-# DATA_QUALITY staleness bound: last stored bar must be within this many
-# calendar days of today (stub data always passes; the check must still exist).
-MAX_BAR_AGE_DAYS = 5
-# Standard US equity option contract multiplier (plan §12.1: cash and max
-# loss are per-share premium x this).
-OPTION_MULTIPLIER = 100
-# Parameter seams for the option gates (plan §6.2): module-level so tests and
-# future config wiring can substitute custom thresholds without touching the
-# chain logic — §7 vol-regime thresholds, §9.1/§9.2 selector thresholds, and
-# the §5 account permission flags the §8 matrix degrades under.
-VOL_REGIME_PARAMS = VolRegimeParams()
-SELECTOR_PARAMS = SelectorParams()
-ACCOUNT_PERMISSIONS = AccountPermissions()
-
-# The §10 gate chain, in its exact order.
-GATE_ORDER = (
-    "TRADING_POOL_AUTHORIZATION",
-    "DATA_QUALITY",
-    "REGIME",
-    "DIRECTIONAL_SIGNAL",
-    "VOLATILITY",
-    "INSTRUMENT",
-    "LIQUIDITY",
-    "CONTRACT_SELECTION",
-    "RISK_APPROVAL",
-)
-
-PASS = "PASS"
-FAIL = "FAIL"
-SKIPPED = "SKIPPED"
-
-# Exact V1 skip details (contract-fixed strings).
-SKIP_EARLIER_FAIL = "not evaluated: earlier gate failed"
-SKIP_NO_OPTION_DATA = "no option/quote data yet — arrives with the Massive integration"
-SKIP_STOCK_ORDER = "stock order — no contract selection needed"
-
-# Regimes that veto a new LONG (bullish) entry (§6.1: TRANSITION defaults to
-# NO TRADE; bear regimes give a long-only account no bullish edge, §5). A
-# resolved BEAR direction may still trade a bear regime — via long puts only.
-_BEAR_REGIMES = frozenset({MarketRegime.MILD_BEAR, MarketRegime.STRONG_BEAR})
-
-
-class OrderPreviewRequest(TickerRequest):
-    quantity: int | None = Field(default=None, ge=1)
-    # Direction resolution seam, mirroring GET .../options (plan §9): an
-    # explicit BULL/BEAR wins; AUTO (default) defers to the signal bias.
-    direction: Literal["AUTO", "BULL", "BEAR"] = "AUTO"
-
-
-@dataclass
-class GateChainResult:
-    """One full §10 gate-chain evaluation, shared by preview and approve.
-
-    ``preview`` is the exact dict ``POST /api/orders/preview`` responds with;
-    ``veto_gate`` names the first FAILing gate (``None`` when the chain fully
-    passes — only then may an approval fill, §42). ``entry_price`` is the last
-    stored UNDERLYING close, ``stop_distance`` the §12.1 stock stop
-    (2 * ATR14), ``edge`` the directional edge at evaluation, and
-    ``last_bar_date`` the last stored bar date (YYYY-MM-DD) — the entry-bar
-    anchor for ``bars_held`` (plan §11).
-
-    Option wiring (plan §8/§9): ``instrument`` is the §8 matrix verdict
-    ("LONG_STOCK" | "LONG_CALL" | "LONG_PUT" | "NO_TRADE"; ``None`` when the
-    chain vetoed before the matrix ran — honest null), ``vol_regime`` the §7
-    classification value (``None`` without chain data), and ``contract`` the
-    §9 top-ranked :class:`ContractQuote` an option approval fills against
-    (``None`` for stock / no trade). For option chains the risk engine was
-    fed ``mid * 100`` as both entry and stop (§12.1), so
-    ``assessment.approved_quantity`` counts CONTRACTS.
-
-    The chain has already recorded its SYSTEM RISK_DECISION audit event on
-    the session but NOT committed — the caller owns the transaction, so the
-    audit lands atomically with whatever state change follows (rule 12).
+    ``{"orders": [...]}`` — every order in PENDING_SUBMIT / ACCEPTED /
+    PARTIALLY_FILLED, oldest first. The positions UI derives its
+    PENDING_UPDATE reconciliation state from this list (a position whose
+    order is still working is neither MATCHED nor MISMATCHED — it is
+    honestly in flux until the order-sync sweep settles it). Empty list when
+    nothing is in flight; this endpoint never needs a broker and never 503s —
+    it reports LOCAL rows only.
     """
-
-    preview: dict
-    assessment: RiskAssessment | None
-    entry_price: float | None
-    stop_distance: float | None
-    edge: float | None
-    last_bar_date: str | None
-    veto_gate: str | None
-    instrument: str | None = None
-    vol_regime: str | None = None
-    contract: ContractQuote | None = None
-
-    @property
-    def failed(self) -> bool:
-        """True when any gate FAILed — no order may be produced (§42)."""
-        return self.veto_gate is not None
-
-
-async def run_gate_chain(
-    session: AsyncSession,
-    ticker: str,
-    quantity: int | None,
-    direction: str = "AUTO",
-) -> GateChainResult:
-    """Evaluate the §10 gate chain for a proposed entry (§33, §42).
-
-    ``direction`` is the §9-style resolution seam: "AUTO" defers to the
-    signal bias, an explicit "BULL"/"BEAR" wins (and is reported honestly in
-    the DIRECTIONAL_SIGNAL detail). Places no order and never commits.
-    Records exactly one SYSTEM RISK_DECISION audit event — veto or approval —
-    on the session; the caller commits it in the same transaction as any
-    state change (§38, rule 12).
-    """
-    settings = get_settings()
-    limits = RiskLimits()
-    regime_params = RegimeParams()
-
-    gates: list[dict] = []
-
-    def gate(name: str, status: str, detail: str) -> None:
-        gates.append({"name": name, "status": status, "detail": detail})
-
-    vetoed = False  # first FAIL stops evaluating later gates (§10, §42)
-    sig = None
-    signal_edge: float | None = None
-    signal_bias: str | None = None
-    strength: str | None = None
-    resolved: DirectionalBias | None = None
-    entry_price: float | None = None
-    stop_distance: float | None = None
-    assessment: RiskAssessment | None = None
-    chain: list[ContractQuote] = []
-    vol_regime = None  # IVRegime | None (§7; None = no chain data, honest null)
-    decision = None  # InstrumentDecision | None (§8 matrix verdict)
-    chosen: ContractQuote | None = None  # §9 top-ranked candidate
-
-    # ------------------------------------------------------------------
-    # Gate 1 — TRADING_POOL_AUTHORIZATION (§32, §18): the ticker must be in
-    # the Trading Pool, per-symbol trading enabled, AND the global kill
-    # switch must allow trading. FAIL names every missing authorization.
-    # ------------------------------------------------------------------
-    pool_row = (
-        await session.execute(
-            select(TradingPoolItem).where(TradingPoolItem.ticker == ticker)
-        )
-    ).scalar_one_or_none()
-    state = await get_or_create_system_state(session)
-    missing: list[str] = []
-    if pool_row is None:
-        missing.append(
-            f"{ticker} is not in the Trading Pool — only pool symbols may trade (§32)"
-        )
-    elif not pool_row.trading_enabled:
-        missing.append(f"trading is not enabled for {ticker} in the Trading Pool (§32)")
-    if not state.trading_enabled:
-        missing.append(
-            "the global kill switch is engaged — trading is paused system-wide (§18)"
-        )
-    if missing:
-        gate("TRADING_POOL_AUTHORIZATION", FAIL, "; ".join(missing))
-        vetoed = True
-    else:
-        gate(
-            "TRADING_POOL_AUTHORIZATION",
-            PASS,
-            f"{ticker} is in the Trading Pool with trading enabled and the "
-            "global kill switch allows trading",
-        )
-
-    # ------------------------------------------------------------------
-    # Gate 2 — DATA_QUALITY: stored bars exist (lazy backfill first, §4.2),
-    # cover the regime engine's slow SMA, and are fresh (parameterized).
-    # ------------------------------------------------------------------
-    bars: list = []
-    if vetoed:
-        gate("DATA_QUALITY", SKIPPED, SKIP_EARLIER_FAIL)
-    else:
-        problems: list[str] = []
-        try:
-            bars = await ensure_daily_bars(
-                session, ticker, settings.market_data_provider
-            )
-        except HTTPException as exc:
-            problems.append(f"no stored bars for {ticker}: {exc.detail}")
-        age_days = 0
-        if bars:
-            if len(bars) < regime_params.sma_slow:
-                problems.append(
-                    f"only {len(bars)} stored bars; the regime engine needs at "
-                    f"least {regime_params.sma_slow}"
-                )
-            last_ts = bars[-1].ts
-            age_days = (datetime.now(timezone.utc).date() - last_ts).days
-            if age_days > MAX_BAR_AGE_DAYS:
-                problems.append(
-                    f"last bar {last_ts.isoformat()} is {age_days} calendar days "
-                    f"old (limit {MAX_BAR_AGE_DAYS})"
-                )
-        if problems:
-            gate("DATA_QUALITY", FAIL, "; ".join(problems))
-            vetoed = True
-        else:
-            gate(
-                "DATA_QUALITY",
-                PASS,
-                f"{len(bars)} stored bars through {bars[-1].ts.isoformat()} "
-                f"({age_days} calendar day(s) old, limit {MAX_BAR_AGE_DAYS})",
-            )
-
-    closes = [b.close for b in bars]
-    highs = [b.high for b in bars]
-    lows = [b.low for b in bars]
-    volumes = [b.volume for b in bars]
-    if not vetoed:
-        entry_price = closes[-1]
-        atr_last = atr(highs, lows, closes, period=ATR_PERIOD)[-1]
-        if atr_last is not None:
-            stop_distance = ATR_STOP_MULTIPLE * atr_last
-        # The live signal (§6.2), computed once and shared by the REGIME,
-        # DIRECTIONAL_SIGNAL and INSTRUMENT gates below. The traded direction
-        # resolves as in the §9 options view: explicit override wins, AUTO
-        # defers to the bias.
-        sig = score_direction(closes, highs, lows, volumes=volumes)
-        signal_edge = sig.directional_edge
-        signal_bias = sig.bias.value
-        resolved = DirectionalBias(direction) if direction != "AUTO" else sig.bias
-
-    # ------------------------------------------------------------------
-    # Gate 3 — REGIME on the symbol's OWN bars (§6.1): TRANSITION defaults
-    # to NO TRADE; a bear regime permits no new BULLISH exposure (§5) — but
-    # a BEAR direction may trade it, via long puts only (§8; no short
-    # stock exists in this system).
-    # ------------------------------------------------------------------
-    if vetoed:
-        gate("REGIME", SKIPPED, SKIP_EARLIER_FAIL)
-    else:
-        regime = classify_regime(closes, highs, lows, params=regime_params)
-        cls = regime.classification
-        if cls is MarketRegime.TRANSITION:
-            gate("REGIME", FAIL, "regime TRANSITION defaults to NO TRADE (§6.1)")
-            vetoed = True
-        elif cls in _BEAR_REGIMES and resolved is not DirectionalBias.BEAR:
-            gate(
-                "REGIME",
-                FAIL,
-                f"{ticker} regime is {cls.value}: a bear regime does not permit "
-                "a new long (bullish) entry (long-only account, §5); only a "
-                "BEAR direction may trade here, via long puts (§8)",
-            )
-            vetoed = True
-        elif cls in _BEAR_REGIMES:
-            gate(
-                "REGIME",
-                PASS,
-                f"{ticker} regime {cls.value} aligns with the BEAR direction — "
-                "bearish exposure via long puts only (no short stock, §5)",
-            )
-        else:
-            gate("REGIME", PASS, f"{ticker} regime {cls.value} permits a long entry")
-
-    # ------------------------------------------------------------------
-    # Gate 4 — DIRECTIONAL_SIGNAL (§6.2): under AUTO a NEUTRAL bias is NO
-    # TRADE (§8 — a valid output); BULL and BEAR both proceed, because the
-    # §8 matrix now maps BEAR to §5-legal long puts. An explicit direction
-    # override passes with the real signal numbers reported honestly.
-    # ------------------------------------------------------------------
-    if vetoed:
-        gate("DIRECTIONAL_SIGNAL", SKIPPED, SKIP_EARLIER_FAIL)
-    else:
-        numbers = (
-            f"edge {sig.directional_edge:+.1f} "
-            f"(bull {sig.bull_score:.1f} / bear {sig.bear_score:.1f})"
-        )
-        if direction != "AUTO":
-            gate(
-                "DIRECTIONAL_SIGNAL",
-                PASS,
-                f"direction override {direction} — explicit direction wins, "
-                f"as in the §9 options view (live signal: bias "
-                f"{sig.bias.value}, {numbers})",
-            )
-        elif sig.bias is DirectionalBias.NEUTRAL:
-            gate(
-                "DIRECTIONAL_SIGNAL",
-                FAIL,
-                f"bias is NEUTRAL with {numbers}: no directional edge — "
-                "NO TRADE is a valid output (§8)",
-            )
-            vetoed = True
-        else:
-            gate("DIRECTIONAL_SIGNAL", PASS, f"{sig.bias.value} bias with {numbers}")
-    if not vetoed:
-        # |edge| -> tier via the risk engine's single source of truth (§12.2);
-        # None (below the weak threshold) makes the §8 matrix answer NO_TRADE.
-        strength = strength_tier(signal_edge, limits)
-
-    # ------------------------------------------------------------------
-    # Gate 5 — VOLATILITY (§7): classify the REAL regime off today's chain
-    # summary (shared helpers — one chain build for this whole chain run).
-    # PASS carries the regime + features; FAIL only when the §8 matrix maps
-    # this exact cell to NO_TRADE *because of vol* — detected by re-asking
-    # the matrix with the no-information (treated-as-NORMAL) column: if the
-    # same direction/strength would trade under NORMAL vol, vol is the veto.
-    # No chain data -> PASS with an honest detail; the matrix then receives
-    # vol_regime=None and documents the treated-as-NORMAL fallback itself.
-    # ------------------------------------------------------------------
-    if vetoed:
-        gate("VOLATILITY", SKIPPED, SKIP_EARLIER_FAIL)
-    else:
-        _, chain = build_option_chain(ticker, entry_price)
-        summary = chain_iv_summary(chain, entry_price, closes)
-        atm_iv = summary["atm_iv"]
-        rv20 = summary["rv20"]
-        if atm_iv is not None:
-            vol_regime = classify_vol_regime(
-                atm_iv,
-                rv20 if rv20 is not None and rv20 > 0 else None,
-                VOL_REGIME_PARAMS,
-            ).regime
-        # §8 matrix verdict — computed HERE because this gate's PASS/FAIL is
-        # defined by whether vol alone turned the cell into NO_TRADE.
-        decision = select_instrument(
-            resolved, strength, vol_regime, ACCOUNT_PERMISSIONS
-        )
-        if vol_regime is None:
-            gate(
-                "VOLATILITY",
-                PASS,
-                "no chain data — ATM IV unavailable (honest null); the §8 "
-                "matrix treats the unknown vol regime as NORMAL "
-                "(no-information column)",
-            )
-        else:
-            vol_numbers = (
-                f"atm_iv {atm_iv:.3f}, rv20 "
-                + (f"{rv20:.3f}" if rv20 is not None else "n/a")
-                + ", iv/rv "
-                + (
-                    f"{atm_iv / rv20:.2f}"
-                    if rv20 is not None and rv20 > 0
-                    else "n/a"
-                )
-            )
-            normal_decision = select_instrument(
-                resolved, strength, None, ACCOUNT_PERMISSIONS
-            )
-            vol_caused_no_trade = (
-                decision.instrument is InstrumentType.NO_TRADE
-                and normal_decision.instrument is not InstrumentType.NO_TRADE
-            )
-            if vol_caused_no_trade:
-                gate(
-                    "VOLATILITY",
-                    FAIL,
-                    f"vol regime {vol_regime.value} ({vol_numbers}) maps this "
-                    f"§8 cell to NO_TRADE — the same direction/strength would "
-                    f"trade under NORMAL vol: {' '.join(decision.rationale)}",
-                )
-                vetoed = True
-            else:
-                gate(
-                    "VOLATILITY",
-                    PASS,
-                    f"vol regime {vol_regime.value} ({vol_numbers})",
-                )
-
-    # ------------------------------------------------------------------
-    # Gate 6 — INSTRUMENT: the §8 matrix verdict under the §5 account
-    # constraints (select_instrument — never reimplemented here). FAIL when
-    # NO_TRADE, with the §8 cell + degradation rationale in the detail;
-    # NO_TRADE is a valid output, never an error (§8).
-    # ------------------------------------------------------------------
-    if vetoed:
-        gate("INSTRUMENT", SKIPPED, SKIP_EARLIER_FAIL)
-    elif decision.instrument is InstrumentType.NO_TRADE:
-        gate(
-            "INSTRUMENT",
-            FAIL,
-            f"§8 matrix verdict NO_TRADE: {' '.join(decision.rationale)}",
-        )
-        vetoed = True
-    else:
-        gate(
-            "INSTRUMENT",
-            PASS,
-            f"§8 matrix selects {decision.instrument.value}: "
-            f"{' '.join(decision.rationale)}",
-        )
-
-    # LIQUIDITY stays a V1 skip: underlying quote/depth data arrives with the
-    # Massive integration (§22.1); option liquidity is already enforced
-    # per-contract by the §9.1 filters inside CONTRACT_SELECTION.
-    gate("LIQUIDITY", SKIPPED, SKIP_EARLIER_FAIL if vetoed else SKIP_NO_OPTION_DATA)
-
-    # ------------------------------------------------------------------
-    # Gate 8 — CONTRACT_SELECTION (§9): SKIPPED for stock; for an option
-    # instrument the §9 selector runs over the SAME chain and the top-ranked
-    # candidate becomes the proposed contract; FAIL when nothing is eligible.
-    # ------------------------------------------------------------------
-    if vetoed:
-        gate("CONTRACT_SELECTION", SKIPPED, SKIP_EARLIER_FAIL)
-    elif decision.instrument is InstrumentType.LONG_STOCK:
-        gate("CONTRACT_SELECTION", SKIPPED, SKIP_STOCK_ORDER)
-    else:
-        side = "BULL" if decision.instrument is InstrumentType.LONG_CALL else "BEAR"
-        scored = select_contracts(chain, side, SELECTOR_PARAMS)
-        top = next((s for s in scored if s.rank == 1), None)
-        if top is None:
-            eligible = sum(1 for s in scored if s.eligible)
-            gate(
-                "CONTRACT_SELECTION",
-                FAIL,
-                f"no eligible {decision.instrument.value} contract in today's "
-                f"chain ({len(chain)} contracts, {eligible} eligible after "
-                "the §9.1 filters)",
-            )
-            vetoed = True
-        else:
-            chosen = top.contract
-            gate(
-                "CONTRACT_SELECTION",
-                PASS,
-                f"top-ranked §9 candidate: {chosen.right} {chosen.strike:g} "
-                f"exp {chosen.expiry.isoformat()} (dte {chosen.dte}), mid "
-                f"{chosen.mid:.4f}, delta {chosen.delta:+.2f}, iv "
-                f"{chosen.iv:.3f}, score {top.score:.3f}",
-            )
-
-    # ------------------------------------------------------------------
-    # Gate 9 — RISK_APPROVAL: build the portfolio snapshot and call the risk
-    # engine (§12, §17). Risk limits have PRIORITY over strategy confidence
-    # (§44 rule 20) — a REJECT here vetoes regardless of signal strength.
-    #
-    # §12.1 OPTIONS FORMULA: for an option entry the request carries
-    # CONTRACT-level units — entry_price = stop_distance = mid * 100,
-    # because the premium is FULLY at risk. approved_quantity is therefore
-    # the number of CONTRACTS and every existing cap applies unchanged.
-    # ------------------------------------------------------------------
-    if vetoed:
-        gate("RISK_APPROVAL", SKIPPED, SKIP_EARLIER_FAIL)
-    else:
-        if chosen is not None:
-            risk_entry = risk_stop = chosen.mid * OPTION_MULTIPLIER
-        else:
-            risk_entry, risk_stop = entry_price, stop_distance
-        portfolio = await get_or_create_portfolio(session)
-        pairs = await open_positions_with_prices(session)
-        values = [position_market_value(pos, price) for pos, price in pairs]
-        nav = portfolio.cash + sum(v for v in values if v is not None)
-        position_risks = [
-            PositionRisk(
-                ticker=pos.ticker,
-                market_value=value if value is not None else 0.0,
-                max_loss=pos.max_loss,
-            )
-            for (pos, _price), value in zip(pairs, values)
-        ]
-        spy_regime = (await market_regime_from_spy(session)).classification
-        snapshot = PortfolioSnapshot(
-            nav=nav,
-            cash=portfolio.cash,
-            positions=position_risks,
-            regime=spy_regime,
-            trading_enabled=state.trading_enabled,
-        )
-        # §14 vol targeting: the SAME computation the portfolio risk view
-        # reports (shared helper — one implementation, plan §21). The
-        # multiplier scales the §12.2 tier budget INSIDE assess, which
-        # hard-caps it at abs_max_trade_risk — vol targeting can NEVER
-        # override hard caps (§14, §44 rule 20). No open positions -> 1.0.
-        closes_by_ticker = await stored_closes_by_ticker(
-            session, (pos.ticker for pos, _price in pairs)
-        )
-        vol_block = vol_targeting_block(nav, pairs, closes_by_ticker)
-        budget_multiplier = vol_block["multiplier"]
-        # §16 portfolio greek limits: the current book's aggregated greeks
-        # (shared helper) plus the candidate's per-share greeks — stock is
-        # delta 1 / gamma 0 / theta 0 / vega 0; an option candidate carries
-        # the proposed §9 contract's greeks. assess checks the post-trade
-        # book at the APPROVED quantity; a breach REJECTs like any other
-        # risk limit (§44 rule 20).
-        book_greeks, _greek_rows = portfolio_greeks_read(pairs)
-        if chosen is not None:
-            candidate_greeks = PositionGreeksInput(
-                ticker=ticker,
-                instrument=decision.instrument.value,
-                quantity=1,  # requested basis; assess scales by approved qty
-                multiplier=OPTION_MULTIPLIER,
-                spot=entry_price,
-                delta=chosen.delta,
-                gamma=chosen.gamma,
-                theta_per_day=chosen.theta,
-                vega=chosen.vega,
-            )
-        else:
-            candidate_greeks = PositionGreeksInput(
-                ticker=ticker,
-                instrument=InstrumentType.LONG_STOCK.value,
-                quantity=1,  # requested basis; assess scales by approved qty
-                multiplier=1,
-                spot=entry_price,
-                delta=1.0,
-                gamma=0.0,
-                theta_per_day=0.0,
-                vega=0.0,
-            )
-        assessment = assess(
-            RiskRequest(
-                ticker=ticker,
-                entry_price=risk_entry,
-                stop_distance=risk_stop,
-                edge=signal_edge,
-                quantity_requested=quantity,
-            ),
-            snapshot,
-            limits,
-            budget_multiplier=budget_multiplier,
-            portfolio_greeks=book_greeks,
-            new_position_greeks=candidate_greeks,
-        )
-        # §14 transparency: when vol targeting actually scaled the budget the
-        # gate detail says so, with the real number.
-        vt_detail = (
-            f", budget multiplier {budget_multiplier:.2f} (vol targeting)"
-            if abs(budget_multiplier - 1.0) > 1e-9
-            else ""
-        )
-        unit = "contracts" if chosen is not None else "shares"
-        if assessment.decision is RiskDecision.REJECT:
-            gate(
-                "RISK_APPROVAL",
-                FAIL,
-                f"risk engine REJECT ({', '.join(assessment.reason_codes)}) — "
-                "risk limits have priority over strategy confidence "
-                f"(§44 rule 20){vt_detail}",
-            )
-            vetoed = True
-        elif assessment.decision is RiskDecision.APPROVE_WITH_RESIZE:
-            gate(
-                "RISK_APPROVAL",
-                PASS,
-                f"APPROVE_WITH_RESIZE: quantity resized to "
-                f"{assessment.approved_quantity} {unit} "
-                f"({', '.join(assessment.reason_codes)}){vt_detail}",
-            )
-        else:
-            gate(
-                "RISK_APPROVAL",
-                PASS,
-                f"APPROVE: {assessment.approved_quantity} {unit}, "
-                f"${assessment.trade_risk_usd:,.2f} at risk{vt_detail}",
-            )
-
-    # §33: aggregate the passing/failing gate details + risk explanations;
-    # both lists are ALWAYS present.
-    why_trade = [f"{g['name']}: {g['detail']}" for g in gates if g["status"] == PASS]
-    why_not_trade = [f"{g['name']}: {g['detail']}" for g in gates if g["status"] == FAIL]
-    if assessment is not None:
-        if assessment.decision is RiskDecision.REJECT:
-            why_not_trade.extend(assessment.explanations)
-        else:
-            why_trade.extend(assessment.explanations)
-
-    # Exactly ONE RISK_DECISION audit event per chain run — even an early veto
-    # is a decision and must be auditable (§38, rule 12). Recorded on the
-    # session only; the CALLER commits, so the event shares one transaction
-    # with any state change (preview: none; approve: the fill).
-    veto_gate = next((g["name"] for g in gates if g["status"] == FAIL), None)
-    await audit.record(
-        session,
-        actor_type=ActorType.SYSTEM,
-        action=AuditAction.RISK_DECISION,
-        entity_type="order_preview",
-        entity_id=ticker,
-        details={
-            "decision": assessment.decision.value if assessment is not None else "VETOED",
-            "veto_gate": veto_gate,
-            "gates": {g["name"]: g["status"] for g in gates},
-            "reason_codes": (
-                list(assessment.reason_codes)
-                if assessment is not None
-                else ([f"VETO_{veto_gate}"] if veto_gate else [])
-            ),
-        },
+    rows_result = await session.execute(
+        select(Order)
+        .where(Order.status.in_([PENDING_SUBMIT, "ACCEPTED", "PARTIALLY_FILLED"]))
+        .order_by(Order.id)
     )
-
-    risk_out = None
-    if assessment is not None:
-        risk_out = {
-            "decision": assessment.decision.value,
-            "approved_quantity": assessment.approved_quantity,
-            "signal_strength": assessment.signal_strength,
-            "risk_budget_pct": assessment.risk_budget_pct,
-            "trade_risk_usd": assessment.trade_risk_usd,
-            "reason_codes": assessment.reason_codes,
-            "explanations": assessment.explanations,
-            "heat_before_pct": assessment.heat_before_pct,
-            "heat_after_pct": assessment.heat_after_pct,
-            "cash_after_pct": assessment.cash_after_pct,
-        }
-
-    # The proposed contract (§9), null for stock / no trade (honest null).
-    contract_out = None
-    if chosen is not None:
-        contract_out = {
-            "expiry": chosen.expiry.isoformat(),
-            "dte": chosen.dte,
-            "strike": chosen.strike,
-            "right": chosen.right,
-            "mid": chosen.mid,
-            "delta": chosen.delta,
-            "iv": chosen.iv,
-            "multiplier": OPTION_MULTIPLIER,
-            # A long option's premium is fully at risk (§12.1).
-            "max_loss_per_contract": chosen.mid * OPTION_MULTIPLIER,
-        }
-
-    preview = {
-        "ticker": ticker,
-        "as_of": datetime.now(timezone.utc).isoformat(),
-        "gates": gates,
-        "signal": {
-            "edge": signal_edge,
-            "bias": signal_bias,
-            "strength": assessment.signal_strength if assessment is not None else None,
-        },
-        "proposed": {
-            # The §8 matrix verdict — "NO_TRADE" is reported honestly when
-            # the INSTRUMENT (or vol-caused VOLATILITY) gate failed; null when
-            # the chain vetoed before the matrix ran (honest null).
-            "instrument": decision.instrument.value if decision is not None else None,
-            "vol_regime": vol_regime.value if vol_regime is not None else None,
-            "instrument_rationale": (
-                list(decision.rationale) if decision is not None else []
-            ),
-            "contract": contract_out,
-            # §12.1: for an option entry BOTH numbers are the risk engine's
-            # contract-level basis (mid * 100 — premium fully at risk); for
-            # stock they stay the last close and the 2*ATR14 stop.
-            "entry_price": (
-                chosen.mid * OPTION_MULTIPLIER if chosen is not None else entry_price
-            ),
-            "stop_distance": (
-                chosen.mid * OPTION_MULTIPLIER
-                if chosen is not None
-                else stop_distance
-            ),
-            "quantity_requested": quantity,
-        },
-        "risk": risk_out,
-        "why_trade": why_trade,
-        "why_not_trade": why_not_trade,
-    }
-    return GateChainResult(
-        preview=preview,
-        assessment=assessment,
-        entry_price=entry_price,
-        stop_distance=stop_distance,
-        edge=signal_edge,
-        last_bar_date=bars[-1].ts.isoformat() if bars else None,
-        veto_gate=veto_gate,
-        instrument=decision.instrument.value if decision is not None else None,
-        vol_regime=vol_regime.value if vol_regime is not None else None,
-        contract=chosen,
-    )
+    return {"orders": [_order_payload(o) for o in rows_result.scalars().all()]}
 
 
 @router.post("/preview")
@@ -900,9 +360,16 @@ async def preview_order(
     configured. Every gate — data quality, regime, volatility, contract
     selection, sizing — is a judgement about current prices; running them on
     invented numbers would produce a confident recommendation about nothing.
+
+    RESEARCH mode (upgrade §15/§16): a Watchlist symbol gets its complete
+    research plan without Trading Pool membership — execution authorization
+    is reported separately in ``execution_authorization`` and enforced only
+    by the approve path, which re-runs this chain in execution mode (§21).
     """
     require_market_data_provider()
-    result = await run_gate_chain(session, req.ticker, req.quantity, req.direction)
+    result = await run_gate_chain(
+        session, req.ticker, req.quantity, req.direction, mode="research"
+    )
     await session.commit()
     return result.preview
 
@@ -928,10 +395,26 @@ class OrderCloseRequest(TickerRequest):
 
 
 def _contract_payload(row: Order | Position) -> dict | None:
-    """The opt_* identity block of an order/position, null for stock."""
+    """The opt_* identity block of an order/position, null for stock.
+
+    ``option_symbol`` is the server-built OCC symbol (§27) — the same string
+    the broker is addressed with, so the UI never reconstructs it. Null when
+    the stored fields cannot build one (malformed row): reported honestly,
+    and the close path will 422 with the full reason if a close is attempted.
+    """
     if row.opt_expiry is None:
         return None
+    try:
+        symbol = occ_option_symbol(
+            row.ticker,
+            date.fromisoformat(row.opt_expiry),
+            float(row.opt_strike),
+            row.opt_right or "",
+        )
+    except (TypeError, ValueError):
+        symbol = None
     return {
+        "option_symbol": symbol,
         "expiry": row.opt_expiry,
         "strike": row.opt_strike,
         "right": row.opt_right,
@@ -958,6 +441,9 @@ def _order_payload(order: Order) -> dict:
         "fill_price": order.fill_price,
         "commission": order.commission,
         "status": order.status,
+        # The local position this order opened/closes (§27) — null until a
+        # BUY's first fill lands, and for pre-lifecycle rows.
+        "position_id": order.position_id,
         "contract": _contract_payload(order),
         "broker": (
             {
@@ -979,11 +465,16 @@ def _position_payload(position: Position) -> dict:
         "status": position.status,
         "quantity": position.quantity,
         "avg_price": position.avg_price,
-        # Stock: the §11.3 underlying stop. Options: honest null here — the
-        # §11.3 stop is PREMIUM-based (entry premium * (1 - stop pct)) and is
-        # reported by the position monitor's exit-engine read.
+        # Stock: the §11.3 underlying stop — ABOVE entry for a Phase 3
+        # short. Options: honest null here — the §11.3 stop is
+        # PREMIUM-based (entry premium * (1 - stop pct)) and is reported by
+        # the position monitor's exit-engine read.
         "stop_price": (
-            position.avg_price - position.stop_distance
+            (
+                position.avg_price + position.stop_distance
+                if is_short_stock_position(position)
+                else position.avg_price - position.stop_distance
+            )
             if position.stop_distance > 0 and not is_option_position(position)
             else None
         ),
@@ -1057,13 +548,49 @@ async def option_close_reference(
                 "has no reference price (honest error, §44 rule 18)"
             ),
         )
-    _, chain = build_option_chain(position.ticker, last_close)
+    # Close pricing feeds a REAL fill — always a live chain read (§42).
+    _, chain = build_option_chain(position.ticker, last_close, max_age_seconds=0.0)
     contract = find_option_contract(chain, position)
     if contract is not None:
         return contract.mid, "chain mid"
     return (
         option_intrinsic_value(position, last_close),
         "intrinsic (contract missing from today's chain)",
+    )
+
+
+async def spread_close_reference(
+    session: AsyncSession, position: Position
+) -> tuple[float, str]:
+    """Per-share NET reference to close a defined-risk vertical (Phase 1).
+
+    Net mid = long mid − short mid off a LIVE chain regeneration; when
+    either leg is missing from today's chain, falls back to NET intrinsic
+    against the last stored close (bounded at >= 0) — contractual
+    arithmetic, documented, never a silent zero."""
+    last_close = await _last_stored_close(session, position.ticker)
+    if last_close is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"no stored bars for {position.ticker} — the paper fill model "
+                "has no reference price (honest error, §44 rule 18)"
+            ),
+        )
+    _, chain = build_option_chain(position.ticker, last_close, max_age_seconds=0.0)
+    long_leg = find_option_contract(chain, position)
+    short_leg = find_spread_short_leg(chain, position)
+    if long_leg is not None and short_leg is not None:
+        return max(long_leg.mid - short_leg.mid, 0.0), "chain net mid (long - short)"
+    long_intr = option_intrinsic_value(position, last_close)
+    short_strike = position.short_strike or 0.0
+    if (position.opt_right or "C") == "C":
+        short_intr = max(last_close - short_strike, 0.0)
+    else:
+        short_intr = max(short_strike - last_close, 0.0)
+    return (
+        max(long_intr - short_intr, 0.0),
+        "net intrinsic (leg(s) missing from today's chain)",
     )
 
 
@@ -1121,24 +648,42 @@ async def execute_sell_to_close(
 
     settings = get_settings()
     is_option = is_option_position(position)
+    is_spread = is_spread_position(position)
+    is_short_stock = is_short_stock_position(position)
     multiplier = position.multiplier or 1
-    fill = reference_price * (1.0 - settings.paper_slippage_bps / 10000.0)
-    commission = (
-        settings.paper_commission_per_contract
-        if is_option
-        else settings.paper_commission_per_share
-    ) * quantity
-    proceeds = quantity * fill * multiplier - commission
-    realized = (fill - position.avg_price) * quantity * multiplier - commission
+    if is_short_stock:
+        # Phase 3 COVER: the close is a BUY — slippage moves the fill UP
+        # (against the buyer), cash is DEBITED, and P&L mirrors:
+        # realized = (entry − cover) × qty − commission.
+        fill = reference_price * (1.0 + settings.paper_slippage_bps / 10000.0)
+        commission = settings.paper_commission_per_share * quantity
+        proceeds = -(quantity * fill * multiplier) - commission
+        realized = (
+            (position.avg_price - fill) * quantity * multiplier - commission
+        )
+    else:
+        fill = reference_price * (1.0 - settings.paper_slippage_bps / 10000.0)
+        if is_spread:
+            # Two legs close together: per-contract commission on EACH leg.
+            commission = settings.paper_commission_per_contract * quantity * 2
+        elif is_option:
+            commission = settings.paper_commission_per_contract * quantity
+        else:
+            commission = settings.paper_commission_per_share * quantity
+        proceeds = quantity * fill * multiplier - commission
+        realized = (
+            (fill - position.avg_price) * quantity * multiplier - commission
+        )
 
     portfolio = await get_or_create_portfolio(session)
     portfolio.cash += proceeds
     portfolio.updated_at = utcnow()
 
+    close_side = BUY_TO_CLOSE if is_short_stock else SELL_TO_CLOSE
     order = Order(
         ticker=position.ticker,
         instrument=position.instrument,
-        side=SELL_TO_CLOSE,
+        side=close_side,
         quantity=quantity,
         fill_price=fill,
         commission=commission,
@@ -1173,7 +718,7 @@ async def execute_sell_to_close(
         details={
             "ticker": position.ticker,
             "instrument": position.instrument,
-            "side": SELL_TO_CLOSE,
+            "side": close_side,
             "quantity": quantity,
             "reason": reason,
             "system_generated": system_generated,
@@ -1181,7 +726,10 @@ async def execute_sell_to_close(
     )
     submitted_details = {
         "fill_model": (
-            "paper: reference * (1 - slippage_bps/10000) per share; "
+            "paper: cover BUY at reference * (1 + slippage_bps/10000); "
+            "cash DEBITED qty * fill + commission"
+            if is_short_stock
+            else "paper: reference * (1 - slippage_bps/10000) per share; "
             "cash = qty * fill * multiplier - commission"
         ),
         "reference_price": reference_price,
@@ -1234,9 +782,13 @@ async def _sell_to_close_via_broker(
 ) -> tuple[Order, float]:
     """Sell-to-close `position` through the REAL broker (§11).
 
-    The broker half of :func:`execute_sell_to_close`, with the same contract:
-    records rows and audit events on the session and NEVER commits. The local
-    position shrinks by what ACTUALLY filled at the broker — never by what was
+    The broker half of :func:`execute_sell_to_close`. TRANSACTIONS (§11): the
+    PENDING_SUBMIT order row is committed (T1) before the submit leaves the
+    process — including whatever the caller had staged, see the inline note —
+    and the failure paths commit their own settled state; only the SUCCESS
+    path leaves the fill/position/cash mutation uncommitted for the caller
+    (rule 12: the outcome and its audits land together). The local position
+    shrinks by what ACTUALLY filled at the broker — never by what was
     requested — so a partial exit leaves an honestly partial position rather
     than a local flat against a broker long.
 
@@ -1253,7 +805,42 @@ async def _sell_to_close_via_broker(
     # Close the SAME instrument that was opened: an option position is closed
     # by selling its OCC contract symbol, never the underlying ticker (that
     # would sell shares we do not hold — and this account is long-only, §5).
-    if is_option_position(position):
+    close_mleg_legs: list[BrokerOrderLeg] | None = None
+    if is_spread_position(position):
+        # Close BOTH legs atomically: SELL_TO_CLOSE the long + BUY_TO_CLOSE
+        # the short (roadmap Phase 1) — never leg-by-leg, which would leave
+        # a naked short between the fills.
+        try:
+            long_sym = occ_option_symbol(
+                ticker,
+                date.fromisoformat(position.opt_expiry or ""),
+                float(position.opt_strike),
+                position.opt_right or "",
+            )
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"cannot build the OCC symbol to close spread position "
+                    f"{position.id} ({ticker}): {exc}."
+                ),
+            ) from exc
+        short_sym = position.short_occ_symbol
+        if not short_sym:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"spread position {position.id} ({ticker}) has no stored "
+                    "short leg symbol; it cannot be closed at the broker "
+                    "until the row is corrected."
+                ),
+            )
+        broker_symbol = f"{long_sym}/{short_sym}"
+        close_mleg_legs = [
+            BrokerOrderLeg(symbol=long_sym, side=SELL_TO_CLOSE),
+            BrokerOrderLeg(symbol=short_sym, side=BUY_TO_CLOSE),
+        ]
+    elif is_option_position(position):
         try:
             broker_symbol = occ_option_symbol(
                 ticker,
@@ -1273,6 +860,8 @@ async def _sell_to_close_via_broker(
             ) from exc
     else:
         broker_symbol = ticker
+    covering_short = is_short_stock_position(position)
+    close_side = BUY_TO_CLOSE if covering_short else SELL_TO_CLOSE
 
     # NO SHORTING (§5), enforced at the submission boundary itself.
     #
@@ -1293,6 +882,40 @@ async def _sell_to_close_via_broker(
             ),
         )
 
+    # ONE closing order in flight per position (§5/§11). Without this, every
+    # exit-monitor tick would re-trigger the same exit while the previous sell
+    # sits ACCEPTED-unfilled at the broker — each tick minting a fresh
+    # client_order_id — and two fills would sell more than the position holds.
+    # The §5 quantity guard above cannot see broker-side exposure; this can.
+    in_flight_sell = (
+        (
+            await session.execute(
+                select(Order).where(
+                    Order.position_id == position.id,
+                    Order.side == close_side,
+                    Order.status.in_(
+                        [PENDING_SUBMIT, "ACCEPTED", "PARTIALLY_FILLED"]
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if in_flight_sell is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "CLOSE_ALREADY_IN_FLIGHT",
+                "message": (
+                    f"position {position.id} ({ticker}) already has a closing "
+                    f"order in flight (order #{in_flight_sell.id}, status "
+                    f"{in_flight_sell.status}); the order-sync sweep settles "
+                    "it — nothing was re-submitted"
+                ),
+            },
+        )
+
     broker = resolve_broker()
     client_order_id = new_client_order_id(f"stc-{position.id}")
 
@@ -1307,7 +930,7 @@ async def _sell_to_close_via_broker(
             "ticker": ticker,
             "instrument": position.instrument,
             "broker_symbol": broker_symbol,
-            "side": SELL_TO_CLOSE,
+            "side": close_side,
             "quantity": quantity,
             "reason": reason,
             "system_generated": system_generated,
@@ -1316,26 +939,68 @@ async def _sell_to_close_via_broker(
         },
     )
 
+    # §11 lifecycle: the local order row exists BEFORE the submit leaves the
+    # process, committed durably (T1). NOTE the deliberate mid-function
+    # commit: whatever the caller had staged on this session (e.g. this
+    # position's EXIT_GENERATED audit in the sweep) lands with the intent
+    # row — each position's exit is semantically independent, so this never
+    # tears a cross-position invariant. A crash after this point leaves a
+    # PENDING_SUBMIT row the order-sync sweep resolves by client_order_id.
+    # opt_* mirror the position so the order row identifies the actual
+    # contract sold (§44 rule 18).
+    order = Order(
+        client_order_id=client_order_id,
+        ticker=ticker,
+        instrument=position.instrument,
+        opt_expiry=position.opt_expiry,
+        opt_strike=position.opt_strike,
+        opt_right=position.opt_right,
+        side=close_side,
+        quantity=quantity,
+        fill_price=0.0,
+        commission=0.0,  # whatever the broker charged; Alpaca paper: none
+        status=PENDING_SUBMIT,
+        filled_quantity=0,
+        position_id=position.id,
+    )
+    session.add(order)
+    await session.flush()
+    await session.commit()
+
     try:
-        broker_order, adopted = await submit_and_poll(
-            broker, client_order_id, broker_symbol, SELL_TO_CLOSE, quantity
-        )
+        if close_mleg_legs is not None:
+            broker_order, adopted = await submit_mleg_and_poll(
+                broker, client_order_id, close_mleg_legs, quantity
+            )
+        elif covering_short:
+            # Phase 3: buy-to-cover through the dedicated stock-gated
+            # adapter method — risk-reducing, allowed under the pause.
+            broker_order, adopted = await submit_stock_cover_and_poll(
+                broker, client_order_id, broker_symbol, quantity
+            )
+        else:
+            broker_order, adopted = await submit_and_poll(
+                broker, client_order_id, broker_symbol, SELL_TO_CLOSE, quantity
+            )
     except BrokerRejected as exc:
+        order.status = "REJECTED"
+        order.broker_status = "rejected_at_submit"
         await audit.record(
             session,
             actor_type=ActorType.SYSTEM,
             action=AuditAction.ORDER_REJECTED,
             entity_type="order",
-            entity_id=client_order_id,
+            entity_id=str(order.id),
             details={
                 "ticker": ticker,
-                "side": SELL_TO_CLOSE,
+                "side": close_side,
                 "client_order_id": client_order_id,
                 "reason": str(exc),
                 "rejected_by": "broker",
                 "position_unchanged": True,
             },
         )
+        await session.commit()
         raise HTTPException(
             status_code=422,
             detail={
@@ -1348,31 +1013,36 @@ async def _sell_to_close_via_broker(
             },
         ) from exc
     except BrokerError as exc:
+        # A FAULT, not a decision: the row STAYS PENDING_SUBMIT for the
+        # order-sync sweep to settle against the broker.
         await audit.record(
             session,
             actor_type=ActorType.SYSTEM,
             action=AuditAction.ORDER_SUBMITTED,
             entity_type="order",
-            entity_id=client_order_id,
+            entity_id=str(order.id),
             details={
                 "ticker": ticker,
-                "side": SELL_TO_CLOSE,
+                "side": close_side,
                 "client_order_id": client_order_id,
                 "error": str(exc),
                 "outcome": (
                     "broker call FAILED — the closing order may or may not "
-                    "exist at the broker; the local position was NOT changed. "
-                    "Reconcile with GET /api/broker/reconcile."
+                    "exist at the broker; the local position was NOT changed "
+                    "and the order row stays PENDING_SUBMIT until the "
+                    "order-sync sweep resolves it."
                 ),
             },
         )
+        await session.commit()
         raise HTTPException(
             status_code=502,
             detail={
                 "code": "BROKER_ERROR",
                 "message": (
                     f"the broker call failed: {exc}. The position was left "
-                    "untouched locally; reconcile before retrying."
+                    "untouched locally; the order-sync sweep will resolve the "
+                    "order's true state — do not blindly retry."
                 ),
             },
         ) from exc
@@ -1380,20 +1050,48 @@ async def _sell_to_close_via_broker(
     filled = broker_order.filled_quantity
     fill_price = broker_order.filled_avg_price
 
-    order = Order(
-        client_order_id=client_order_id,
-        ticker=ticker,
-        instrument=position.instrument,
-        side=SELL_TO_CLOSE,
-        quantity=quantity,
-        fill_price=fill_price if fill_price is not None else 0.0,
-        commission=0.0,  # whatever the broker charged; Alpaca paper: none
-        status=broker_order.status,
-        broker_order_id=broker_order.broker_order_id or None,
-        broker_status=broker_order.raw_status[:24] if broker_order.raw_status else None,
-        filled_quantity=filled,
+    if filled > 0 and fill_price is None:
+        # PRICE-PENDING FILL (same eventual-consistency gap as the buy path):
+        # contracts sold but no average price yet — the proceeds cannot be
+        # credited honestly, so NOTHING is applied. filled_quantity stays 0
+        # (the sweep's delta measures applied state) and the status is forced
+        # non-terminal so the sweep applies the sale when the price arrives.
+        # The position is deliberately untouched until then.
+        order.status = "ACCEPTED"
+        order.broker_order_id = broker_order.broker_order_id or None
+        order.broker_status = (
+            broker_order.raw_status[:24] if broker_order.raw_status else None
+        )
+        await session.flush()
+        await audit.record(
+            session,
+            actor_type=ActorType.SYSTEM,
+            action=AuditAction.ORDER_SUBMITTED,
+            entity_type="order",
+            entity_id=str(order.id),
+            details={
+                "outcome": (
+                    f"broker reports {filled} sold but no average price yet "
+                    "— the sale is NOT applied (no price, no cash credit, "
+                    "position unchanged) and the row stays non-terminal; the "
+                    "order-sync sweep applies it once the broker publishes "
+                    "the price"
+                ),
+                **broker_order_details(broker_order, adopted=adopted),
+            },
+        )
+        return order, 0.0
+
+    # Settle the PENDING_SUBMIT row to what the broker actually did (§11).
+    # INVARIANT: filled_quantity/fill_price record what has been APPLIED to
+    # cash and the position — the order-sync sweep's delta depends on it.
+    order.fill_price = fill_price if fill_price is not None else 0.0
+    order.status = broker_order.status
+    order.broker_order_id = broker_order.broker_order_id or None
+    order.broker_status = (
+        broker_order.raw_status[:24] if broker_order.raw_status else None
     )
-    session.add(order)
+    order.filled_quantity = filled
     await session.flush()
 
     await audit.record(
@@ -1421,7 +1119,7 @@ async def _sell_to_close_via_broker(
             entity_id=str(order.id),
             details={
                 "ticker": ticker,
-                "side": SELL_TO_CLOSE,
+                "side": close_side,
                 "reason": (
                     f"the broker settled the closing order as "
                     f"{broker_order.raw_status!r}"
@@ -1460,11 +1158,14 @@ async def _sell_to_close_via_broker(
     # Dropping it here would credit an option close at 1/100th of its value.
     multiplier = position.multiplier or 1
     proceeds = filled * fill_price * multiplier
-    realized = (fill_price - position.avg_price) * filled * multiplier
-
-    portfolio = await get_or_create_portfolio(session)
-    portfolio.cash += proceeds
-    portfolio.updated_at = utcnow()
+    realized = (
+        (position.avg_price - fill_price) * filled * multiplier
+        if covering_short
+        else (fill_price - position.avg_price) * filled * multiplier
+    )
+    # NO LOCAL CASH LEDGER in broker mode: the proceeds landed in the REAL
+    # account at the broker, and the platform stores no copy of it — cash is
+    # read live from the broker wherever it is displayed or sized from.
 
     remaining = position.quantity - filled
     position.max_loss = (
@@ -1604,8 +1305,43 @@ async def _approve_order_locked(
             ),
         )
 
+    # --- ...and one in-flight opening order per ticker (§11/§42). ----------
+    # A non-terminal BUY is exposure that has not landed yet: it may fill any
+    # moment. Approving another would place TWO broker orders for one intent —
+    # the position-based check above cannot see it (a zero-fill order has no
+    # position). The order-sync sweep settles the in-flight row; retry after.
+    in_flight = (
+        (
+            await session.execute(
+                select(Order).where(
+                    Order.ticker == ticker,
+                    # Phase 3: a stock short opens with SELL_TO_OPEN — both
+                    # opening sides count as in-flight exposure.
+                    Order.side.in_([BUY_TO_OPEN, SELL_TO_OPEN]),
+                    Order.status.in_(
+                        [PENDING_SUBMIT, "ACCEPTED", "PARTIALLY_FILLED"]
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if in_flight is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{ticker} already has an opening order in flight (order "
+                f"#{in_flight.id}, status {in_flight.status}) — it may still "
+                "fill at the broker. The order-sync sweep settles it; retry "
+                "after it reaches a terminal state."
+            ),
+        )
+
     # --- Re-run the FULL §10 chain (§42: client previews are never trusted).
-    chain = await run_gate_chain(session, ticker, req.quantity, req.direction)
+    chain = await run_gate_chain(
+        session, ticker, req.quantity, req.direction, mode="execution"
+    )
     if chain.failed or chain.assessment is None:
         # The chain already recorded its RISK_DECISION; commit it so the veto
         # stays auditable (rule 12), then answer 422 with the fresh preview.
@@ -1638,10 +1374,27 @@ async def _approve_order_locked(
     # commission, and quantity counts CONTRACTS.
     settings = get_settings()
     is_option = chain.contract is not None
-    if is_option:
+    is_spread = chain.spread is not None
+    is_short_stock = chain.instrument == InstrumentType.SHORT_STOCK.value
+    if is_short_stock:
+        # Phase 3: the OPEN is a SELL — slippage moves the fill DOWN
+        # (against the seller) and the net proceeds are CREDITED to cash.
+        # The liability is the open position itself, carried at NEGATIVE
+        # market value by the portfolio view; NAV stays honest throughout.
+        fill = chain.entry_price * (1.0 - settings.paper_slippage_bps / 10000.0)
+        commission = settings.paper_commission_per_share * quantity
+        cost = 0.0  # nothing is debited; the guard below never trips
+    elif is_option:
         contract = chain.contract
         fill = contract.mid * (1.0 + settings.paper_slippage_bps / 10000.0)
         commission = settings.paper_commission_per_contract * quantity
+        cost = quantity * fill * OPTION_MULTIPLIER + commission
+    elif is_spread:
+        # §12.1 defined risk: fill = NET debit * (1 + slippage) per share —
+        # slippage adverse on the net; commission PER LEG (×2).
+        spread = chain.spread
+        fill = spread.net_debit * (1.0 + settings.paper_slippage_bps / 10000.0)
+        commission = settings.paper_commission_per_contract * quantity * 2
         cost = quantity * fill * OPTION_MULTIPLIER + commission
     else:
         fill = chain.entry_price * (1.0 + settings.paper_slippage_bps / 10000.0)
@@ -1649,7 +1402,7 @@ async def _approve_order_locked(
         cost = quantity * fill + commission
 
     portfolio = await get_or_create_portfolio(session)
-    if cost > portfolio.cash:
+    if not is_short_stock and cost > portfolio.cash:
         # The §13 cash floor was already enforced by RISK_APPROVAL, but the
         # fill adds slippage + commission — guard anyway (risk outranks all).
         await session.commit()  # keep the RISK_DECISION auditable (rule 12)
@@ -1668,17 +1421,40 @@ async def _approve_order_locked(
         client_order_id=req.client_order_id,
         ticker=ticker,
         instrument=chain.instrument or InstrumentType.LONG_STOCK.value,
-        side=BUY_TO_OPEN,
+        side=SELL_TO_OPEN if is_short_stock else BUY_TO_OPEN,
         quantity=quantity,
         fill_price=fill,
         commission=commission,
         status="FILLED",
-        opt_expiry=contract.expiry.isoformat() if is_option else None,
-        opt_strike=contract.strike if is_option else None,
-        opt_right=contract.right if is_option else None,
+        # Spread rows: opt_* identify the LONG leg (the close path and the
+        # audit trail carry the short leg separately).
+        opt_expiry=(
+            contract.expiry.isoformat()
+            if is_option
+            else chain.spread.long_leg.expiry.isoformat()
+            if is_spread
+            else None
+        ),
+        opt_strike=(
+            contract.strike
+            if is_option
+            else chain.spread.long_leg.strike
+            if is_spread
+            else None
+        ),
+        opt_right=(
+            contract.right
+            if is_option
+            else chain.spread.long_leg.right
+            if is_spread
+            else None
+        ),
     )
     session.add(order)
-    portfolio.cash -= cost
+    if is_short_stock:
+        portfolio.cash += quantity * fill - commission  # short proceeds
+    else:
+        portfolio.cash -= cost
     portfolio.updated_at = utcnow()
     if is_option:
         # §12.1: the premium is fully at risk — max_loss is the whole debit
@@ -1698,6 +1474,48 @@ async def _approve_order_locked(
             opt_strike=contract.strike,
             opt_right=contract.right,
             multiplier=OPTION_MULTIPLIER,
+        )
+    elif is_spread:
+        # Defined risk (§12.1): max_loss = the whole NET debit; stop_distance
+        # stores the per-share net fill — the §11.3 premium-stop basis ON THE
+        # NET. opt_* = long leg; short_* = short leg (migration 015).
+        spread = chain.spread
+        position = Position(
+            ticker=ticker,
+            instrument=chain.instrument,
+            quantity=quantity,
+            avg_price=fill,
+            max_loss=quantity * fill * OPTION_MULTIPLIER,
+            stop_distance=fill,
+            entry_edge=chain.edge,
+            entry_bar_date=chain.last_bar_date,
+            status=POSITION_OPEN,
+            opt_expiry=spread.long_leg.expiry.isoformat(),
+            opt_strike=spread.long_leg.strike,
+            opt_right=spread.long_leg.right,
+            multiplier=OPTION_MULTIPLIER,
+            short_occ_symbol=occ_option_symbol(
+                ticker,
+                spread.short_leg.expiry,
+                spread.short_leg.strike,
+                spread.short_leg.right,
+            ),
+            short_strike=spread.short_leg.strike,
+        )
+    elif is_short_stock:
+        # §12.1 Phase 3: heat carries the GAP-inflated risk the chain sized
+        # from; stop_distance stays the per-share 2×ATR — the exit engine
+        # mirrors it ABOVE entry for the BEAR direction.
+        position = Position(
+            ticker=ticker,
+            instrument=InstrumentType.SHORT_STOCK.value,
+            quantity=quantity,
+            avg_price=fill,
+            max_loss=quantity * chain.stop_distance * SHORT_STOCK_GAP_RISK_FACTOR,
+            stop_distance=chain.stop_distance,
+            entry_edge=chain.edge,
+            entry_bar_date=chain.last_bar_date,
+            status=POSITION_OPEN,
         )
     else:
         position = Position(
@@ -1723,7 +1541,7 @@ async def _approve_order_locked(
         details={
             "ticker": ticker,
             "instrument": order.instrument,
-            "side": BUY_TO_OPEN,
+            "side": order.side,
             "quantity_requested": req.quantity,
             "client_order_id": req.client_order_id,
         },
@@ -1738,6 +1556,30 @@ async def _approve_order_locked(
             "multiplier": OPTION_MULTIPLIER,
             "slippage_bps": settings.paper_slippage_bps,
             "commission_per_contract": settings.paper_commission_per_contract,
+        }
+    elif is_spread:
+        submitted_details = {
+            "fill_model": (
+                "paper: NET debit * (1 + slippage_bps/10000) per share; "
+                "cash = qty * net_fill * 100 + 2-leg commission"
+            ),
+            "net_debit_mid": chain.spread.net_debit,
+            "long_leg_mid": chain.spread.long_leg.mid,
+            "short_leg_mid": chain.spread.short_leg.mid,
+            "short_occ_symbol": position.short_occ_symbol,
+            "multiplier": OPTION_MULTIPLIER,
+            "slippage_bps": settings.paper_slippage_bps,
+            "commission_per_contract": settings.paper_commission_per_contract,
+        }
+    elif is_short_stock:
+        submitted_details = {
+            "fill_model": (
+                "paper: last stored close * (1 - slippage_bps/10000) — a "
+                "short SELL fills lower; cash CREDITED qty*fill - commission"
+            ),
+            "last_close": chain.entry_price,
+            "slippage_bps": settings.paper_slippage_bps,
+            "commission_per_share": settings.paper_commission_per_share,
         }
     else:
         submitted_details = {
@@ -1780,9 +1622,11 @@ async def _approve_order_locked(
             # Stock: underlying stop. Options: honest null — the §11.3 stop
             # is premium-based and reported by the position monitor.
             "stop_price": (
-                position.avg_price - position.stop_distance
-                if not is_option
-                else None
+                None
+                if is_option or is_spread
+                else position.avg_price + position.stop_distance
+                if is_short_stock
+                else position.avg_price - position.stop_distance
             ),
             "max_loss": position.max_loss,
             "contract": _contract_payload(position),
@@ -1795,14 +1639,15 @@ async def _approve_order_locked(
 # Real broker execution (plan §11) — the BUY_TO_OPEN half.
 # ---------------------------------------------------------------------------
 
-# The 422 message for an instrument with no broker representation. LONG_STOCK,
-# LONG_CALL and LONG_PUT all execute at the broker (options as OCC symbols on
-# the same endpoint); anything else does not exist in this long-only platform
-# (§5) and is refused rather than approximated.
+# The 422 message for an instrument with no broker representation.
+# LONG_STOCK, LONG_CALL, LONG_PUT, the defined-risk verticals (mleg) and the
+# Phase 3 margin-backed SHORT_STOCK all execute at the broker; anything else
+# (the naked shorts, forever) is refused rather than approximated.
 BROKER_INSTRUMENT_UNSUPPORTED = (
-    "{instrument} cannot be executed at the broker: this platform is long-only "
-    "(§5) and submits LONG_STOCK, LONG_CALL and LONG_PUT. The §8 matrix "
-    "selected {instrument} for {ticker}."
+    "{instrument} cannot be executed at the broker: this platform submits "
+    "LONG_STOCK, LONG_CALL, LONG_PUT, defined-risk verticals and "
+    "margin-backed SHORT_STOCK (§5). The §8 matrix selected {instrument} "
+    "for {ticker}."
 )
 
 
@@ -1840,8 +1685,13 @@ async def _approve_via_broker(
     would happily fill — and our cash figure is precisely the number
     reconciliation exists to check, so it is the wrong thing to arbitrate on.
 
-    Commits its own transaction — the chain's RISK_DECISION, the order row, any
-    position and every ORDER_* audit event land together (rule 12).
+    Commits in TWO transactions (§11 lifecycle): T1 — the chain's
+    RISK_DECISION, the ORDER_REQUESTED audit and the order row in
+    PENDING_SUBMIT — lands BEFORE the submit leaves the process, so a crash
+    mid-submit leaves a durable row the order-sync sweep can resolve against
+    the broker by client_order_id. T2 — the settled row, any position/cash
+    mutation and the outcome ORDER_* audits — lands together after the broker
+    answers (rule 12 per state change).
     """
     ticker = req.ticker
 
@@ -1850,9 +1700,54 @@ async def _approve_via_broker(
     # in this long-only platform (§5) and is refused before submission, with
     # the veto's RISK_DECISION still auditable.
     contract = chain.contract
-    if contract is None:
+    spread = chain.spread
+    mleg_legs: list[BrokerOrderLeg] | None = None
+    stock_short = chain.instrument == InstrumentType.SHORT_STOCK.value
+    if contract is None and spread is None and stock_short:
+        # Phase 3: SELL_TO_OPEN the ticker itself — the dedicated
+        # margin-attested adapter method; Alpaca enforces locate/HTB and
+        # maintenance margin on its side.
+        broker_symbol = ticker
+        instrument = InstrumentType.SHORT_STOCK.value
+    elif contract is None and spread is None:
         broker_symbol = ticker
         instrument = InstrumentType.LONG_STOCK.value
+    elif spread is not None and chain.instrument in (
+        InstrumentType.BULL_CALL_SPREAD.value,
+        InstrumentType.BEAR_PUT_SPREAD.value,
+    ):
+        # Roadmap Phase 1: one ATOMIC mleg order — the adapter's shape guard
+        # revalidates the defined-risk pair before any I/O.
+        instrument = chain.instrument
+        try:
+            long_sym = occ_option_symbol(
+                ticker,
+                spread.long_leg.expiry,
+                spread.long_leg.strike,
+                spread.long_leg.right,
+            )
+            short_sym = occ_option_symbol(
+                ticker,
+                spread.short_leg.expiry,
+                spread.short_leg.strike,
+                spread.short_leg.right,
+            )
+        except ValueError as exc:
+            await session.commit()
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": (
+                        f"cannot build OCC symbols for the {ticker} spread: {exc}"
+                    ),
+                    "preview": chain.preview,
+                },
+            ) from exc
+        broker_symbol = f"{long_sym}/{short_sym}"
+        mleg_legs = [
+            BrokerOrderLeg(symbol=long_sym, side=BUY_TO_OPEN),
+            BrokerOrderLeg(symbol=short_sym, side=SELL_TO_OPEN),
+        ]
     elif chain.instrument in (
         InstrumentType.LONG_CALL.value,
         InstrumentType.LONG_PUT.value,
@@ -1901,7 +1796,7 @@ async def _approve_via_broker(
             # The exact string sent to the broker — for an option this is the
             # OCC symbol, so the audit trail identifies the actual contract.
             "broker_symbol": broker_symbol,
-            "side": BUY_TO_OPEN,
+            "side": SELL_TO_OPEN if stock_short else BUY_TO_OPEN,
             "quantity_requested": req.quantity,
             "quantity_submitted": quantity,
             "client_order_id": client_order_id,
@@ -1909,19 +1804,89 @@ async def _approve_via_broker(
         },
     )
 
+    # §11 lifecycle: the local order row exists BEFORE the submit leaves the
+    # process, committed durably (T1) with the request audit and the chain's
+    # RISK_DECISION. If we crash mid-submit, this row — findable at the broker
+    # by its client_order_id — is what the order-sync sweep resolves, instead
+    # of an invisible broker order. fill_price 0.0 / filled_quantity 0 are
+    # honest ("nothing filled yet"), never placeholders.
+    order = Order(
+        client_order_id=client_order_id,
+        ticker=ticker,
+        instrument=instrument,
+        # opt_* identify WHICH contract trades; None for stock. Without these
+        # the position could not later be closed at the broker (the close path
+        # rebuilds the OCC symbol from exactly these three fields).
+        opt_expiry=(
+            contract.expiry.isoformat()
+            if contract is not None
+            else spread.long_leg.expiry.isoformat()
+            if spread is not None
+            else None
+        ),
+        opt_strike=(
+            contract.strike
+            if contract is not None
+            else spread.long_leg.strike
+            if spread is not None
+            else None
+        ),
+        opt_right=(
+            contract.right
+            if contract is not None
+            else spread.long_leg.right
+            if spread is not None
+            else None
+        ),
+        side=SELL_TO_OPEN if stock_short else BUY_TO_OPEN,
+        quantity=quantity,
+        fill_price=0.0,
+        commission=0.0,
+        status=PENDING_SUBMIT,
+        filled_quantity=0,
+        # Approval-time risk context (migration 010): a fill that arrives
+        # AFTER this request returned (surfaced by the order-sync sweep) must
+        # open the position with the §10 chain's own parameters, so they are
+        # captured here while the chain still exists.
+        stop_distance=chain.stop_distance,
+        entry_edge=chain.edge,
+        entry_bar_date=chain.last_bar_date,
+    )
+    session.add(order)
+    await session.flush()
+    await session.commit()
+
     try:
-        broker_order, adopted = await submit_and_poll(
-            broker, client_order_id, broker_symbol, BUY_TO_OPEN, quantity
-        )
+        if mleg_legs is not None:
+            broker_order, adopted = await submit_mleg_and_poll(
+                broker, client_order_id, mleg_legs, quantity
+            )
+        elif stock_short:
+            # The attestation names the §10 chain audit that sized this
+            # short — the adapter refuses an unattested call outright.
+            broker_order, adopted = await submit_stock_short_and_poll(
+                broker,
+                client_order_id,
+                broker_symbol,
+                quantity,
+                margin_attested_by=f"gate-chain:{client_order_id}",
+            )
+        else:
+            broker_order, adopted = await submit_and_poll(
+                broker, client_order_id, broker_symbol, BUY_TO_OPEN, quantity
+            )
     except BrokerRejected as exc:
-        # A business rejection: the broker's answer was "no". Audited with the
-        # broker's own reason, no position, no cash movement.
+        # A business rejection: the broker's answer was "no". The PENDING_SUBMIT
+        # row settles to REJECTED — a terminal, audited state — with no
+        # position and no cash movement.
+        order.status = "REJECTED"
+        order.broker_status = "rejected_at_submit"
         await audit.record(
             session,
             actor_type=ActorType.SYSTEM,
             action=AuditAction.ORDER_REJECTED,
             entity_type="order",
-            entity_id=client_order_id,
+            entity_id=str(order.id),
             details={
                 "ticker": ticker,
                 "client_order_id": client_order_id,
@@ -1939,22 +1904,24 @@ async def _approve_via_broker(
         ) from exc
     except BrokerError as exc:
         # A FAULT, not a decision: the order may or may not exist at the
-        # broker. We must not claim either. Nothing local is written beyond the
-        # request audit, and reconciliation is the backstop.
+        # broker. We must not claim either, so the row STAYS PENDING_SUBMIT —
+        # the order-sync sweep looks it up at the broker by client_order_id
+        # and settles it to whatever actually happened.
         await audit.record(
             session,
             actor_type=ActorType.SYSTEM,
             action=AuditAction.ORDER_SUBMITTED,
             entity_type="order",
-            entity_id=client_order_id,
+            entity_id=str(order.id),
             details={
                 "ticker": ticker,
                 "client_order_id": client_order_id,
                 "error": str(exc),
                 "outcome": (
                     "broker call FAILED — the order may or may not exist at "
-                    "the broker; no local row was written. Reconcile with "
-                    "GET /api/broker/reconcile."
+                    "the broker; the local row stays PENDING_SUBMIT and the "
+                    "order-sync sweep (or GET /api/broker/reconcile) resolves "
+                    "it against the broker by client_order_id."
                 ),
             },
         )
@@ -1965,8 +1932,9 @@ async def _approve_via_broker(
                 "code": "BROKER_ERROR",
                 "message": (
                     f"the broker call failed: {exc}. The order may or may not "
-                    "have reached the broker — nothing was recorded locally; "
-                    "reconcile before retrying."
+                    "have reached the broker — the local order row stays "
+                    "PENDING_SUBMIT until the order-sync sweep resolves it; "
+                    "do not blindly retry."
                 ),
             },
         ) from exc
@@ -1974,31 +1942,61 @@ async def _approve_via_broker(
     filled = broker_order.filled_quantity
     fill_price = broker_order.filled_avg_price
 
-    order = Order(
-        client_order_id=client_order_id,
-        ticker=ticker,
-        instrument=instrument,
-        # opt_* identify WHICH contract traded; None for stock. Without these
-        # the position could not later be closed at the broker (the close path
-        # rebuilds the OCC symbol from exactly these three fields).
-        opt_expiry=contract.expiry.isoformat() if contract is not None else None,
-        opt_strike=contract.strike if contract is not None else None,
-        opt_right=contract.right if contract is not None else None,
-        side=BUY_TO_OPEN,
-        quantity=quantity,
-        # No modelled price EVER lands here: an unfilled order's fill_price is
-        # 0.0 because nothing was paid, not because we guessed.
-        fill_price=fill_price if fill_price is not None else 0.0,
-        # Commission is whatever the broker charged. Alpaca paper charges none
-        # and reports none, so claiming the internal per-share model's number
-        # would be inventing a cost that was not incurred.
-        commission=0.0,
-        status=broker_order.status,
-        broker_order_id=broker_order.broker_order_id or None,
-        broker_status=broker_order.raw_status[:24] if broker_order.raw_status else None,
-        filled_quantity=filled,
+    if filled > 0 and fill_price is None:
+        # PRICE-PENDING FILL (broker eventual consistency: filled_qty can
+        # populate before filled_avg_price). The fill CANNOT be applied — no
+        # price means no honest cash debit — so NOTHING is recorded as
+        # applied: filled_quantity stays 0 (the order-sync sweep's
+        # incremental delta measures against what was APPLIED, not what was
+        # reported) and the local status is forced NON-terminal even if the
+        # broker already says "filled", so the sweep keeps watching and
+        # applies the fill the moment the price populates.
+        order.status = "ACCEPTED"
+        order.broker_order_id = broker_order.broker_order_id or None
+        order.broker_status = (
+            broker_order.raw_status[:24] if broker_order.raw_status else None
+        )
+        await session.flush()
+        await audit.record(
+            session,
+            actor_type=ActorType.SYSTEM,
+            action=AuditAction.ORDER_SUBMITTED,
+            entity_type="order",
+            entity_id=str(order.id),
+            details={
+                "outcome": (
+                    f"broker reports {filled} filled but no average price "
+                    "yet — the fill is NOT applied (no price, no cash "
+                    "movement, no position) and the row stays non-terminal; "
+                    "the order-sync sweep applies it once the broker "
+                    "publishes the price"
+                ),
+                "venue": get_settings().broker_provider,
+                **broker_order_details(broker_order, adopted=adopted),
+            },
+        )
+        await session.commit()
+        return {
+            "order": _order_payload(order),
+            "position": None,
+            "preview": chain.preview,
+        }
+
+    # Settle the PENDING_SUBMIT row to what the broker actually did (§11).
+    # No modelled price EVER lands here: an unfilled order's fill_price stays
+    # 0.0 because nothing was paid, not because we guessed. Commission is
+    # whatever the broker charged (Alpaca paper: none) — never the internal
+    # model's number. INVARIANT: filled_quantity/fill_price record what has
+    # been APPLIED to cash and positions (the branch below applies it in the
+    # same transaction) — the order-sync sweep's delta arithmetic depends on
+    # this never diverging.
+    order.fill_price = fill_price if fill_price is not None else 0.0
+    order.status = broker_order.status
+    order.broker_order_id = broker_order.broker_order_id or None
+    order.broker_status = (
+        broker_order.raw_status[:24] if broker_order.raw_status else None
     )
-    session.add(order)
+    order.filled_quantity = filled
     await session.flush()
 
     await audit.record(
@@ -2044,27 +2042,61 @@ async def _approve_via_broker(
         # cash and max loss both carry the multiplier. For a long option the
         # premium paid IS the max loss (§12.1); for stock it is the stop
         # distance per share.
-        multiplier = 100 if contract is not None else 1
+        is_option_like = contract is not None or spread is not None
+        multiplier = 100 if is_option_like else 1
         cost = filled * fill_price * multiplier
-        portfolio = await get_or_create_portfolio(session)
-        portfolio.cash -= cost
-        portfolio.updated_at = utcnow()
+        # Phase 3 short stock: heat carries the GAP-inflated stop risk the
+        # chain sized from (§12.1); a short's premium-free max_loss is
+        # unbounded in principle, so the stop-based estimate is the honest
+        # heat number, inflated for gap risk.
+        short_stock_max_loss = (
+            filled * (chain.stop_distance or 0.0) * SHORT_STOCK_GAP_RISK_FACTOR
+        )
+        # NO LOCAL CASH LEDGER in broker mode: the debit happened in the REAL
+        # account at the broker; the platform stores no copy of it. For a
+        # spread, fill_price is the broker-reported NET debit per share.
         position = Position(
             ticker=ticker,
             instrument=instrument,
             quantity=filled,
             avg_price=fill_price,
             multiplier=multiplier,
-            opt_expiry=contract.expiry.isoformat() if contract is not None else None,
-            opt_strike=contract.strike if contract is not None else None,
-            opt_right=contract.right if contract is not None else None,
-            max_loss=(
-                cost if contract is not None else filled * (chain.stop_distance or 0.0)
+            opt_expiry=(
+                contract.expiry.isoformat()
+                if contract is not None
+                else spread.long_leg.expiry.isoformat()
+                if spread is not None
+                else None
             ),
-            # For options this is the per-share premium basis the §11.3
-            # premium stop measures against, not an underlying stop.
+            opt_strike=(
+                contract.strike
+                if contract is not None
+                else spread.long_leg.strike
+                if spread is not None
+                else None
+            ),
+            opt_right=(
+                contract.right
+                if contract is not None
+                else spread.long_leg.right
+                if spread is not None
+                else None
+            ),
+            short_occ_symbol=(
+                broker_symbol.split("/")[1] if spread is not None else None
+            ),
+            short_strike=spread.short_leg.strike if spread is not None else None,
+            max_loss=(
+                cost
+                if is_option_like
+                else short_stock_max_loss
+                if stock_short
+                else filled * (chain.stop_distance or 0.0)
+            ),
+            # For options/spreads this is the per-share (net) premium basis
+            # the §11.3 premium stop measures against.
             stop_distance=(
-                fill_price if contract is not None else (chain.stop_distance or 0.0)
+                fill_price if is_option_like else (chain.stop_distance or 0.0)
             ),
             entry_edge=chain.edge,
             entry_bar_date=chain.last_bar_date,
@@ -2072,6 +2104,9 @@ async def _approve_via_broker(
         )
         session.add(position)
         await session.flush()
+        # Link the order to the position it opened (migration 010): further
+        # fills found by the order-sync sweep land on THIS position row.
+        order.position_id = position.id
         await audit.record(
             session,
             actor_type=ActorType.SYSTEM,
@@ -2085,7 +2120,9 @@ async def _approve_via_broker(
                 "partial": filled < quantity,
                 "commission": 0.0,
                 "position_id": position.id,
-                "cash_debited": cost,
+                # For a Phase 3 short the broker CREDITED the proceeds;
+                # either way the real account holds the truth (§14).
+                ("cash_credited" if stock_short else "cash_debited"): cost,
                 **broker_order_details(broker_order, adopted=adopted),
             },
         )
@@ -2122,7 +2159,11 @@ async def _approve_via_broker(
                 "instrument": position.instrument,
                 "quantity": position.quantity,
                 "avg_price": position.avg_price,
-                "stop_price": position.avg_price - position.stop_distance,
+                "stop_price": (
+                    position.avg_price + position.stop_distance
+                    if stock_short
+                    else position.avg_price - position.stop_distance
+                ),
                 "max_loss": position.max_loss,
                 "contract": None,
             }
@@ -2198,12 +2239,41 @@ async def _close_position_locked(
             ),
         )
 
+    # Phase 2 collateral law: shares pinned under OPEN covered calls cannot
+    # be sold — buy the call back first. Only the FREE portion may close.
+    if position.instrument == InstrumentType.LONG_STOCK.value:
+        pinned = (
+            (
+                await session.execute(
+                    select(func.coalesce(func.sum(Position.quantity), 0)).where(
+                        Position.collateral_position_id == position.id,
+                        Position.status == POSITION_OPEN,
+                        Position.instrument == InstrumentType.COVERED_CALL.value,
+                    )
+                )
+            ).scalar_one()
+            * 100
+        )
+        free = position.quantity - pinned
+        if pinned > 0 and quantity > free:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"{pinned} of {position.quantity} {ticker} shares are "
+                    "pinned as covered-call collateral — buy back the open "
+                    f"covered call(s) first, or close at most {free} free "
+                    "share(s)."
+                ),
+            )
+
     # The reference price is the INTERNAL fill model's input. On the broker
     # path there is nothing to reference — the broker sets the price — so it is
     # neither computed nor required (0.0 is passed and ignored downstream).
     reference, source = 0.0, "broker fill (no reference price used)"
     if simulated_broker_mode():
-        if is_option_position(position):
+        if is_spread_position(position):
+            reference, source = await spread_close_reference(session, position)
+        elif is_option_position(position):
             reference, source = await option_close_reference(session, position)
         else:
             reference = await _last_stored_close(session, ticker)

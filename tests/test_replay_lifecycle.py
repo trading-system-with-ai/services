@@ -44,6 +44,8 @@ import math
 from datetime import datetime, timedelta, timezone
 
 import pytest
+
+from apps.gateway.execution import gate_chain
 from sqlalchemy import select
 
 from apps.gateway.db import Order, Position, SessionLocal, StockBarDaily
@@ -170,10 +172,23 @@ async def test_replay_lifecycle(client, monkeypatch):
     settings = get_settings()
     monkeypatch.setattr(settings, "paper_commission_per_share", 0.0)
     monkeypatch.setattr(settings, "paper_commission_per_contract", 0.0)
-    monkeypatch.setattr(orders_router, "MAX_BAR_AGE_DAYS", 100_000)
+    monkeypatch.setattr(gate_chain, "MAX_BAR_AGE_DAYS", 100_000)
 
     bars = build_bars()
     await authorize(client)
+
+    # This replay OWNS the ticker's history — it advances it bar by bar. The
+    # freshness refresh (ensure_daily_bars) would see the synthetic series as
+    # "stale" against the real calendar and append stub bars on top, colliding
+    # with the replay's own upcoming dates. Pre-arming the per-symbol attempt
+    # throttle keeps the refresh a no-op for the test's lifetime.
+    from datetime import datetime as _dt, timezone as _tz
+
+    from apps.gateway.routers import analysis as analysis_router
+
+    monkeypatch.setitem(
+        analysis_router._refresh_attempts, TICKER, _dt.now(_tz.utc)
+    )
 
     # Seed the pre-replay history in one shot; the ticker now has stored
     # bars, so no lazy backfill can ever overwrite the synthetic series.

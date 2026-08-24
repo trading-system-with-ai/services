@@ -29,10 +29,14 @@ name, no URL and no setting in this package that reaches live trading.
 """
 from typing import Callable
 
-from .provider import (  # noqa: F401
+from .provider import (
+    BrokerOrderLeg,  # noqa: F401
     BROKER_NOT_CONFIGURED_MESSAGE,
     BUY_TO_OPEN,
+    BUY_TO_CLOSE,  # noqa: F401
+    MLEG_LEG_SIDES,  # noqa: F401
     ORDER_SIDES,
+    SELL_TO_OPEN,  # noqa: F401
     ORDER_STATUSES,
     SELL_TO_CLOSE,
     BrokerAccount,

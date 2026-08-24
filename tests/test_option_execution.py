@@ -17,6 +17,8 @@ import math
 from datetime import datetime, timedelta, timezone
 
 import pytest
+
+from apps.gateway.execution import gate_chain
 from sqlalchemy import select, update
 
 from apps.gateway.db import Order, Position, SessionLocal
@@ -140,11 +142,17 @@ async def test_preview_bull_low_vol_selects_long_call_with_contract_sizing(clien
     contract = proposed["contract"]
     assert contract is not None
     assert set(contract) == {
+        "option_symbol",
         "expiry",
         "dte",
         "strike",
         "right",
+        "bid",
+        "ask",
         "mid",
+        "spread_pct",
+        "open_interest",
+        "volume",
         "delta",
         "iv",
         "multiplier",
@@ -154,6 +162,16 @@ async def test_preview_bull_low_vol_selects_long_call_with_contract_sizing(clien
     assert contract["multiplier"] == 100
     assert contract["mid"] > 0
     assert contract["max_loss_per_contract"] == pytest.approx(contract["mid"] * 100)
+    # §25: the live quote around the mid, and the exact broker-addressable
+    # OCC symbol, both server-built — the UI reconstructs nothing.
+    assert contract["bid"] <= contract["mid"] <= contract["ask"]
+    assert contract["spread_pct"] >= 0
+    symbol = contract["option_symbol"]
+    # Compact OCC (2026-08-17 fix): ROOT + yymmdd + C/P + 8-digit strike —
+    # length varies with the root (15 + len(root)).
+    assert len(symbol) == 15 + len(CALL_TICKER)
+    assert symbol[len(CALL_TICKER) + 6] == "C"
+    assert symbol.startswith(CALL_TICKER)
     # §9.1 defaults: the candidate sits inside the DTE window.
     assert 30 <= contract["dte"] <= 90
 
@@ -206,18 +224,29 @@ async def test_preview_bear_direction_override_selects_put_or_no_trade(client):
     assert "override" in gate(body, "DIRECTIONAL_SIGNAL")["detail"]
 
 
-async def test_preview_vol_caused_no_trade_fails_volatility_gate(client):
-    """VOLATILITY FAILs ONLY when vol alone turns the §8 cell into NO_TRADE:
-    "GE" deterministically reads BEAR/MODERATE with HIGH vol — the
-    'Higher-delta Long Put / No Trade' cell — while the same
-    direction/strength under NORMAL vol would trade (LONG_PUT)."""
-    await authorize(client, "GE")
-    body = await preview(client, "GE")
+async def test_preview_vol_caused_no_trade_fails_volatility_gate(client, monkeypatch):
+    """VOLATILITY FAILs ONLY when vol alone turns the §8 cell into NO_TRADE.
+
+    "PLTR" deterministically reads BEAR/MODERATE (-55.6, MILD_BEAR) at the
+    anchored stub date under the §6 grouped weights (v1); the documented
+    VOL_REGIME_PARAMS seam then forces the HIGH verdict (any ATM IV >= 0.01
+    reads HIGH, nothing reads EXTREME), landing the 'Higher-delta Long Put /
+    No Trade' cell — while the same direction/strength under NORMAL vol
+    would trade (LONG_PUT)."""
+    from libs.trading_core.volatility import VolRegimeParams
+
+    from apps.gateway.routers import orders as orders_router
+
+    monkeypatch.setattr(gate_chain, "VOL_REGIME_PARAMS",
+        VolRegimeParams(low_iv=0.001, high_iv=0.01, extreme_iv=99.0),
+    )
+    await authorize(client, "PLTR")
+    body = await preview(client, "PLTR")
 
     vol_gate = gate(body, "VOLATILITY")
     assert vol_gate["status"] == "FAIL", (
         "stub no longer yields the BEAR/MODERATE/HIGH vol-caused NO_TRADE "
-        f"cell for GE — re-pick the ticker. Preview: {body['proposed']}, "
+        f"cell for PLTR — re-pick the ticker. Preview: {body['proposed']}, "
         f"gate: {vol_gate}"
     )
     assert "NO_TRADE" in vol_gate["detail"]
@@ -234,7 +263,7 @@ async def test_preview_vol_caused_no_trade_fails_volatility_gate(client):
     assert body["why_not_trade"]
 
     # §42: the vetoed cell may never fill.
-    r = await approve(client, "GE")
+    r = await approve(client, "JPM")
     assert r.status_code == 422
     assert await db_orders() == []
 

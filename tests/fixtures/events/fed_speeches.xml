@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Trimmed reproduction of https://www.federalreserve.gov/feeds/speeches.xml -->
+<rss version="2.0">
+  <channel>
+    <title>FRB: Speeches</title>
+    <link>https://www.federalreserve.gov/newsevents/speeches.htm</link>
+    <description>Speeches by members of the Board of Governors</description>
+    <language>en-us</language>
+    <item>
+      <title>Chair Jerome H. Powell: Economic Outlook and Monetary Policy</title>
+      <link>https://www.federalreserve.gov/newsevents/speech/powell20260821a.htm</link>
+      <description>At the Jackson Hole Economic Policy Symposium, Jackson Hole, Wyoming</description>
+      <pubDate>Fri, 21 Aug 2026 10:00:00 -0400</pubDate>
+      <guid>https://www.federalreserve.gov/newsevents/speech/powell20260821a.htm</guid>
+    </item>
+    <item>
+      <title>Vice Chair Philip N. Jefferson: The Labor Market and Price Stability</title>
+      <link>https://www.federalreserve.gov/newsevents/speech/jefferson20260826a.htm</link>
+      <description>At the National Association for Business Economics, Chicago, Illinois</description>
+      <pubDate>Wed, 26 Aug 2026 14:30:00 -0400</pubDate>
+      <guid>https://www.federalreserve.gov/newsevents/speech/jefferson20260826a.htm</guid>
+    </item>
+    <item>
+      <title>Governor Michelle W. Bowman: Bank Supervision and Regulation</title>
+      <link>https://www.federalreserve.gov/newsevents/speech/bowman20260902a.htm</link>
+      <description>At the Community Banking Research Conference, St. Louis, Missouri</description>
+      <pubDate>Wed, 02 Sep 2026 09:15:00 -0400</pubDate>
+      <guid>https://www.federalreserve.gov/newsevents/speech/bowman20260902a.htm</guid>
+    </item>
+    <item>
+      <title>An item with no colon in the title at all</title>
+      <link>https://www.federalreserve.gov/newsevents/speech/other20260903a.htm</link>
+      <description>Remarks with no speaker prefix</description>
+      <pubDate>Thu, 03 Sep 2026 12:00:00 -0400</pubDate>
+    </item>
+    <item>
+      <title>Governor Lisa D. Cook: Undated Remarks</title>
+      <link>https://www.federalreserve.gov/newsevents/speech/cook20260904a.htm</link>
+      <description>An item whose pubDate is missing entirely</description>
+    </item>
+  </channel>
+</rss>

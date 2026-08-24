@@ -262,18 +262,21 @@ async def test_position_missing_locally_is_reported_and_pauses(monkeypatch):
         assert await trading_enabled(client) is False
 
 
-async def test_cash_mismatch_beyond_tolerance_is_reported(monkeypatch):
+async def test_cash_is_never_compared_because_no_copy_exists(monkeypatch):
+    """THE PLATFORM STORES NO COPY OF CASH (user rule: the account is the
+    broker's), so there is nothing for cash to disagree WITH: reconciliation
+    reports local cash as null and never emits a CASH_MISMATCH — the position
+    ledger is what it compares."""
     ledger = FakeLedger([], cash=LOCAL_CASH - 5_000.0)
     async with _client(monkeypatch, ledger) as client:
-        await seed_local([], cash=LOCAL_CASH)
+        await seed_local([], cash=LOCAL_CASH)  # a stale row changes nothing
 
         body = (await client.get("/api/broker/reconcile")).json()
 
-        (mismatch,) = [m for m in body["mismatches"] if m["kind"] == MISMATCH_CASH]
-        assert mismatch["symbol"] is None
-        assert mismatch["broker"] == pytest.approx(LOCAL_CASH - 5_000.0)
-        assert mismatch["local"] == pytest.approx(LOCAL_CASH)
-        assert await trading_enabled(client) is False
+        assert body["local"]["cash"] is None
+        assert [m for m in body["mismatches"] if m["kind"] == MISMATCH_CASH] == []
+        assert body["in_sync"] is True
+        assert await trading_enabled(client) is True
 
 
 async def test_mismatch_does_not_auto_correct_either_ledger(monkeypatch):
@@ -313,12 +316,47 @@ async def test_repeated_reconcile_stays_paused_and_keeps_reporting(monkeypatch):
         assert len(await kill_switch_events(client)) == 2
 
 
-async def test_option_positions_do_not_manufacture_a_mismatch(monkeypatch):
-    """Option rows can only come from the simulator (options are not wired at
-    the broker), so they must not be compared against broker stock positions."""
-    ledger = FakeLedger([broker_position("AAPL", 10)])
+async def test_option_positions_reconcile_by_occ_symbol(monkeypatch):
+    """Options are broker-executed (§30.13): a local option position compares
+    against the broker's holding of the SAME OCC contract symbol — matching
+    quantity is in_sync, an absent contract is a real MISSING_AT_BROKER."""
+    occ = "MSFT260918C00400000"
+
+    def option_row():
+        return Position(
+            ticker="MSFT",
+            instrument="LONG_CALL",
+            quantity=2,
+            avg_price=3.5,
+            max_loss=700.0,
+            stop_distance=3.5,
+            entry_edge=0.4,
+            entry_bar_date="2026-08-07",
+            opt_expiry="2026-09-18",
+            opt_strike=400.0,
+            opt_right="C",
+            multiplier=100,
+        )
+
+    # Broker holds the same contract, same quantity -> in sync.
+    ledger = FakeLedger([broker_position("AAPL", 10), broker_position(occ, 2)])
     async with _client(monkeypatch, ledger) as client:
         await seed_local([("AAPL", 10)])
+        async with SessionLocal() as s:
+            s.add(option_row())
+            await s.commit()
+
+        body = (await client.get("/api/broker/reconcile")).json()
+        assert body["in_sync"] is True
+        assert await trading_enabled(client) is True
+
+
+async def test_option_position_missing_at_broker_is_a_mismatch(monkeypatch):
+    """The inverse: a local option long the broker does not hold pauses
+    trading like any other divergence — an option fill that never landed at
+    the broker is exactly the §18 failure reconciliation exists to catch."""
+    ledger = FakeLedger([])
+    async with _client(monkeypatch, ledger) as client:
         async with SessionLocal() as s:
             s.add(
                 Position(
@@ -339,9 +377,11 @@ async def test_option_positions_do_not_manufacture_a_mismatch(monkeypatch):
             await s.commit()
 
         body = (await client.get("/api/broker/reconcile")).json()
-
-        assert body["in_sync"] is True
-        assert await trading_enabled(client) is True
+        assert body["in_sync"] is False
+        kinds = {m["kind"] for m in body["mismatches"]}
+        assert "MISSING_AT_BROKER" in kinds
+        assert any(m["symbol"] == "MSFT260918C00400000" for m in body["mismatches"])
+        assert await trading_enabled(client) is False  # §18 kill switch fired
 
 
 # ===========================================================================

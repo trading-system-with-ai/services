@@ -134,7 +134,7 @@ def test_no_look_ahead_equity_prefix_identical():
 def test_uptrend_produces_trade_and_positive_return():
     result = run_short(make_bars(uptrend_closes()))
     assert len(result.trades) >= 1
-    full = result.metrics["full"]
+    full = result.metrics
     assert full.num_trades >= 1
     assert full.total_return_pct > 0.0
     assert full.exposure_pct > 0.0
@@ -150,20 +150,19 @@ def test_downtrend_and_flat_series_produce_no_trades_with_null_metrics():
     for closes in (downtrend, flat):
         result = run_short(make_bars(closes))
         assert result.trades == []
-        for segment in ("full", "in_sample", "out_of_sample"):
-            m = result.metrics[segment]
-            assert m.num_trades == 0
-            assert m.win_rate is None
-            assert m.profit_factor is None
-            assert m.expectancy_pct is None
-            assert m.avg_trade_pct is None
-            assert m.avg_hold_bars is None
-            assert m.exposure_pct == 0.0
-            assert m.total_return_pct == 0.0
+        m = result.metrics
+        assert m.num_trades == 0
+        assert m.win_rate is None
+        assert m.profit_factor is None
+        assert m.expectancy_pct is None
+        assert m.avg_trade_pct is None
+        assert m.avg_hold_bars is None
+        assert m.exposure_pct == 0.0
+        assert m.total_return_pct == 0.0
         # Flat equity: zero-variance daily returns => Sharpe/Sortino are None,
         # never a division blow-up.
-        assert result.metrics["full"].sharpe is None
-        assert result.metrics["full"].sortino is None
+        assert result.metrics.sharpe is None
+        assert result.metrics.sortino is None
         assert all(value == INITIAL_EQUITY for value in result.equity)
 
 
@@ -229,7 +228,7 @@ def test_raising_slippage_never_increases_total_return():
     bars = make_bars(uptrend_closes())
     returns = [
         run_short(bars, BacktestParams(warmup_bars=25, slippage_bps=bps))
-        .metrics["full"]
+        .metrics
         .total_return_pct
         for bps in (0.0, 5.0, 50.0, 200.0)
     ]
@@ -240,7 +239,7 @@ def test_raising_commission_never_increases_total_return():
     bars = make_bars(uptrend_closes())
     returns = [
         run_short(bars, BacktestParams(warmup_bars=25, commission_per_share=c))
-        .metrics["full"]
+        .metrics
         .total_return_pct
         for c in (0.0, 0.005, 0.05, 0.5)
     ]
@@ -324,26 +323,18 @@ def test_long_only_invariant_no_shorting_no_negative_cash():
                 "END_OF_DATA"
             )
         assert min(result.equity) > 0.0
-        assert 0.0 <= result.metrics["full"].exposure_pct <= 100.0
+        assert 0.0 <= result.metrics.exposure_pct <= 100.0
 
 
-def test_in_sample_out_of_sample_segmentation():
-    """OOS boundary = floor(n * oos_split); trades belong to the segment of
-    their ENTRY bar; the engine only reports the OOS segment, it never
-    optimizes on it (plan §44 rule 16)."""
+def test_metrics_cover_the_full_period_only():
+    """IS/OOS segmentation was removed 2026-08-16 (user decision: manual-only
+    tuning until ML-driven parameter search exists). One flat metrics object
+    over the whole series; no oos fields anywhere on the result."""
     bars = make_bars(wavy_closes(400))
     result = run_short(bars)
-    boundary = math.floor(400 * SHORT_PARAMS.oos_split)
-    assert result.oos_start_date == bars[0][boundary]
-    assert set(result.metrics) == {"full", "in_sample", "out_of_sample"}
-    m = result.metrics
-    assert m["in_sample"].num_trades + m["out_of_sample"].num_trades == m["full"].num_trades
-    assert m["in_sample"].num_trades == sum(
-        1 for t in result.trades if t.entry_index < boundary
-    )
-    assert m["out_of_sample"].num_trades == sum(
-        1 for t in result.trades if t.entry_index >= boundary
-    )
+    assert result.metrics.num_trades == len(result.trades)
+    assert not hasattr(result, "oos_start_date")
+    assert not hasattr(BacktestParams(), "oos_split")
 
 
 # ---------------------------------------------------------------------------
@@ -362,9 +353,8 @@ def test_default_params_match_the_v1_schema():
         p.atr_trail_k,
         p.time_stop_bars,
         p.min_move_atr,
-        p.oos_split,
         p.warmup_bars,
-    ) == (1.0, 0.005, 5.0, 25.0, 10.0, 3.0, 20, 1.0, 0.7, 200)
+    ) == (1.0, 0.005, 5.0, 25.0, 10.0, 3.0, 20, 1.0, 200)
 
 
 @pytest.mark.parametrize(
@@ -378,8 +368,6 @@ def test_default_params_match_the_v1_schema():
         {"atr_trail_k": 0.0},
         {"time_stop_bars": 0},
         {"min_move_atr": -0.5},
-        {"oos_split": 0.0},
-        {"oos_split": 1.0},
         {"warmup_bars": 0},
     ],
 )
@@ -432,9 +420,9 @@ def test_fill_model_monotonicity_optimistic_conservative_worst():
     for result in results.values():
         assert result.trades, "the wavy series must produce trades"
 
-    r_opt = results["OPTIMISTIC"].metrics["full"].total_return_pct
-    r_con = results["CONSERVATIVE"].metrics["full"].total_return_pct
-    r_wor = results["WORST"].metrics["full"].total_return_pct
+    r_opt = results["OPTIMISTIC"].metrics.total_return_pct
+    r_con = results["CONSERVATIVE"].metrics.total_return_pct
+    r_wor = results["WORST"].metrics.total_return_pct
     assert r_opt > r_con > r_wor
 
     # The decision path is price-driven, not equity-driven, so the FIRST
@@ -542,4 +530,137 @@ def test_fill_model_conservative_regression_bit_identical_to_default():
     assert trade.entry_price == pytest.approx(opens[26] * (1.0 + slip), rel=1e-12)
     assert trade.exit_price == pytest.approx(
         opens[trade.exit_index] * (1.0 - slip), rel=1e-12
+    )
+
+
+# ---------------------------------------------------------------------------
+# Live-parity exits (user mandate 2026-08-16: backtest and live must run the
+# same exit logic). The engine now calls libs.trading_core.exits.evaluate_exit
+# directly; HARD_STOP is the live §11.3 / §12.1 rule: stop fixed at entry at
+# ATR_STOP_MULTIPLE * atr14, never widened.
+# ---------------------------------------------------------------------------
+
+
+def test_hard_stop_fires_like_live_on_a_crash_through_the_entry_stop():
+    """A sharp crash right after entry must exit via HARD_STOP (priority 1,
+    before ATR_TRAIL): 2×ATR below ENTRY is tighter than 3×ATR below PEAK
+    while peak ≈ entry."""
+    # Entry decision at bar 25 (warmup), fill at the open of 26. Crash TWO
+    # bars later, while price still sits near the entry: -20% lands far below
+    # entry - 2*ATR (a 1%/day uptrend keeps ATR tiny relative to a 20% gap)
+    # and the stop is tighter than the 3*ATR trail while peak ≈ entry.
+    closes = uptrend_closes(28)
+    closes = closes + [closes[-1] * 0.80, closes[-1] * 0.79, closes[-1] * 0.78]
+    result = run_short(make_bars(closes))
+    assert result.trades, "the uptrend must have entered before the crash"
+    crash_exit = result.trades[-1]
+    assert crash_exit.exit_reason.startswith("HARD_STOP"), crash_exit.exit_reason
+    # The reason carries the live engine's real numbers (§38 explainability).
+    assert "stop" in crash_exit.exit_reason and "breached" in crash_exit.exit_reason
+
+
+def test_stop_sizing_uses_the_shared_live_constant():
+    """§12.1 single source of truth: the engine sizes stops off the SAME
+    ATR_STOP_MULTIPLE the live gate chain imports — not a private copy."""
+    from libs.trading_core.risk.engine import ATR_STOP_MULTIPLE as risk_multiple
+    from libs.trading_core.backtest.engine import ATR_STOP_MULTIPLE as bt_multiple
+    from apps.gateway.routers.orders import ATR_STOP_MULTIPLE as live_multiple
+
+    assert bt_multiple is risk_multiple
+    assert live_multiple is risk_multiple
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 (2026-08-17): run_short_stock_backtest — the exact bear mirror.
+# ---------------------------------------------------------------------------
+
+from libs.trading_core.backtest import run_short_stock_backtest  # noqa: E402
+
+SHORT_STOCK_PARAMS = BacktestParams(warmup_bars=25, instrument="SHORT_STOCK")
+
+
+def run_short_stock(bars, params: BacktestParams = SHORT_STOCK_PARAMS):
+    return run_short_stock_backtest(
+        *bars,
+        params,
+        regime_params=SHORT_REGIME,
+        directional_params=SHORT_DIRECTION,
+    )
+
+
+def downtrend_closes(n: int = 80) -> list[float]:
+    return [100.0 * 0.99**i for i in range(n)]
+
+
+def test_short_stock_downtrend_produces_trade_and_positive_return():
+    result = run_short_stock(make_bars(downtrend_closes()))
+    assert result.trades, "a clean downtrend must produce at least one short"
+    total_pnl = sum(t.pnl for t in result.trades)
+    assert total_pnl > 0.0
+    # Equity bookkeeping identity: final equity = initial + Σ pnl (all
+    # positions covered by END_OF_DATA, liability marked at the final close).
+    assert result.equity[-1] == pytest.approx(INITIAL_EQUITY + total_pnl)
+    walk_assert_finite(result)
+
+
+def test_short_stock_uptrend_and_flat_produce_no_trades():
+    """The bear mirror of the long engine's no-trade honesty: a rising or
+    flat series never triggers a short entry (§44 rule 18)."""
+    flat = [100.0] * 80
+    for closes in (uptrend_closes(), flat):
+        result = run_short_stock(make_bars(closes))
+        assert result.trades == []
+        assert result.equity[-1] == pytest.approx(INITIAL_EQUITY)
+
+
+def test_short_stock_hard_stop_mirrors_above_entry():
+    """A short opened into a downtrend that violently REVERSES exits on the
+    mirrored hard stop (close >= entry + stop_distance)."""
+    down = [100.0 * 0.985**i for i in range(32)]
+    # One violent +30% gap bar while the edge is still strongly bear — the
+    # priority-1 stop must fire before SIGNAL_DECAY can see the reversal.
+    closes = down + [down[-1] * 1.30] + [
+        down[-1] * 1.30 * 1.02**i for i in range(1, 6)
+    ]
+    result = run_short_stock(make_bars(closes, spread=0.3))
+    assert result.trades, "the downtrend leg must open a short first"
+    stopped = [t for t in result.trades if "HARD_STOP" in t.exit_reason]
+    assert stopped, [t.exit_reason for t in result.trades]
+    # The mirrored relation is named in the reason (engine's rel_hit ">=").
+    assert ">=" in stopped[0].exit_reason
+    # The stop loss is a LOSS: exit above entry.
+    assert stopped[0].exit_price > stopped[0].entry_price
+    assert stopped[0].pnl < 0.0
+
+
+def test_short_stock_no_look_ahead_closed_trades_identical():
+    closes = [
+        100.0 * (0.997**i) * (1.0 + 0.05 * math.sin(i / 8.0)) for i in range(400)
+    ]
+    full = run_short_stock(make_bars(closes))
+    trunc = run_short_stock(make_bars(closes[:300]))
+    closed_before_300 = [t for t in full.trades if t.exit_index < 299]
+    for a, b in zip(closed_before_300, trunc.trades):
+        assert a == b
+
+
+def test_short_stock_proceeds_are_credited_then_debited_back():
+    """Hand-check the cash mechanics on the first trade: the short SELL
+    credits qty*(fill - commission); the cover debits qty*(fill + commission);
+    pnl = qty*(entry - exit) - both commissions."""
+    result = run_short_stock(make_bars(downtrend_closes()))
+    t = result.trades[0]
+    params = SHORT_STOCK_PARAMS
+    expected_pnl = (
+        t.shares * (t.entry_price - t.exit_price)
+        - t.shares * params.commission_per_share
+        - (
+            t.shares * params.commission_per_share
+            if "END_OF_DATA" not in t.exit_reason
+            else 0.0
+        )
+    )
+    assert t.pnl == pytest.approx(expected_pnl)
+    assert t.return_pct == pytest.approx(
+        expected_pnl / (t.shares * t.entry_price) * 100.0
     )

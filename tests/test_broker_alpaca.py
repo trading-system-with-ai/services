@@ -329,7 +329,10 @@ def test_non_positive_quantity_is_refused():
         ("filled", "FILLED"),
         ("rejected", "REJECTED"),
         ("canceled", "CANCELED"),
-        ("pending_cancel", "CANCELED"),
+        # A cancel REQUEST is not a cancel: the order is still live at the
+        # broker and can still fill, so it must stay non-terminal and in the
+        # order-sync sweep's watch (the raw status is preserved alongside).
+        ("pending_cancel", "ACCEPTED"),
         ("expired", "EXPIRED"),
     ],
 )
@@ -711,3 +714,260 @@ def test_registry_has_no_live_alpaca_entry():
     from libs.broker import _BROKERS
 
     assert all("live" not in name for name in _BROKERS)
+
+
+# ---------------------------------------------------------------------------
+# MLEG (roadmap Phase 1): atomic defined-risk verticals. THE SHAPE GUARD IS
+# THE §5 SAFETY BOUNDARY — sell-to-open can only exist covered inside the
+# pair, validated BEFORE any network I/O.
+# ---------------------------------------------------------------------------
+from libs.broker import BrokerOrderLeg
+from libs.broker.provider import BUY_TO_CLOSE, SELL_TO_OPEN
+
+LONG_OCC = "AAPL260918C00335000"
+SHORT_OCC = "AAPL260918C00350000"
+
+
+def open_legs() -> list[BrokerOrderLeg]:
+    return [
+        BrokerOrderLeg(symbol=LONG_OCC, side="BUY_TO_OPEN"),
+        BrokerOrderLeg(symbol=SHORT_OCC, side=SELL_TO_OPEN),
+    ]
+
+
+def _mleg_payload(**overrides) -> dict:
+    payload = _order_payload(
+        symbol=None,
+        legs=[
+            _order_payload(symbol=LONG_OCC, side="buy", filled_qty="2",
+                           filled_avg_price="7.60", qty="2"),
+            _order_payload(symbol=SHORT_OCC, side="sell", filled_qty="2",
+                           filled_avg_price="3.10", qty="2"),
+        ],
+        status="filled",
+        filled_qty="2",
+    )
+    payload.update(overrides)
+    return payload
+
+
+def test_mleg_submits_atomic_order_with_correct_intents():
+    calls = []
+    bodies = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path == "/v2/account":
+            return httpx.Response(200, json=PAPER_ACCOUNT)
+        import json as _json
+        bodies.append(_json.loads(request.content))
+        return httpx.Response(200, json=_mleg_payload())
+
+    order = _broker(handler).submit_mleg_order(CLIENT_ORDER_ID, open_legs(), 2)
+    body = bodies[0]
+    assert body["order_class"] == "mleg"
+    assert body["qty"] == "2"
+    intents = {leg["symbol"]: leg["position_intent"] for leg in body["legs"]}
+    assert intents == {LONG_OCC: "buy_to_open", SHORT_OCC: "sell_to_open"}
+    sides = {leg["symbol"]: leg["side"] for leg in body["legs"]}
+    assert sides == {LONG_OCC: "buy", SHORT_OCC: "sell"}
+    # One BrokerOrder for the whole spread: joined symbol, NET fill.
+    assert order.symbol == f"{LONG_OCC}/{SHORT_OCC}"
+    assert order.filled_avg_price == pytest.approx(7.60 - 3.10)
+    assert order.filled_quantity == 2
+
+
+def test_mleg_net_fill_is_none_until_every_leg_fills():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2/account":
+            return httpx.Response(200, json=PAPER_ACCOUNT)
+        payload = _mleg_payload(status="partially_filled")
+        payload["legs"][1]["filled_avg_price"] = None
+        payload["legs"][1]["filled_qty"] = "0"
+        return httpx.Response(200, json=payload)
+
+    order = _broker(handler).submit_mleg_order(CLIENT_ORDER_ID, open_legs(), 2)
+    assert order.filled_avg_price is None  # half-filled net = invented number
+
+
+def _shape_guard_broker():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2/account":
+            return httpx.Response(200, json=PAPER_ACCOUNT)
+        raise AssertionError("shape guard must reject BEFORE any order POST")
+
+    return _broker(handler)
+
+
+def test_mleg_shape_guard_rejects_every_illegal_pair():
+    b = _shape_guard_broker()
+    # A lone sell-to-open (the §5 nightmare) has no vocabulary here.
+    with pytest.raises(ValueError, match="exactly TWO legs"):
+        b.submit_mleg_order(CLIENT_ORDER_ID, [BrokerOrderLeg(SHORT_OCC, SELL_TO_OPEN)], 1)
+    # Two sell-to-opens: not a defined-risk pair.
+    with pytest.raises(ValueError, match="mleg pair must be"):
+        b.submit_mleg_order(
+            CLIENT_ORDER_ID,
+            [BrokerOrderLeg(LONG_OCC, SELL_TO_OPEN), BrokerOrderLeg(SHORT_OCC, SELL_TO_OPEN)],
+            1,
+        )
+    # Call vertical with the short strike BELOW the long: uncovered.
+    with pytest.raises(ValueError, match="short strike must be ABOVE"):
+        b.submit_mleg_order(
+            CLIENT_ORDER_ID,
+            [BrokerOrderLeg(SHORT_OCC, "BUY_TO_OPEN"), BrokerOrderLeg(LONG_OCC, SELL_TO_OPEN)],
+            1,
+        )
+    # Cross-expiry legs: not a vertical.
+    with pytest.raises(ValueError, match="SAME underlying, expiry and"):
+        b.submit_mleg_order(
+            CLIENT_ORDER_ID,
+            [
+                BrokerOrderLeg(LONG_OCC, "BUY_TO_OPEN"),
+                BrokerOrderLeg("AAPL261016C00350000", SELL_TO_OPEN),
+            ],
+            1,
+        )
+    # Non-1:1 ratio.
+    with pytest.raises(ValueError, match="1:1"):
+        b.submit_mleg_order(
+            CLIENT_ORDER_ID,
+            [
+                BrokerOrderLeg(LONG_OCC, "BUY_TO_OPEN", ratio=2),
+                BrokerOrderLeg(SHORT_OCC, SELL_TO_OPEN),
+            ],
+            1,
+        )
+    # Close pair is legal shape-wise (SELL_TO_CLOSE long + BUY_TO_CLOSE short)
+    # but a LIVE (non-paper) account is still refused by layer 2:
+    def live_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2/account":
+            return httpx.Response(200, json=LIVE_ACCOUNT)
+        raise AssertionError("live account must never see an order")
+
+    with pytest.raises(BrokerError, match="NOT a paper account"):
+        _broker(live_handler).submit_mleg_order(
+            CLIENT_ORDER_ID,
+            [
+                BrokerOrderLeg(LONG_OCC, "SELL_TO_CLOSE"),
+                BrokerOrderLeg(SHORT_OCC, BUY_TO_CLOSE),
+            ],
+            1,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: collateral-attested short open + dedicated buyback (OCC-gated —
+# short STOCK remains unconstructable through every path).
+# ---------------------------------------------------------------------------
+
+
+def test_short_open_requires_collateral_attestation_and_occ_symbol():
+    b = _shape_guard_broker()
+    with pytest.raises(ValueError, match="covered_by"):
+        b.submit_short_open_order(CLIENT_ORDER_ID, SHORT_OCC, 1, covered_by="")
+    with pytest.raises(ValueError, match="OCC OPTION symbol"):
+        b.submit_short_open_order(CLIENT_ORDER_ID, "AAPL", 1, covered_by="pos-7")
+    with pytest.raises(ValueError, match="OCC OPTION symbol"):
+        b.submit_short_close_order(CLIENT_ORDER_ID, "AAPL", 1)
+
+
+def test_short_open_and_buyback_wire_shape():
+    import json as _json
+    bodies = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2/account":
+            return httpx.Response(200, json=PAPER_ACCOUNT)
+        bodies.append(_json.loads(request.content))
+        return httpx.Response(
+            200,
+            json=_order_payload(symbol=SHORT_OCC, side=bodies[-1]["side"], status="accepted"),
+        )
+
+    broker = _broker(handler)
+    broker.submit_short_open_order(CLIENT_ORDER_ID, SHORT_OCC, 2, covered_by="position:41")
+    assert bodies[-1]["side"] == "sell"
+    assert bodies[-1]["position_intent"] == "sell_to_open"
+    assert bodies[-1]["qty"] == "2"
+    broker.submit_short_close_order(CLIENT_ORDER_ID + "x", SHORT_OCC, 2)
+    assert bodies[-1]["side"] == "buy"
+    assert bodies[-1]["position_intent"] == "buy_to_close"
+
+
+def test_short_open_refused_on_live_account():
+    def live_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2/account":
+            return httpx.Response(200, json=LIVE_ACCOUNT)
+        raise AssertionError("live account must never see an order")
+
+    with pytest.raises(BrokerError, match="NOT a paper account"):
+        _broker(live_handler).submit_short_open_order(
+            CLIENT_ORDER_ID, SHORT_OCC, 1, covered_by="position:41"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: margin-attested STOCK short + cover (stock-gated — the exact
+# mirror: a naked short OPTION remains unconstructable through every path).
+# ---------------------------------------------------------------------------
+
+
+def test_stock_short_requires_margin_attestation_and_stock_symbol():
+    b = _shape_guard_broker()
+    with pytest.raises(ValueError, match="margin_attested_by"):
+        b.submit_stock_short_order(CLIENT_ORDER_ID, "AAPL", 1, margin_attested_by="")
+    # The mirror gate: an OCC OPTION symbol here would be a NAKED short
+    # option — refused with the charter named, forever.
+    with pytest.raises(ValueError, match="naked short options"):
+        b.submit_stock_short_order(
+            CLIENT_ORDER_ID, SHORT_OCC, 1, margin_attested_by="gate-chain:x"
+        )
+    with pytest.raises(ValueError, match="not a stock symbol"):
+        b.submit_stock_cover_order(CLIENT_ORDER_ID, SHORT_OCC, 1)
+    with pytest.raises(ValueError, match="not a stock symbol"):
+        b.submit_stock_short_order(
+            CLIENT_ORDER_ID, "aapl!", 1, margin_attested_by="gate-chain:x"
+        )
+    with pytest.raises(ValueError, match="quantity"):
+        b.submit_stock_short_order(
+            CLIENT_ORDER_ID, "AAPL", 0, margin_attested_by="gate-chain:x"
+        )
+
+
+def test_stock_short_and_cover_wire_shape():
+    import json as _json
+    bodies = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2/account":
+            return httpx.Response(200, json=PAPER_ACCOUNT)
+        bodies.append(_json.loads(request.content))
+        return httpx.Response(
+            200,
+            json=_order_payload(symbol="AAPL", side=bodies[-1]["side"], status="accepted"),
+        )
+
+    broker = _broker(handler)
+    broker.submit_stock_short_order(
+        CLIENT_ORDER_ID, "AAPL", 30, margin_attested_by="gate-chain:oid-1"
+    )
+    assert bodies[-1]["side"] == "sell"
+    assert bodies[-1]["position_intent"] == "sell_to_open"
+    assert bodies[-1]["qty"] == "30"
+    assert bodies[-1]["symbol"] == "AAPL"
+    broker.submit_stock_cover_order(CLIENT_ORDER_ID + "x", "AAPL", 30)
+    assert bodies[-1]["side"] == "buy"
+    assert bodies[-1]["position_intent"] == "buy_to_close"
+
+
+def test_stock_short_refused_on_live_account():
+    def live_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2/account":
+            return httpx.Response(200, json=LIVE_ACCOUNT)
+        raise AssertionError("live account must never see an order")
+
+    with pytest.raises(BrokerError, match="NOT a paper account"):
+        _broker(live_handler).submit_stock_short_order(
+            CLIENT_ORDER_ID, "AAPL", 1, margin_attested_by="gate-chain:x"
+        )

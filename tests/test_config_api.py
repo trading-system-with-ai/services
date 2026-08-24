@@ -20,9 +20,12 @@ EXPECTED_GROUPS = {
     "risk_limits",
     "exit_params",
     "selector_params",
+    "spread_params",
     "vol_target_params",
     "regime_params",
     "directional_params",
+    "edge_classification_params",
+    "tradeability_params",
     "backtest_defaults",
     "paper_trading",
     "kill_switch",
@@ -58,13 +61,24 @@ async def test_values_match_real_dataclasses(client):
         "broker_configured": True,
     }
 
+    # ALL TEN §2 permission fields render — the four real flags at their
+    # Settings defaults AND the six display-and-refuse fields (guide §33),
+    # which must always read false: the platform has no code path for them.
     perms = AccountPermissions()
     assert body["account_permissions"] == {
         "long_stock": perms.long_stock,
         "long_call": perms.long_call,
         "long_put": perms.long_put,
         "defined_risk_spreads": perms.defined_risk_spreads,
+        "short_stock": False,
+        "naked_short_call": False,
+        "naked_short_put": False,
+        "covered_call": False,
+        "cash_secured_put": False,
+        "margin": False,
     }
+    assert (perms.long_stock, perms.long_call, perms.long_put) == (True, True, True)
+    assert perms.defined_risk_spreads is False
 
     limits = RiskLimits()
     rl = body["risk_limits"]
@@ -109,7 +123,7 @@ async def test_values_match_real_dataclasses(client):
     assert body["directional_params"]["rsi_bull_zone"] == list(d.rsi_bull_zone)
 
     bt = BacktestParams()
-    assert body["backtest_defaults"]["oos_split"] == bt.oos_split
+    assert "oos_split" not in body["backtest_defaults"]  # IS/OOS removed 2026-08-16
     assert body["backtest_defaults"]["warmup_bars"] == bt.warmup_bars
     assert body["backtest_defaults"]["entry_edge_threshold"] == bt.entry_edge_threshold
 

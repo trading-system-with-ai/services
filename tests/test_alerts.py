@@ -80,13 +80,16 @@ async def test_pause_is_critical_with_reason_then_resume_is_info(client):
 
 
 async def test_veto_preview_is_warning_naming_the_failing_gate(client):
-    """A watchlist-only (non-pool) ticker's preview vetoes at
-    TRADING_POOL_AUTHORIZATION — that RISK_DECISION IS an alert."""
+    """A watchlist-only (non-pool) ticker's APPROVE attempt vetoes at
+    TRADING_POOL_AUTHORIZATION (execution mode — research no longer gates on
+    the pool, upgrade §15) — that RISK_DECISION IS an alert."""
     r = await client.post("/api/watchlist", json={"ticker": "MSFT"})
     assert r.status_code == 201
-    r = await client.post("/api/orders/preview", json={"ticker": "MSFT"})
-    assert r.status_code == 200
-    assert r.json()["gates"][0]["status"] == "FAIL"
+    r = await client.post("/api/orders/approve", json={"ticker": "MSFT"})
+    assert r.status_code == 422
+    gates = r.json()["detail"]["preview"]["gates"]
+    assert gates[0]["name"] == "TRADING_POOL_AUTHORIZATION"
+    assert gates[0]["status"] == "FAIL"
 
     body = await alerts(client)
     risk = [a for a in body if a["action"] == "RISK_DECISION"]

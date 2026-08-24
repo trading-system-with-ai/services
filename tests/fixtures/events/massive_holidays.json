@@ -1,0 +1,8 @@
+[
+  {"date": "2026-11-26", "exchange": "NYSE", "name": "Thanksgiving", "status": "closed"},
+  {"date": "2026-11-26", "exchange": "NASDAQ", "name": "Thanksgiving", "status": "closed"},
+  {"date": "2026-11-27", "exchange": "NYSE", "name": "Thanksgiving", "status": "early-close", "open": "09:30", "close": "13:00"},
+  {"date": "2026-12-25", "exchange": "NYSE", "name": "Christmas", "status": "closed"},
+  {"date": "2027-01-01", "exchange": "NYSE", "name": "New Years Day", "status": "closed"},
+  {"date": "garbage", "exchange": "NYSE", "name": "Broken row", "status": "closed"}
+]

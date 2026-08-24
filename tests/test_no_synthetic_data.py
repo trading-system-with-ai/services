@@ -203,7 +203,10 @@ async def test_positions_listed_with_null_price_fields(unconfigured_client):
 
 
 async def test_portfolio_risk_degrades_instead_of_503(unconfigured_client):
-    """NAV/cash come from the DB, so this view answers 200 — with nulls."""
+    """This view answers 200 with honest nulls — and on a fully unconfigured
+    install there is no ACCOUNT either: with no execution venue connected,
+    every account number is null (the platform never fabricates a
+    default-cash portfolio for display), and the venue block says why."""
     await _seed_watchlisted_position()
 
     r = await unconfigured_client.get("/api/portfolio/risk")
@@ -213,50 +216,27 @@ async def test_portfolio_risk_degrades_instead_of_503(unconfigured_client):
     # The situation is stated outright, not left to be inferred from nulls.
     assert body["market_data"]["configured"] is False
     assert "MARKET_DATA_PROVIDER" in body["market_data"]["message"]
+    assert body["venue"]["configured"] is False
 
-    # NAV == cash EXACTLY: the open position contributes nothing rather than a
-    # synthetic mark. This is the numeric heart of the guarantee here.
-    assert body["nav"] == body["cash"]
-    assert body["cash_pct"] == 1.0
+    # NO VENUE -> NO ACCOUNT: every account figure is null, never a default.
+    assert body["nav"] is None
+    assert body["cash"] is None
+    assert body["cash_pct"] is None
+    assert body["portfolio_heat_pct"] is None
+    assert body["heat_state"] is None
 
     # Regime and its dependent cash floor are computed from SPY bars -> null.
     assert body["market_regime"] is None
     assert body["cash_floor_pct"] is None
 
-    (position,) = body["positions"]
-    assert position["ticker"] == TICKER
-    assert position["quantity"] == 10  # real DB fact
-    assert position["market_price"] is None
-    assert position["market_value"] is None
-    assert position["note"] == "DATA_ISSUE"
+    # The account-less payload reports no positions detail (there is no
+    # account to attribute them to for display); the rows stay in the DB.
+    assert body["positions"] == []
 
-    greeks = body["greeks"]
-    for field in (
-        "net_delta_shares",
-        "delta_adjusted_notional_usd",
-        "delta_notional_pct_nav",
-        "net_gamma",
-        "net_theta_usd_per_day",
-        "net_vega_usd",
-    ):
-        assert greeks[field] is None, f"greeks.{field} must be null when unconfigured"
-    assert greeks["breaches"] == []  # no numbers -> no breach can be claimed
-    (greeks_row,) = greeks["per_position"]
-    assert greeks_row["data_ok"] is False
-    for field in (
-        "equivalent_shares",
-        "delta_notional_usd",
-        "gamma",
-        "theta_usd_per_day",
-        "vega_usd",
-    ):
-        assert greeks_row[field] is None
-
-    # §14 vol targeting: no forecast, neutral multiplier, and it says so.
-    vol = body["vol_targeting"]
-    assert vol["forecast_vol"] is None
-    assert vol["multiplier"] == 1.0
-    assert "no market data provider is configured" in vol["note"]
+    # With no account there are no greeks and no vol-targeting read at all —
+    # honest absence, not zero-filled blocks.
+    assert body["greeks"] is None
+    assert body["vol_targeting"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +432,15 @@ ALL_PROBED_ENDPOINTS = MARKET_DATA_ENDPOINTS + LLM_ENDPOINTS + [
     ("GET", "/api/health/strategy", None),
     ("GET", "/api/positions/monitor", None),
     ("GET", "/api/alerts", None),
+    # The event registry (Catalyst Phase B). Deliberately NOT in
+    # MARKET_DATA_ENDPOINTS: its substance is stored event rows, not market
+    # data, so it answers 200 with events=[] and a capability block explaining
+    # why — a 503 would hide that explanation. It belongs HERE because the
+    # property walker is exactly the guard that matters for it: an event feed
+    # must never carry a price, a greek or an implied move it could not know.
+    ("GET", "/api/events", None),
+    ("GET", "/api/events?horizon=30d", None),
+    ("GET", "/api/events/calendar", None),
     # The broker surfaces: both must answer in the unconfigured state (they
     # are how a user finds out WHY execution refused) without inventing an
     # account, a position or a price to fill the silence.

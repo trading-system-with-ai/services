@@ -46,7 +46,7 @@ import logging
 from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from libs.common.config import get_settings
@@ -56,8 +56,10 @@ from libs.trading_core.exits import (
     PositionState,
     evaluate_exit,
     evaluate_option_exit,
+    ShortPremiumState,
+    evaluate_short_premium_exit,
 )
-from libs.trading_core.models import ActorType, AuditAction
+from libs.trading_core.models import ActorType, AuditAction, InstrumentType
 
 from .. import audit
 from ..db import Position, StockBarDaily, get_session
@@ -68,13 +70,26 @@ from ..deps import (
     market_data_configured,
     require_market_data_provider,
 )
+from .analysis import EASTERN as EASTERN_TZ
 from .options import option_chain_or_none
+# Phase D (design §8.5, spec §52): the option-row risk fields come from the
+# persisted stress run of the newest snapshot — a READ of history, so the
+# positions list stays a read view and never re-runs the catalogue.
+from ..risk_snapshot import (
+    latest_worst_scenario_per_position,
+    worst_scenario_pnl_for_key,
+)
+from libs.broker.alpaca import occ_option_symbol
+
 from .orders import (
     POSITION_OPEN,
     execute_sell_to_close,
     execution_lock,
     find_option_contract,
+    find_spread_short_leg,
     is_option_position,
+    is_short_stock_position,
+    is_spread_position,
     option_intrinsic_value,
 )
 
@@ -118,6 +133,21 @@ def _bars_held(position: Position, bars: list[StockBarDaily]) -> int:
     return sum(1 for b in bars if b.ts > entry)
 
 
+def _dte_remaining(position: Position) -> int | None:
+    """Calendar days from today to ``opt_expiry``, clamped at 0; ``None`` for
+    a row with no expiry (stock).
+
+    US-exchange trading day (EASTERN): after 20:00 ET the UTC calendar has
+    already rolled over, which made this DTE differ by one from the chain
+    paths every US evening. ONE clock for every options surface — which is
+    why this is a shared helper and not two copies of the arithmetic.
+    """
+    if not position.opt_expiry:
+        return None
+    today = datetime.now(EASTERN_TZ).date()
+    return max(0, (date.fromisoformat(position.opt_expiry) - today).days)
+
+
 def _option_live_read(
     position: Position, spot: float
 ) -> tuple[int | None, float | None]:
@@ -133,15 +163,48 @@ def _option_live_read(
     configured": ``dte`` is arithmetic on a stored expiry date and stays
     real, but no mid can be known without a chain.
     """
-    dte: int | None = None
-    if position.opt_expiry:
-        today = datetime.now(timezone.utc).date()
-        dte = max(0, (date.fromisoformat(position.opt_expiry) - today).days)
+    dte = _dte_remaining(position)
     chain = option_chain_or_none(position.ticker, spot)
+    if is_spread_position(position):
+        # Roadmap Phase 1: the spread's live mark is the NET mid — both legs
+        # must be quoted; either one missing -> honest None (the §11.3 net
+        # premium stop then reports "insufficient data").
+        if chain is None:
+            return dte, None
+        long_leg = find_option_contract(chain, position)
+        short_leg = find_spread_short_leg(chain, position)
+        if long_leg is None or short_leg is None:
+            return dte, None
+        return dte, max(long_leg.mid - short_leg.mid, 0.0)
     if chain is None:
         return dte, None
     contract = find_option_contract(chain, position)
     return dte, contract.mid if contract is not None else None
+
+
+def _option_iv0(position: Position, spot: float) -> float | None:
+    """The PROVIDER's implied vol for this position's contract, or ``None``.
+
+    Phase D §8.5 (spec §52 "Volatility sensitivity"): the same ``iv0`` the
+    stress engine anchors this position's revaluation on, read through the
+    SAME shared chain helper — so the number a user sees next to a position
+    is the number its scenario loss was computed with.
+
+    Honest nulls: no chain (no provider), a contract missing from today's
+    chain, or a feed that omits IV on this strike ⇒ ``None``, never a solved
+    or guessed vol. A spread reports its LONG leg's IV (a two-leg position
+    has no single IV; the long leg is the one whose premium is at risk) and
+    ``None`` when that leg is unquoted.
+
+    PROVENANCE: this is the vendor's IV, passed through unchanged — never an
+    internally solved one (data-source-architecture.md §12; the internally
+    calculated solver is labelled where it is used).
+    """
+    chain = option_chain_or_none(position.ticker, spot)
+    if chain is None:
+        return None
+    contract = find_option_contract(chain, position)
+    return contract.iv if contract is not None else None
 
 
 def _evaluate_open_position(
@@ -165,7 +228,10 @@ def _evaluate_open_position(
             f"no stored bars for {position.ticker} — exit rules cannot be "
             "evaluated (DATA_ISSUE)"
         )
-    is_option = is_option_position(position)
+    # Spreads ride the OPTION exit semantics on NET values (net entry debit
+    # in avg_price, net mid from the live read) — §11.3/§11.7 transfer
+    # verbatim because the net debit IS the premium at risk.
+    is_option = is_option_position(position) or is_spread_position(position)
     if is_option and position.avg_price <= 0.0:
         return None, (
             "option position has no entry premium recorded — exit rules "
@@ -195,12 +261,29 @@ def _evaluate_open_position(
         )
     else:
         underlying_entry = position.avg_price
+    # Direction mirror (2026-08-17 bug fix): a LONG_PUT / BEAR_PUT_SPREAD
+    # profits when the underlying FALLS — its signal exits fire on the
+    # OPPOSING (BULL) bias, its decay on the bear-favorable edge, and its
+    # ATR trail hangs ABOVE the running trough (the short-side standard).
+    # Before this, every winning put was SIGNAL_FLIP'd on the first sweep.
+    bear_position = position.instrument in (
+        InstrumentType.LONG_PUT.value,
+        InstrumentType.BEAR_PUT_SPREAD.value,
+        # Phase 3: a stock short profits when the underlying falls; the
+        # shared engine mirrors its hard stop ABOVE entry.
+        InstrumentType.SHORT_STOCK.value,
+    )
+    trough = min(closes_since_entry) if closes_since_entry else bars[-1].close
     state = PositionState(
         entry_price=underlying_entry,
         stop_distance=position.stop_distance,  # ignored by the option engine
         entry_edge=position.entry_edge,
         bars_held=_bars_held(position, bars),
         highest_close_since_entry=max(peak, bars[-1].close),
+        direction="BEAR" if bear_position else "BULL",
+        lowest_close_since_entry=(
+            min(trough, bars[-1].close) if bear_position else None
+        ),
     )
     closes = [b.close for b in bars]
     highs = [b.high for b in bars]
@@ -275,12 +358,35 @@ async def list_positions(
     # every OPEN row (see the docstring — real rows, null market fields).
     have_market_data = market_data_configured()
 
+    # Phase D (spec §52): the worst persisted scenario's per-leg P&L, read
+    # ONCE for the whole list. Empty when no snapshot has been built yet —
+    # every row's `worst_scenario_pnl` is then an honest null, never a 0.
+    worst_per_position, worst_scenario_name = await latest_worst_scenario_per_position(
+        session
+    )
+
     out: list[dict] = []
     for pos in positions:
         is_option = is_option_position(pos)
         contract_out = None
         if pos.opt_expiry is not None:
+            # Server-built OCC symbol (§27) — same string the broker is
+            # addressed with; null when the stored fields cannot build one.
+            try:
+                option_symbol = occ_option_symbol(
+                    pos.ticker,
+                    date.fromisoformat(pos.opt_expiry),
+                    float(pos.opt_strike),
+                    pos.opt_right or "",
+                )
+            except (TypeError, ValueError):
+                option_symbol = None
             contract_out = {
+                # Spread rows (Phase 1): the SHORT leg's identity; honest
+                # nulls for single-leg options.
+                "short_symbol": pos.short_occ_symbol,
+                "short_strike": pos.short_strike,
+                "option_symbol": option_symbol,
                 "expiry": pos.opt_expiry,
                 "strike": pos.opt_strike,
                 "right": pos.opt_right,
@@ -306,10 +412,15 @@ async def list_positions(
             "unrealized_pnl_pct": None,
             "realized_pnl": pos.realized_pnl,
             "max_loss": pos.max_loss,
-            # Stock: the fixed §11.3 underlying stop. Options: null here —
-            # the premium stop is filled from the exit-engine read below.
+            # Stock: the fixed §11.3 underlying stop — ABOVE entry for a
+            # Phase 3 short. Options: null here — the premium stop is
+            # filled from the exit-engine read below.
             "stop_price": (
-                pos.avg_price - pos.stop_distance
+                (
+                    pos.avg_price + pos.stop_distance
+                    if is_short_stock_position(pos)
+                    else pos.avg_price - pos.stop_distance
+                )
                 if pos.stop_distance > 0 and not is_option
                 else None
             ),
@@ -322,6 +433,37 @@ async def list_positions(
             "exit_status": None,
             "exit_reasons": [],
             "contract": contract_out,
+            # --- ADDITIVE (Phase D design §8.5; spec §52 "stock vs option
+            # risk display"): the option-specific risk facts, so an option
+            # row is never presented as if it were stock. All FOUR are null
+            # on a stock row — a share has no premium at risk, no expiry and
+            # no IV, and saying null is more honest than saying zero.
+            #
+            # `premium_at_risk` is the capital that CANNOT be recovered if
+            # the position expires worthless: the premium PAID for a long
+            # option (= max_loss, §12.1) and the NET DEBIT for a spread. It
+            # is a DB fact, available with or without market data.
+            # `dte` mirrors contract.dte (calendar days, Eastern clock) at
+            # the top level so §52's option panel reads one object.
+            # `iv0` is the PROVIDER's IV for this contract — the anchor the
+            # stress reprice used. `worst_scenario_pnl` is this position's
+            # own P&L (gain-positive; a loss is negative) under the worst
+            # scenario of the newest persisted snapshot, with the scenario
+            # NAMED so the number is never an anonymous figure.
+            "premium_at_risk": (
+                pos.quantity * pos.avg_price * (pos.multiplier or 1)
+                if (is_option or is_spread_position(pos)) and pos.avg_price > 0
+                else None
+            ),
+            # Calendar days to expiry on the EASTERN clock — the same one
+            # every options surface uses (see _option_live_read). Filled for
+            # spreads too, which never enter the single-leg live read.
+            "dte": _dte_remaining(pos),
+            "iv0": None,
+            "worst_scenario_pnl": worst_scenario_pnl_for_key(
+                worst_per_position, f"{pos.ticker}#{pos.id}"
+            ),
+            "worst_scenario_name": worst_scenario_name,
         }
         if pos.status == POSITION_OPEN and not have_market_data:
             # No provider configured: the row's DB facts above stand, every
@@ -346,6 +488,10 @@ async def list_positions(
                     if contract_out is not None:
                         contract_out["dte"] = dte
                         contract_out["current_mid"] = current_mid
+                    # Phase D §8.5 additive: the provider IV the stress
+                    # reprice anchored on. (`dte` is filled for EVERY
+                    # option-bearing row below, spreads included.)
+                    row["iv0"] = _option_iv0(pos, price)
                     if current_mid is not None:
                         row["market_value"] = pos.quantity * current_mid * mult
                         row["unrealized_pnl"] = (
@@ -356,6 +502,17 @@ async def list_positions(
                             row["unrealized_pnl_pct"] = pnl_pct
                             if contract_out is not None:
                                 contract_out["premium_pnl_pct"] = pnl_pct
+                elif is_short_stock_position(pos):
+                    # Phase 3: a short is a LIABILITY (negative market
+                    # value, matching the portfolio view) and its P&L
+                    # mirrors: entry − current.
+                    row["market_value"] = -pos.quantity * price
+                    row["unrealized_pnl"] = (pos.avg_price - price) * pos.quantity
+                    row["unrealized_pnl_pct"] = (
+                        (pos.avg_price - price) / pos.avg_price
+                        if pos.avg_price
+                        else None
+                    )
                 else:
                     row["market_value"] = pos.quantity * price
                     row["unrealized_pnl"] = (price - pos.avg_price) * pos.quantity
@@ -513,8 +670,98 @@ async def _run_exit_sweep_locked(session: AsyncSession) -> dict:
     failed: list[dict] = []
     for pos in positions:
         bars = await _stored_bars(session, pos.ticker)
+
+        # Phase 2 — income rows (covered call / CSP): mechanical
+        # short-premium management, then BUYBACK via the income endpoint's
+        # own logic is the human's; the sweep only SURFACES the verdict for
+        # now (auto-buyback lands with the Phase 2 unlock). Loud, not
+        # silent: the decision and reasons appear in the sweep output.
+        if pos.instrument in (
+            InstrumentType.COVERED_CALL.value,
+            InstrumentType.CASH_SECURED_PUT.value,
+        ):
+            spot = bars[-1].close if bars else None
+            mid = None
+            dte = None
+            if spot is not None:
+                dte, mid = _option_live_read(pos, spot)
+            decision = evaluate_short_premium_exit(
+                ShortPremiumState(
+                    entry_credit=pos.avg_price,
+                    current_mid=mid,
+                    dte=dte,
+                    strike=pos.opt_strike or 0.0,
+                    spot=spot,
+                    right=pos.opt_right or "C",
+                )
+            )
+            if decision.should_exit:
+                await audit.record(
+                    session,
+                    actor_type=ActorType.SYSTEM,
+                    action=AuditAction.EXIT_GENERATED,
+                    entity_type="position",
+                    entity_id=str(pos.id),
+                    details={
+                        "ticker": pos.ticker,
+                        "instrument": pos.instrument,
+                        "rule": decision.triggered_rule,
+                        "reasons": decision.reasons,
+                        "action_required": (
+                            "BUY BACK via POST /api/income/"
+                            f"{pos.id}/buyback — auto-buyback arrives with "
+                            "the Phase 2 unlock"
+                        ),
+                    },
+                )
+                failed.append(
+                    {
+                        "ticker": pos.ticker,
+                        "rule": decision.triggered_rule,
+                        "error": (
+                            "income position needs BUYBACK "
+                            f"(POST /api/income/{pos.id}/buyback)"
+                        ),
+                    }
+                )
+            else:
+                held.append({"ticker": pos.ticker, "reasons": decision.reasons})
+            continue
+
+        # Phase 2 collateral law: a stock row pinned under open covered
+        # calls cannot be auto-sold — HOLD loudly instead.
+        if pos.instrument == InstrumentType.LONG_STOCK.value:
+            pinned = (
+                (
+                    await session.execute(
+                        select(
+                            func.coalesce(func.sum(Position.quantity), 0)
+                        ).where(
+                            Position.collateral_position_id == pos.id,
+                            Position.status == POSITION_OPEN,
+                            Position.instrument
+                            == InstrumentType.COVERED_CALL.value,
+                        )
+                    )
+                ).scalar_one()
+                * 100
+            )
+            if pinned > 0:
+                held.append(
+                    {
+                        "ticker": pos.ticker,
+                        "reasons": [
+                            f"HELD: {pinned} share(s) pinned as covered-call "
+                            "collateral — the exit sweep will not sell them; "
+                            "buy back the covered call first (risk note: the "
+                            "stock exit signal is being deferred)."
+                        ],
+                    }
+                )
+                continue
+
         option_read = None
-        if is_option_position(pos) and bars:
+        if (is_option_position(pos) or is_spread_position(pos)) and bars:
             option_read = _option_live_read(pos, bars[-1].close)
         decision, why_not = _evaluate_open_position(pos, bars, option_read)
         if decision is None:
@@ -538,7 +785,23 @@ async def _run_exit_sweep_locked(session: AsyncSession) -> dict:
                 "reasons": decision.reasons,
             },
         )
-        if is_option_position(pos):
+        if is_spread_position(pos):
+            # Same reference logic as /close for spreads: live NET mid, or
+            # the documented NET-intrinsic fallback (bounded at >= 0).
+            _dte, current_net = option_read if option_read is not None else (None, None)
+            if current_net is not None:
+                reference, source = current_net, "chain net mid (long - short)"
+            else:
+                spot_ref = bars[-1].close
+                long_intr = option_intrinsic_value(pos, spot_ref)
+                short_strike = pos.short_strike or 0.0
+                if (pos.opt_right or "C") == "C":
+                    short_intr = max(spot_ref - short_strike, 0.0)
+                else:
+                    short_intr = max(short_strike - spot_ref, 0.0)
+                reference = max(long_intr - short_intr, 0.0)
+                source = "net intrinsic (leg(s) missing from today's chain)"
+        elif is_option_position(pos):
             # Same reference logic as /close: current chain mid, or the
             # documented intrinsic fallback when the contract is gone.
             _dte, current_mid = option_read if option_read is not None else (None, None)

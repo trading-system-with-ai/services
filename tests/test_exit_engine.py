@@ -133,12 +133,13 @@ def test_holding_uptrend_reports_ok_for_all_five_rules():
     assert rule_names(d) == list(RULES)
     assert all(r.startswith("OK: ") for r in d.reasons)
     assert all(any(ch.isdigit() for ch in r) for r in d.reasons)
-    # Hand-computed edge with SHORT_DIRECTION on a clean uptrend: bull side
-    # triggers 6 of 9 components (close>sma5/10/20, slope>0, macd>signal,
-    # macd>0; RSI=100 sits OUTSIDE the [50,70] bull zone, a monotonic series
-    # confirms no pivots, flat volume never expands), bear side 0:
-    # edge = 6/9*100 - 0 = 66.667.
-    assert d.current_edge == pytest.approx(200.0 / 3.0)
+    # Hand-computed edge with SHORT_DIRECTION on a clean uptrend under the §6
+    # grouped weights (v1): bull side triggers close>sma5/10/20 (SMA group,
+    # 20), slope>0 (10), macd>signal + macd>0 (MACD group, 10) = 40 of the 75
+    # total (RSI=100 sits OUTSIDE the [50,70] bull zone — 5 untriggered; a
+    # monotonic series confirms no pivots — 20; flat volume never expands —
+    # 10), bear side 0: edge = 40/75*100 - 0 = 53.333.
+    assert d.current_edge == pytest.approx(160.0 / 3.0)
     assert d.stop_price == pytest.approx(closes[20] - 10.0)
     assert d.trail_price is not None and d.trail_price < closes[-1]
     assert d.time_stop_remaining == 20 - 9 == 11
@@ -198,7 +199,9 @@ def test_signal_flip_triggers_on_bear_bias():
 
     assert d.triggered_rule == "SIGNAL_FLIP"
     assert d.should_exit is True
-    assert d.current_edge == pytest.approx(-400.0 / 9.0)
+    # Grouped weights (v1): the flipped series triggers the bear SMA group
+    # (20) + negative slope (10) = 30 of 75, bull 0 -> edge = -30/75*100.
+    assert d.current_edge == pytest.approx(-40.0)
     assert d.reasons[0].startswith("OK: HARD_STOP")
     assert "bias BEAR" in d.reasons[1]
     # Collect-all behaviour: decay and trail conditions are ALSO breached
@@ -634,7 +637,7 @@ def test_option_holding_reports_ok_for_all_six_rules():
     # stop_price reports the PREMIUM stop level for options (§11.3):
     # 2.0 * (1 - 0.45).
     assert d.stop_price == pytest.approx(1.1)
-    assert d.current_edge == pytest.approx(200.0 / 3.0)  # same live signal
+    assert d.current_edge == pytest.approx(160.0 / 3.0)  # same live signal
     assert d.time_stop_remaining == 11
 
 

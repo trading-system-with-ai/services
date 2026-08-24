@@ -713,3 +713,781 @@ def test_greek_checks_require_both_arguments():
     )
     assert only_portfolio == reference
     assert only_candidate == reference
+
+
+# ===========================================================================
+# assess_income — covered call / cash-secured put OPENS (risk-engine audit
+# §8 item 3, §10 Phase B0; spec §2, §72). Every case hand-computes the
+# approved contracts in a comment. NAV 100,000 unless stated.
+# ===========================================================================
+
+from libs.trading_core.risk import IncomeRiskRequest, assess_income  # noqa: E402
+
+
+def csp(
+    contracts: int = 1,
+    strike: float = 100.0,
+    credit: float = 2.0,
+    ticker: str = "XOM",
+) -> IncomeRiskRequest:
+    """CSP bases: risk (strike − credit) × 100, capital strike × 100."""
+    return IncomeRiskRequest(
+        ticker=ticker,
+        instrument="CASH_SECURED_PUT",
+        contracts=contracts,
+        risk_per_contract=(strike - credit) * 100,
+        capital_per_contract=strike * 100,
+    )
+
+
+def cc(contracts: int = 1, ticker: str = "XOM") -> IncomeRiskRequest:
+    """Covered call bases: risk 0 / capital 0 (stock row carries the heat)."""
+    return IncomeRiskRequest(
+        ticker=ticker,
+        instrument="COVERED_CALL",
+        contracts=contracts,
+        risk_per_contract=0.0,
+        capital_per_contract=0.0,
+    )
+
+
+def test_income_kill_switch_rejects_both_instruments():
+    for request in (csp(), cc()):
+        result = assess_income(request, snap(trading_enabled=False))
+        assert result.decision is RiskDecision.REJECT
+        assert result.reason_codes == ["KILL_SWITCH_ACTIVE"]
+        assert result.approved_quantity == 0
+        assert result.signal_strength is None
+        assert result.risk_budget_pct is None
+
+
+def test_income_heat_gate_rejects_at_threshold_even_zero_basis_cc():
+    # Heat 8,000 / 100,000 = 8.00% >= heat_reject 8% -> REJECT, even for a
+    # covered call whose own risk basis is zero (the gate is on the BOOK).
+    positions = [PositionRisk("XOM", 50_000.0, 8_000.0)]
+    result = assess_income(cc(), snap(positions=positions))
+    assert result.decision is RiskDecision.REJECT
+    assert result.reason_codes == ["HEAT_LIMIT"]
+    assert result.heat_before_pct == pytest.approx(0.08)
+
+
+def test_income_abs_trade_risk_cap_resizes_csp():
+    # NAV 1,000,000 cash 1,000,000. Strike 100 / credit 2 -> risk 9,800 per
+    # contract; abs cap 1.5% * 1,000,000 = 15,000 -> floor(15,000 / 9,800)
+    # = 1 contract. Single-name risk cap is ALSO 15,000 (same 1.5%), so it
+    # cannot bind further; capital 10,000 per contract vs 200,000 cap ok;
+    # cash floor 15% -> (1,000,000 − 150,000)/10,000 = 85 ok.
+    result = assess_income(csp(contracts=3), snap(nav=1_000_000.0, cash=1_000_000.0))
+    assert result.decision is RiskDecision.APPROVE_WITH_RESIZE
+    assert result.approved_quantity == 1
+    assert result.reason_codes == ["RESIZED_BY_ABS_TRADE_RISK_CAP"]
+    assert result.trade_risk_usd == pytest.approx(9_800.0)
+    assert result.heat_after_pct == pytest.approx(0.0098)
+    assert result.cash_after_pct == pytest.approx(0.99)
+    assert "$29,400.00" in result.explanations[0]  # 3 * 9,800 named
+    assert result.signal_strength is None and result.risk_budget_pct is None
+
+
+def test_income_abs_trade_risk_cap_zeroes_to_reject_on_small_nav():
+    # NAV 100,000: abs cap 1,500 < 9,800 per contract -> 0 -> REJECT with
+    # the bare code (not RESIZED_BY_).
+    result = assess_income(csp(contracts=1), snap())
+    assert result.decision is RiskDecision.REJECT
+    assert result.reason_codes == ["ABS_TRADE_RISK_CAP"]
+    assert result.approved_quantity == 0
+    assert result.trade_risk_usd == 0.0
+
+
+def test_income_single_name_risk_cap_binds_csp():
+    # NAV 1,000,000, XOM already carries 6,000 max loss (0.6%). Single-name
+    # cap 15,000 - 6,000 = 9,000 headroom < 9,800 -> 0. Abs cap alone would
+    # allow 1 (15,000 / 9,800). Order: abs cap first (3 -> 1, RESIZED), then
+    # single-name (1 -> 0, bare code) -> REJECT with both reasons.
+    positions = [PositionRisk("XOM", 60_000.0, 6_000.0)]
+    result = assess_income(
+        csp(contracts=3), snap(nav=1_000_000.0, cash=940_000.0, positions=positions)
+    )
+    assert result.decision is RiskDecision.REJECT
+    assert result.reason_codes == [
+        "RESIZED_BY_ABS_TRADE_RISK_CAP",
+        "SINGLE_NAME_RISK_CAP",
+    ]
+    assert result.approved_quantity == 0
+
+
+def test_income_single_name_capital_cap_binds_on_capital_basis():
+    # Small risk basis so only capital binds: strike 100 / credit 99 -> risk
+    # 100 per contract (abs cap 15,000/100 = 150 fine). NAV 1,000,000, XOM
+    # market value 195,000; capital cap 200,000 - 195,000 = 5,000 -> floor(
+    # 5,000 / 10,000) = 0 -> SINGLE_NAME_CAPITAL_CAP REJECT.
+    positions = [PositionRisk("XOM", 195_000.0, 1_000.0)]
+    result = assess_income(
+        csp(contracts=1, strike=100.0, credit=99.0),
+        snap(nav=1_000_000.0, cash=805_000.0, positions=positions),
+    )
+    assert result.decision is RiskDecision.REJECT
+    assert result.reason_codes == ["SINGLE_NAME_CAPITAL_CAP"]
+    assert "$195,000.00" in result.explanations[0]
+
+
+def test_income_bucket_cap_binds_on_risk_basis():
+    # NVDA and AMD share TECH_MEGA (bucket cap 3% = 30,000 on NAV 1,000,000).
+    # AMD carries 25,000 max loss -> bucket headroom 5,000 < 9,800 -> 0.
+    # abs cap: 15,000/9,800 = 1 (no resize for 1 requested); single-name NVDA
+    # 15,000/9,800 = 1 ok; then bucket -> 0 -> REJECT.
+    positions = [PositionRisk("AMD", 100_000.0, 25_000.0)]
+    result = assess_income(
+        csp(contracts=1, ticker="NVDA"),
+        snap(nav=1_000_000.0, cash=900_000.0, positions=positions),
+    )
+    assert result.decision is RiskDecision.REJECT
+    assert result.reason_codes == ["BUCKET_LIMIT_TECH_MEGA"]
+
+
+def test_income_heat_headroom_strictly_below_reject():
+    # NAV 1,000,000, book heat 70,200 (7.02%): headroom to 8% = 9,800 —
+    # EXACTLY one contract's risk, but heat must stay STRICTLY below 8%, so
+    # 1 contract (heat 80,000 = 8.00%) is not allowed -> 0 -> REJECT.
+    # (abs cap 15,000/9,800 = 1; single-name XOM has 0 -> 1; no bucket.)
+    positions = [PositionRisk("SPY", 500_000.0, 70_200.0)]
+    result = assess_income(
+        csp(contracts=1), snap(nav=1_000_000.0, cash=500_000.0, positions=positions)
+    )
+    assert result.decision is RiskDecision.REJECT
+    assert result.reason_codes == ["HEAT_LIMIT"]
+    # One dollar less of book heat and the contract fits: 70,199 + 9,800 =
+    # 79,999 < 80,000.
+    positions = [PositionRisk("SPY", 500_000.0, 70_199.0)]
+    result = assess_income(
+        csp(contracts=1), snap(nav=1_000_000.0, cash=500_000.0, positions=positions)
+    )
+    assert result.decision is RiskDecision.APPROVE
+    assert result.approved_quantity == 1
+    assert result.heat_after_pct == pytest.approx(0.079999)
+
+
+def test_income_cash_floor_binds_on_reservation_basis():
+    # NAV 1,000,000, STRONG_BULL floor 15% = 150,000. Usable cash 165,000 ->
+    # (165,000 − 150,000) / 10,000 = 1 contract; risk basis 100 per contract
+    # (strike 100 / credit 99) so nothing else binds for 3 requested ->
+    # RESIZED_BY_CASH_FLOOR to 1; cash after = 155,000 / 1,000,000 = 15.5%.
+    positions = [PositionRisk("SPY", 835_000.0, 1_000.0)]
+    result = assess_income(
+        csp(contracts=3, strike=100.0, credit=99.0),
+        snap(nav=1_000_000.0, cash=165_000.0, positions=positions),
+    )
+    assert result.decision is RiskDecision.APPROVE_WITH_RESIZE
+    assert result.approved_quantity == 1
+    assert result.reason_codes == ["RESIZED_BY_CASH_FLOOR"]
+    assert result.cash_after_pct == pytest.approx(0.155)
+    # A regime with a 60% floor rejects outright (165,000 < 600,000).
+    result = assess_income(
+        csp(contracts=3, strike=100.0, credit=99.0),
+        snap(
+            nav=1_000_000.0,
+            cash=165_000.0,
+            positions=positions,
+            regime=MarketRegime.STRONG_BEAR,
+        ),
+    )
+    assert result.decision is RiskDecision.REJECT
+    assert result.reason_codes == ["CASH_FLOOR"]
+
+
+def test_income_greek_breach_rejects_with_negated_short_leg():
+    # Covered call, zero bases -> only greeks can bind. The caller passes the
+    # short call's greeks NEGATED: delta −0.30 per share, spot 100, mult 100,
+    # 5 contracts -> −0.30 * 100 * 5 * 100 = −15,000 delta notional. Book
+    # delta notional −140,000 -> post −155,000; |155,000| > 150% * 100,000
+    # = 150,000 -> PORTFOLIO_DELTA_LIMIT REJECT. Theta/vega flat.
+    result = assess_income(
+        cc(contracts=5),
+        snap(),
+        portfolio_greeks=flat_greeks(delta_notional=-140_000.0),
+        new_position_greeks=candidate(
+            delta=-0.30, spot=100.0, quantity=1, instrument="COVERED_CALL"
+        ),
+    )
+    assert result.decision is RiskDecision.REJECT
+    assert result.reason_codes == ["PORTFOLIO_DELTA_LIMIT"]
+    assert "$155,000.00" in result.explanations[0]
+    # Short-premium hedges the book: book +140,000, short call −15,000 ->
+    # 125,000 -> passes.
+    result = assess_income(
+        cc(contracts=5),
+        snap(),
+        portfolio_greeks=flat_greeks(delta_notional=140_000.0),
+        new_position_greeks=candidate(
+            delta=-0.30, spot=100.0, quantity=1, instrument="COVERED_CALL"
+        ),
+    )
+    assert result.decision is RiskDecision.APPROVE
+    assert result.approved_quantity == 5
+
+
+def test_income_greek_check_needs_both_inputs():
+    reference = assess_income(cc(contracts=5), snap())
+    only_book = assess_income(
+        cc(contracts=5), snap(), portfolio_greeks=flat_greeks(delta_notional=1e9)
+    )
+    assert only_book == reference
+    assert reference.decision is RiskDecision.APPROVE
+
+
+def test_income_covered_call_zero_basis_only_kill_heat_greeks_can_bind():
+    # A covered call carries risk 0 / capital 0: with an EMPTY cash balance,
+    # a heavy same-name book and a filled bucket, every sizing clamp is
+    # skipped (nothing to divide by, nothing to add) and 7 contracts are
+    # approved with heat / cash unchanged.
+    positions = [
+        PositionRisk("NVDA", 900_000.0, 14_000.0),  # 1.4% single-name risk
+        PositionRisk("AMD", 50_000.0, 15_000.0),  # TECH_MEGA bucket 2.9%
+        PositionRisk("SPY", 50_000.0, 40_000.0),  # book heat 6.9% (< 8%)
+    ]
+    result = assess_income(
+        cc(contracts=7, ticker="NVDA"),
+        snap(nav=1_000_000.0, cash=0.0, positions=positions),
+    )
+    assert result.decision is RiskDecision.APPROVE
+    assert result.approved_quantity == 7
+    assert result.reason_codes == []
+    assert result.trade_risk_usd == 0.0
+    assert result.heat_after_pct == pytest.approx(0.069)
+    assert result.cash_after_pct == pytest.approx(0.0)
+
+
+def test_income_zero_contracts_rejects_with_reason():
+    result = assess_income(cc(contracts=0), snap())
+    assert result.decision is RiskDecision.REJECT
+    assert result.reason_codes == ["ZERO_QUANTITY_REQUESTED"]
+
+
+def test_income_request_validation():
+    with pytest.raises(ValueError):
+        assess_income(
+            IncomeRiskRequest("XOM", "LONG_CALL", 1, 100.0, 100.0), snap()
+        )
+    with pytest.raises(ValueError):
+        assess_income(
+            IncomeRiskRequest("XOM", "CASH_SECURED_PUT", 1, -1.0, 100.0), snap()
+        )
+    with pytest.raises(ValueError):
+        assess_income(
+            IncomeRiskRequest("XOM", "CASH_SECURED_PUT", 1, 100.0, -1.0), snap()
+        )
+    with pytest.raises(ValueError):
+        assess_income(
+            IncomeRiskRequest("XOM", "CASH_SECURED_PUT", -1, 100.0, 100.0), snap()
+        )
+    # Non-finite bases are refused too (a NaN basis compares False against
+    # every clamp and would otherwise skip them all — QA probe 2026-08-17).
+    for bad in (float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            assess_income(
+                IncomeRiskRequest("XOM", "CASH_SECURED_PUT", 1, bad, 100.0), snap()
+            )
+        with pytest.raises(ValueError):
+            assess_income(
+                IncomeRiskRequest("XOM", "CASH_SECURED_PUT", 1, 100.0, bad), snap()
+            )
+
+
+def test_income_thresholds_are_parameters():
+    # Raising abs_max_trade_risk to 10% lets the 100,000-NAV CSP through:
+    # 10,000 / 9,800 = 1; single-name risk also raised to 10%; heat reject
+    # raised to 12% (headroom 12,000 > 9,800; the default 8,000 would bind);
+    # capital 10,000 vs 20% cap fine; cash floor 15% -> (100,000 −
+    # 15,000)/10,000 = 8.
+    limits = RiskLimits(
+        abs_max_trade_risk=0.10, single_name_risk=0.10, heat_reject=0.12
+    )
+    result = assess_income(csp(contracts=1), snap(), limits)
+    assert result.decision is RiskDecision.APPROVE
+    assert result.approved_quantity == 1
+    assert result.trade_risk_usd == pytest.approx(9_800.0)
+
+
+def test_income_does_not_touch_assess():
+    # The additive engine leaves the reference stock case byte-identical.
+    reference = assess(req(edge=90.0), snap())
+    assert reference.approved_quantity == 1_250
+    assert reference.decision is RiskDecision.APPROVE
+
+
+def test_income_contracts_must_be_a_real_int():
+    """QA follow-up: a float or bool quantity must not flow through to
+    ``approved_quantity`` — the ledger counts whole contracts."""
+    for bad in (1.5, True, "2"):
+        with pytest.raises(ValueError):
+            assess_income(
+                IncomeRiskRequest(
+                    ticker="XOM",
+                    instrument="CASH_SECURED_PUT",
+                    contracts=bad,  # type: ignore[arg-type]
+                    risk_per_contract=9_800.0,
+                    capital_per_contract=10_000.0,
+                ),
+                snap(),
+            )
+
+
+# ---------------------------------------------------------------------------
+# Phase C (design contract §7.3) — ADDITIVE engine surface, SHADOW by default.
+#
+# Three things are pinned below and nothing else may move:
+#   1. ``assess(extra_caps=...)`` applies caller-supplied caps through the
+#      SAME clamp closure as the hard caps, AFTER the cash floor and BEFORE
+#      the greek check, recording the cap's own layer;
+#   2. ``binding_constraints`` is a TOTAL mapping of ``reason_codes`` for
+#      EVERY decision of BOTH pipelines;
+#   3. with default arguments nothing changed at all — a battery of 200+
+#      seeded calls must produce byte-identical decisions.
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass  # noqa: E402
+
+from libs.trading_core.risk import (  # noqa: E402
+    LAYER_HARD_LIMIT,
+    BindingConstraint,
+    IncomeRiskRequest,
+    RiskAssessment,
+    assess_income,
+)
+from libs.trading_core.risk.engine import _binding_constraints  # noqa: E402
+from libs.trading_core.risk.pretrade import (  # noqa: E402
+    LAYER_CONCENTRATION,
+    LAYER_STATISTICAL,
+    QuantityCap,
+)
+
+
+# ---------------------------------------------------------------------------
+# The byte-identity battery (contract §7.3)
+#
+# The battery is a GENERATOR of engine INPUTS, not a copy of engine logic:
+# it produces seeded (request, snapshot, limits, multiplier, greeks) tuples
+# spanning every branch — kill switch, heat gate, weak signal, each cap,
+# the greek reject, the zero-quantity paths — and the test records what the
+# CURRENT engine returns for each. Because the expectations are the engine's
+# own output rather than re-derived arithmetic, the test proves exactly one
+# thing, which is the thing the contract asks for: adding ``extra_caps`` and
+# the two new fields did not perturb any default-argument decision.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Case:
+    """One battery case: the inputs of a single ``assess`` call."""
+
+    request: RiskRequest
+    snapshot: PortfolioSnapshot
+    limits: RiskLimits
+    budget_multiplier: float
+
+    def run(self, **kwargs) -> RiskAssessment:
+        return assess(
+            self.request,
+            self.snapshot,
+            self.limits,
+            budget_multiplier=self.budget_multiplier,
+            **kwargs,
+        )
+
+    def fingerprint(self, result: RiskAssessment) -> tuple:
+        """The four fields the contract requires to be byte-identical."""
+        return (
+            result.decision,
+            result.approved_quantity,
+            tuple(result.reason_codes),
+            tuple(result.explanations),
+        )
+
+
+def battery(n: int = 240, seed: int = 20260818) -> list[_Case]:
+    """Generate ``n`` seeded, deterministic ``assess`` input tuples.
+
+    Ranges are chosen so the whole decision tree is exercised: edges below
+    and above every strength threshold, heats on both sides of the reject
+    gate, cash from 0 to full NAV, every regime, positions in and out of the
+    TECH_MEGA bucket, stop distances that both do and do not divide the
+    budget, explicit requested quantities including 0, and occasional
+    non-default limits. Deterministic for a fixed seed, so the "before" and
+    "after" runs see identical inputs.
+    """
+    rng = random.Random(seed)
+    regimes = list(MarketRegime)
+    tickers = ["XOM", "NVDA", "AAPL", "KO", "QQQ"]
+    cases: list[_Case] = []
+    for i in range(n):
+        nav = rng.choice([25_000.0, 100_000.0, 250_000.0])
+        n_pos = rng.randint(0, 4)
+        positions = [
+            PositionRisk(
+                ticker=rng.choice(tickers),
+                market_value=round(rng.uniform(0.0, nav * 0.25), 2),
+                max_loss=round(rng.uniform(0.0, nav * 0.03), 2),
+            )
+            for _ in range(n_pos)
+        ]
+        request = RiskRequest(
+            ticker=rng.choice(tickers),
+            entry_price=round(rng.uniform(5.0, 400.0), 2),
+            stop_distance=round(rng.uniform(0.25, 40.0), 2),
+            edge=round(rng.uniform(-100.0, 100.0), 1),
+            quantity_requested=rng.choice([None, 0, 1, 7, 50, 5_000]),
+        )
+        snapshot = PortfolioSnapshot(
+            nav=nav,
+            cash=round(rng.uniform(0.0, nav), 2),
+            positions=positions,
+            regime=rng.choice(regimes),
+            # Every ~12th case trips the kill switch.
+            trading_enabled=(i % 12 != 0),
+        )
+        limits = (
+            RiskLimits()
+            if i % 5
+            else RiskLimits(
+                abs_max_trade_risk=round(rng.uniform(0.005, 0.05), 4),
+                single_name_risk=round(rng.uniform(0.005, 0.05), 4),
+                heat_reject=round(rng.uniform(0.02, 0.15), 4),
+            )
+        )
+        cases.append(
+            _Case(
+                request=request,
+                snapshot=snapshot,
+                limits=limits,
+                budget_multiplier=rng.choice([1.0, 0.5, 0.75, 1.5, 2.0]),
+            )
+        )
+    return cases
+
+
+def test_battery_covers_the_whole_decision_tree():
+    """The byte-identity proof is only worth as much as its coverage."""
+    results = [c.run() for c in battery()]
+    decisions = {r.decision for r in results}
+    assert decisions == {
+        RiskDecision.APPROVE,
+        RiskDecision.APPROVE_WITH_RESIZE,
+        RiskDecision.REJECT,
+    }
+    codes = {code for r in results for code in r.reason_codes}
+    # Every early-reject branch and at least the main sizing caps must fire.
+    for expected in (
+        "KILL_SWITCH_ACTIVE",
+        "SIGNAL_TOO_WEAK",
+        "RESIZED_BY_SINGLE_NAME_RISK_CAP",
+        "RESIZED_BY_CASH_FLOOR",
+    ):
+        assert expected in codes, f"battery never exercised {expected}"
+    assert len(results) >= 200
+
+
+def test_assess_with_default_arguments_is_byte_identical():
+    """Contract §7.3: ``extra_caps`` defaults to ``()`` and MUST change nothing.
+
+    The battery is run twice — once plainly and once passing the new
+    argument explicitly at its default — and the decision, approved
+    quantity, reason codes and explanations must match EXACTLY, field for
+    field, on all 240 cases. Any drift in the sizing pipeline, in a clamp
+    sentence, or in the ordering of reason codes fails here.
+    """
+    cases = battery()
+    assert len(cases) >= 200
+    plain = [c.fingerprint(c.run()) for c in cases]
+    explicit = [c.fingerprint(c.run(extra_caps=())) for c in cases]
+    assert plain == explicit
+
+    # And the reference case from the pre-Phase-C suite is untouched.
+    reference = assess(req(edge=90.0), snap())
+    assert reference.decision is RiskDecision.APPROVE
+    assert reference.approved_quantity == 1_250
+    assert reference.reason_codes == []
+
+
+def test_extra_caps_never_raise_the_quantity():
+    """A cap can only REDUCE — the statistical layer cannot grant risk."""
+    for cap_qty in (2_000, 10_000):
+        result = assess(
+            req(edge=90.0),
+            snap(),
+            extra_caps=[
+                QuantityCap(
+                    code="PORTFOLIO_ES_LIMIT",
+                    layer=LAYER_STATISTICAL,
+                    cap_qty=cap_qty,
+                    sentence="ES headroom is ample.",
+                )
+            ],
+        )
+        assert result.approved_quantity == 1_250  # unchanged
+        assert result.decision is RiskDecision.APPROVE
+        assert result.reason_codes == []
+
+
+# ---------------------------------------------------------------------------
+# extra_caps: clamp, code, layer, sentence (contract §7.3)
+# ---------------------------------------------------------------------------
+
+
+def test_extra_cap_resizes_and_records_code_layer_and_sentence():
+    # Baseline approves 1 250 shares (100 000 * 1.25% / 1.00).
+    cap = QuantityCap(
+        code="PORTFOLIO_ES_LIMIT",
+        layer=LAYER_STATISTICAL,
+        cap_qty=400,
+        sentence=(
+            "Portfolio ES-95 (1D) would be $6,200.00 (6.20% of NAV) at 1,250 "
+            "shares, above the 5.00%-of-NAV limit ($5,000.00); quantity "
+            "reduced from 1,250 to 400."
+        ),
+    )
+    result = assess(req(edge=90.0), snap(), extra_caps=[cap])
+    assert result.decision is RiskDecision.APPROVE_WITH_RESIZE
+    assert result.approved_quantity == 400
+    assert result.reason_codes == ["RESIZED_BY_PORTFOLIO_ES_LIMIT"]
+    # The cap's own sentence is recorded verbatim (audit-exact, spec §47).
+    assert result.explanations[0] == cap.sentence
+    assert result.binding_constraints == (
+        BindingConstraint("RESIZED_BY_PORTFOLIO_ES_LIMIT", LAYER_STATISTICAL),
+    )
+    assert result.requested_quantity is None  # none was requested
+
+
+def test_extra_cap_at_zero_rejects_with_the_bare_code():
+    cap = QuantityCap(
+        code="ES_CONTRIBUTION_CAP",
+        layer=LAYER_CONCENTRATION,
+        cap_qty=0,
+        sentence="XOM would hold 91.0% of ES-95 contributions; no size is safe.",
+    )
+    result = assess(req(edge=90.0), snap(), extra_caps=[cap])
+    assert result.decision is RiskDecision.REJECT
+    assert result.approved_quantity == 0
+    assert result.reason_codes == ["ES_CONTRIBUTION_CAP"]
+    assert result.binding_constraints == (
+        BindingConstraint("ES_CONTRIBUTION_CAP", LAYER_CONCENTRATION),
+    )
+
+
+def test_extra_caps_apply_in_order_and_only_the_binding_ones_are_recorded():
+    caps = [
+        QuantityCap("PORTFOLIO_ES_LIMIT", LAYER_STATISTICAL, 900, "ES caps at 900."),
+        QuantityCap("ES_CONTRIBUTION_CAP", LAYER_CONCENTRATION, 300, "RC caps at 300."),
+        # Already above the running quantity (300) — must not bind.
+        QuantityCap("INCREMENTAL_ES_CAP", LAYER_STATISTICAL, 800, "Increment caps at 800."),
+    ]
+    result = assess(req(edge=90.0), snap(), extra_caps=caps)
+    assert result.approved_quantity == 300
+    assert result.reason_codes == [
+        "RESIZED_BY_PORTFOLIO_ES_LIMIT",
+        "RESIZED_BY_ES_CONTRIBUTION_CAP",
+    ]
+    assert [bc.layer for bc in result.binding_constraints] == [
+        LAYER_STATISTICAL,
+        LAYER_CONCENTRATION,
+    ]
+
+
+def test_extra_caps_run_after_the_cash_floor_and_before_the_greeks():
+    """Contract §7.3 placement, proven by consequence rather than by reading
+    the source: the cash floor still binds first (its code comes earlier),
+    and the greek check evaluates the CAPPED quantity (the same greeks that
+    reject at 1 250 pass at 100)."""
+    # Cash 20 000 with a 15% floor on 100 000 NAV leaves 5 000 -> 500 shares
+    # at $10 entry; the statistical cap then cuts 500 to 100.
+    cash_snap = snap(cash=20_000.0)
+    caps = [QuantityCap("PORTFOLIO_ES_LIMIT", LAYER_STATISTICAL, 100, "ES caps at 100.")]
+    result = assess(req(edge=90.0), cash_snap, extra_caps=caps)
+    assert result.approved_quantity == 100
+    assert result.reason_codes == [
+        "RESIZED_BY_CASH_FLOOR",
+        "RESIZED_BY_PORTFOLIO_ES_LIMIT",
+    ]
+
+    # Greeks priced so 1 250 shares breach the delta limit but 100 do not:
+    # the limit is 150% of 100 000 = 150 000 of |delta notional|, and the
+    # candidate carries 1.0 delta x 200 spot x multiplier 1 = 200 per share.
+    book_greeks = flat_greeks()
+    cand_greeks = candidate(delta=1.0, spot=200.0, multiplier=1, quantity=1)
+    uncapped = assess(
+        req(edge=90.0), snap(),
+        portfolio_greeks=book_greeks, new_position_greeks=cand_greeks,
+    )
+    # 1 250 x 200 = 250 000 > 150 000 -> the greek check rejects.
+    assert uncapped.decision is RiskDecision.REJECT
+    assert "PORTFOLIO_DELTA_LIMIT" in uncapped.reason_codes
+
+    capped = assess(
+        req(edge=90.0), snap(),
+        portfolio_greeks=book_greeks, new_position_greeks=cand_greeks,
+        extra_caps=[QuantityCap("PORTFOLIO_ES_LIMIT", LAYER_STATISTICAL, 100, "ES caps at 100.")],
+    )
+    # 100 x 200 = 20 000 <= 150 000 -> the greek check now passes, which is
+    # only possible if the cap was applied BEFORE it.
+    assert capped.decision is RiskDecision.APPROVE_WITH_RESIZE
+    assert capped.approved_quantity == 100
+    assert "PORTFOLIO_DELTA_LIMIT" not in capped.reason_codes
+
+
+def test_a_hard_limit_still_wins_over_a_looser_statistical_cap():
+    """Spec §38: the statistical layer never softens a hard limit."""
+    result = assess(
+        req(edge=90.0),
+        snap(cash=20_000.0),  # cash floor caps at 500
+        extra_caps=[QuantityCap("PORTFOLIO_ES_LIMIT", LAYER_STATISTICAL, 900, "ES caps at 900.")],
+    )
+    assert result.approved_quantity == 500
+    assert result.reason_codes == ["RESIZED_BY_CASH_FLOOR"]
+    assert result.binding_constraints == (
+        BindingConstraint("RESIZED_BY_CASH_FLOOR", LAYER_HARD_LIMIT),
+    )
+
+
+def test_extra_caps_do_not_reach_the_early_reject_branches():
+    """A kill switch outranks everything, statistical caps included."""
+    result = assess(
+        req(edge=90.0),
+        snap(trading_enabled=False),
+        extra_caps=[QuantityCap("PORTFOLIO_ES_LIMIT", LAYER_STATISTICAL, 900, "ES caps at 900.")],
+    )
+    assert result.reason_codes == ["KILL_SWITCH_ACTIVE"]
+    assert result.binding_constraints == (
+        BindingConstraint("KILL_SWITCH_ACTIVE", LAYER_HARD_LIMIT),
+    )
+
+
+# ---------------------------------------------------------------------------
+# binding_constraints: a TOTAL mapping for every code the engine can emit
+# ---------------------------------------------------------------------------
+
+#: Every reason code either pipeline can produce (contract §7.3). Kept as an
+#: explicit list so a NEW code added to the engine without a decision about
+#: its layer fails the totality test below rather than silently defaulting.
+ALL_ENGINE_REASON_CODES = [
+    "KILL_SWITCH_ACTIVE",
+    "HEAT_LIMIT",
+    "SIGNAL_TOO_WEAK",
+    "BUDGET_TOO_SMALL",
+    "ZERO_QUANTITY_REQUESTED",
+    "ABS_TRADE_RISK_CAP",
+    "SINGLE_NAME_RISK_CAP",
+    "SINGLE_NAME_CAPITAL_CAP",
+    "BUCKET_LIMIT_TECH_MEGA",
+    "CASH_FLOOR",
+    "PORTFOLIO_DELTA_LIMIT",
+    "PORTFOLIO_THETA_LIMIT",
+    "PORTFOLIO_VEGA_LIMIT",
+]
+
+
+def test_binding_constraint_mapping_is_total_over_every_engine_code():
+    """Every code, bare and RESIZED_BY_-prefixed, maps to HARD_LIMIT."""
+    codes = ALL_ENGINE_REASON_CODES + [
+        f"RESIZED_BY_{c}" for c in ALL_ENGINE_REASON_CODES
+    ]
+    constraints = _binding_constraints(codes)
+    assert len(constraints) == len(codes)
+    assert [bc.code for bc in constraints] == codes
+    assert {bc.layer for bc in constraints} == {LAYER_HARD_LIMIT}
+
+
+def test_binding_constraint_mapping_is_total_over_unknown_codes_too():
+    """A code the mapping has never seen resolves to HARD_LIMIT — the mapping
+    can never raise, and a future Tier 0 code is a hard limit by default."""
+    assert _binding_constraints(["SOME_FUTURE_TIER_0_CODE"]) == (
+        BindingConstraint("SOME_FUTURE_TIER_0_CODE", LAYER_HARD_LIMIT),
+    )
+    assert _binding_constraints([]) == ()
+
+
+def test_binding_constraint_strips_the_resize_prefix_when_resolving_a_layer():
+    """``RESIZED_BY_<CAP>`` and ``<CAP>`` are one constraint at two severities."""
+    caps = {"PORTFOLIO_ES_LIMIT": LAYER_STATISTICAL}
+    assert _binding_constraints(["RESIZED_BY_PORTFOLIO_ES_LIMIT"], caps) == (
+        BindingConstraint("RESIZED_BY_PORTFOLIO_ES_LIMIT", LAYER_STATISTICAL),
+    )
+    assert _binding_constraints(["PORTFOLIO_ES_LIMIT"], caps) == (
+        BindingConstraint("PORTFOLIO_ES_LIMIT", LAYER_STATISTICAL),
+    )
+
+
+def test_binding_constraints_are_populated_for_every_assess_decision():
+    """Contract §7.3: 'populated for EVERY decision'. The battery checks all
+    240 cases — the constraints must mirror ``reason_codes`` one for one."""
+    for case in battery():
+        result = case.run()
+        assert [bc.code for bc in result.binding_constraints] == result.reason_codes
+        assert all(bc.layer == LAYER_HARD_LIMIT for bc in result.binding_constraints)
+        assert result.requested_quantity == case.request.quantity_requested
+
+
+def test_binding_constraints_are_populated_for_every_assess_income_decision():
+    cases = [
+        # (contracts, risk, capital, snapshot) spanning approve/resize/reject.
+        (1, 100.0, 1_000.0, snap()),
+        (50, 500.0, 2_000.0, snap()),
+        (1, 9_800.0, 10_000.0, snap()),
+        (2, 100.0, 1_000.0, snap(trading_enabled=False)),
+        (0, 100.0, 1_000.0, snap()),
+        (3, 0.0, 0.0, snap()),  # covered-call shape: both bases zero
+        (5, 200.0, 500.0, snap(cash=1_000.0)),
+        (
+            4,
+            300.0,
+            900.0,
+            snap(positions=[PositionRisk("XOM", 0.0, 8_000.0)]),
+        ),
+    ]
+    seen_decisions = set()
+    for contracts, rp, cp, snapshot in cases:
+        result = assess_income(
+            IncomeRiskRequest("XOM", "CASH_SECURED_PUT", contracts, rp, cp),
+            snapshot,
+        )
+        seen_decisions.add(result.decision)
+        assert [bc.code for bc in result.binding_constraints] == result.reason_codes
+        assert all(
+            bc.layer == LAYER_HARD_LIMIT for bc in result.binding_constraints
+        )
+        assert result.requested_quantity == contracts
+    # The set of cases really did span all three decisions.
+    assert seen_decisions == {
+        RiskDecision.APPROVE,
+        RiskDecision.APPROVE_WITH_RESIZE,
+        RiskDecision.REJECT,
+    }
+
+
+def test_requested_quantity_sits_next_to_approved_quantity():
+    """Spec §47: 'Requested: 4 contracts / Approved: 2 contracts'."""
+    result = assess(req(edge=90.0, quantity_requested=100), snap())
+    assert result.requested_quantity == 100
+    assert result.approved_quantity == 100  # budget allows 1 250; 100 requested
+
+    income = assess_income(
+        IncomeRiskRequest("XOM", "CASH_SECURED_PUT", 4, 500.0, 2_000.0), snap()
+    )
+    assert income.requested_quantity == 4
+    assert income.approved_quantity <= 4
+
+
+def test_new_risk_assessment_fields_default_so_old_construction_sites_work():
+    """Additive-only: the two fields have defaults, so every pre-Phase-C
+    construction of a ``RiskAssessment`` still type-checks and runs."""
+    a = RiskAssessment(
+        decision=RiskDecision.APPROVE,
+        approved_quantity=10,
+        signal_strength="STRONG",
+        risk_budget_pct=0.01,
+        trade_risk_usd=100.0,
+        reason_codes=[],
+        explanations=[],
+        heat_before_pct=0.01,
+        heat_after_pct=0.02,
+        cash_after_pct=0.5,
+    )
+    assert a.requested_quantity is None
+    assert a.binding_constraints == ()

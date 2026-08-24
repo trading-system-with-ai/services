@@ -219,3 +219,21 @@ __marimo__/
 
 # local dev database
 dev.db
+
+# --- open-source hardening (added before publication) -----------------------
+# Secrets: .env is already covered above; these close the remaining shapes.
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+credentials.json
+secrets.json
+# A local DB dump can contain broker/vendor API keys — the platform stores
+# runtime credentials in the `runtime_config` TABLE, not in files.
+*.sqlite
+*.sqlite3
+*.dump
+*.sql.gz
+pgdata/
+.DS_Store

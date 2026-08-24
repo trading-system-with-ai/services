@@ -12,11 +12,17 @@ INITIAL_CASH = 100_000.0
 
 CONTRACT_KEYS = {
     "as_of",
+    # The execution venue whose account this view reports (§6; account
+    # numbers are null when it is not connected).
+    "venue",
     # Honest status of the market data dependency this view degrades on rather
     # than 503s on (tests/test_no_synthetic_data.py owns the unconfigured case).
     "market_data",
     "nav",
     "cash",
+    # Σ cash_reserved over open cash-secured puts (risk-engine audit §8 item
+    # 3; additive) — tests/test_income_risk_gate.py owns its values.
+    "cash_reserved_usd",
     "cash_pct",
     "market_regime",
     "cash_floor_pct",
@@ -29,6 +35,11 @@ CONTRACT_KEYS = {
     "buckets",
     "greeks",  # §16 portfolio greeks block (tests/test_portfolio_greeks_api.py)
     "vol_targeting",  # §14 vol-targeting block (tests/test_portfolio_greeks_api.py)
+    # Risk Engine Upgrade Phase B (design contract §6), SHADOW and ADDITIVE:
+    # the statistical layer (VaR/ES/vol/contributions/model health) and the
+    # drawdown block. tests/test_risk_snapshot_api.py owns their contents.
+    "statistical",
+    "drawdown",
     "limits",
 }
 

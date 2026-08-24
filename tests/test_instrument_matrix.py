@@ -48,6 +48,17 @@ def test_default_permissions_match_plan_5():
         True,
         False,
     )
+    # The §2/§33 display-and-refuse fields default False and can never be
+    # anything else (tests/test_account_permissions.py proves construction
+    # with any of them True raises citing §33).
+    assert (
+        p.short_stock,
+        p.naked_short_call,
+        p.naked_short_put,
+        p.covered_call,
+        p.cash_secured_put,
+        p.margin,
+    ) == (False, False, False, False, False, False)
 
 
 def test_unknown_strength_string_rejected():
@@ -192,7 +203,7 @@ def test_extreme_vol_rationales():
     assert "§7" in text(bull)
     bear = select_instrument(BEAR, "STRONG", EXTREME)
     assert bear.instrument is NO_TRADE
-    assert "no short stock" in text(bear)
+    assert "short stock is not enabled" in text(bear)  # Phase 3 wording
     assert "§5" in text(bear)
 
 
@@ -271,18 +282,20 @@ def test_long_call_and_stock_off_bull_low_becomes_no_trade():
     assert "long stock not permitted" in text(d)
 
 
-def test_spreads_permitted_still_degrades_in_v1_with_honest_note():
-    """defined_risk_spreads=True cannot produce a spread in v1 —
-    InstrumentType has no spread member — so the cell still degrades, and
-    the rationale says why (honest, never silent)."""
+def test_spreads_permitted_now_emits_the_spread():
+    """SUPERSEDED 2026-08-17 (execution-chains roadmap Phase 1): spread
+    InstrumentTypes exist — defined_risk_spreads=True makes the §8 spread
+    cell emit BULL_CALL_SPREAD instead of degrading. (The live §10 chain
+    still refuses spread EXECUTION with an honest gate FAIL until the
+    multi-leg chain lands.)"""
     d = select_instrument(
         BULL,
         "STRONG",
         NORMAL,
         permissions=AccountPermissions(defined_risk_spreads=True),
     )
-    assert d.instrument is STOCK
-    assert "not implemented in v1" in text(d)
+    assert d.instrument is InstrumentType.BULL_CALL_SPREAD
+    assert d.contract_needed is True
 
 
 # ---------------------------------------------------------------------------
@@ -294,3 +307,97 @@ def test_determinism():
     a = select_instrument(BEAR, "MODERATE", NORMAL)
     b = select_instrument(BEAR, "MODERATE", NORMAL)
     assert a == b
+
+
+# ---------------------------------------------------------------------------
+# Defined-risk spreads (execution-chains roadmap Phase 1, research spine):
+# with the permission ON the §8 spread cells emit REAL spread instruments;
+# with it OFF (the default until the execution chain lands) every cell
+# degrades exactly as before — bit-identical rationale-tail behavior.
+# ---------------------------------------------------------------------------
+from libs.trading_core.strategies.instrument import AccountPermissions
+
+
+def _spreads_on() -> AccountPermissions:
+    return AccountPermissions(defined_risk_spreads=True)
+
+
+def test_spread_cells_emit_spreads_when_permitted():
+    cases = [
+        (DirectionalBias.BULL, "STRONG", IVRegime.NORMAL, InstrumentType.BULL_CALL_SPREAD),
+        (DirectionalBias.BULL, "STRONG", IVRegime.HIGH, InstrumentType.BULL_CALL_SPREAD),
+        (DirectionalBias.BEAR, "STRONG", IVRegime.NORMAL, InstrumentType.BEAR_PUT_SPREAD),
+        (DirectionalBias.BEAR, "MODERATE", IVRegime.LOW, InstrumentType.BEAR_PUT_SPREAD),
+        (DirectionalBias.BEAR, "MODERATE", IVRegime.NORMAL, InstrumentType.BEAR_PUT_SPREAD),
+        (DirectionalBias.BEAR, "MODERATE", IVRegime.HIGH, InstrumentType.BEAR_PUT_SPREAD),
+    ]
+    for direction, strength, vol, expected in cases:
+        d = select_instrument(direction, strength, vol, _spreads_on())
+        assert d.instrument is expected, (direction, strength, vol, d.instrument)
+        assert d.contract_needed is True
+        assert any("Spread" in line for line in d.rationale)
+
+
+def test_spread_cells_degrade_identically_when_not_permitted():
+    """Default permissions: same instruments as before the spreads existed."""
+    assert (
+        select_instrument(DirectionalBias.BULL, "STRONG", IVRegime.NORMAL).instrument
+        is InstrumentType.LONG_STOCK
+    )
+    assert (
+        select_instrument(DirectionalBias.BEAR, "STRONG", IVRegime.NORMAL).instrument
+        is InstrumentType.LONG_PUT
+    )
+    assert (
+        select_instrument(DirectionalBias.BEAR, "MODERATE", IVRegime.HIGH).instrument
+        is InstrumentType.NO_TRADE
+    )
+    # The degradation is spelled out (§37).
+    d = select_instrument(DirectionalBias.BULL, "STRONG", IVRegime.NORMAL)
+    assert any("spreads not permitted" in line for line in d.rationale)
+
+
+def test_extreme_vol_still_overrides_even_with_spreads_on():
+    d = select_instrument(
+        DirectionalBias.BULL, "STRONG", IVRegime.EXTREME, _spreads_on()
+    )
+    assert d.instrument is InstrumentType.LONG_STOCK
+    d = select_instrument(
+        DirectionalBias.BEAR, "STRONG", IVRegime.EXTREME, _spreads_on()
+    )
+    assert d.instrument is InstrumentType.NO_TRADE
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 (2026-08-17): SHORT_STOCK in the premium-unbuyable cells, gated on
+# BOTH short_stock and margin.
+# ---------------------------------------------------------------------------
+
+
+def test_short_stock_fills_the_premium_unbuyable_cells():
+    perms = AccountPermissions(short_stock=True, margin=True)
+    d = select_instrument(BEAR, "STRONG", EXTREME, perms)
+    assert d.instrument is InstrumentType.SHORT_STOCK
+    assert d.contract_needed is False
+    d2 = select_instrument(BEAR, "MODERATE", HIGH, perms)
+    assert d2.instrument is InstrumentType.SHORT_STOCK
+    # Spreads outrank short stock in the HIGH cell (defined risk first).
+    both = AccountPermissions(
+        short_stock=True, margin=True, defined_risk_spreads=True
+    )
+    d3 = select_instrument(BEAR, "MODERATE", HIGH, both)
+    assert d3.instrument is InstrumentType.BEAR_PUT_SPREAD
+
+
+def test_short_stock_requires_both_flags():
+    only_short = AccountPermissions(short_stock=True)
+    d = select_instrument(BEAR, "STRONG", EXTREME, only_short)
+    assert d.instrument is NO_TRADE
+    only_margin = AccountPermissions(margin=True)
+    d2 = select_instrument(BEAR, "STRONG", EXTREME, only_margin)
+    assert d2.instrument is NO_TRADE
+    # Puts stay preferred where premium is buyable: LOW vol strong bear
+    # remains LONG_PUT even with shorting fully enabled.
+    full = AccountPermissions(short_stock=True, margin=True)
+    d3 = select_instrument(BEAR, "STRONG", LOW, full)
+    assert d3.instrument is InstrumentType.LONG_PUT

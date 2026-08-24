@@ -120,13 +120,15 @@ def test_geometric_uptrend_is_bull_without_volumes():
 
 
 def test_flat_oscillation_is_neutral():
-    # 253 bars end exactly on the 100.0 midline: bull and bear evidence is
-    # symmetric, the edge is 0 and the bias is NEUTRAL.
+    # 253 bars end exactly on the 100.0 midline: neither side accumulates
+    # enough evidence to clear the bias threshold. (Exact bull==bear symmetry
+    # was an artifact of the old equal weights: DIFFERENT components trigger
+    # on each side, and §6 grouped weights value them differently — the small
+    # residual edge stays far inside the NEUTRAL band.)
     closes, highs, lows = oscillation(253)
     result = score_direction(closes, highs, lows)
     assert result.bias is DirectionalBias.NEUTRAL
-    assert result.bull_score == approx(result.bear_score)
-    assert result.directional_edge == approx(0.0)
+    assert abs(result.directional_edge) < DirectionalParams().bias_threshold / 2
 
 
 # ---------------------------------------------------------------------------
@@ -228,9 +230,19 @@ def test_determinism_identical_calls_identical_results():
     )
 
 
+# Explicit EQUAL-weight parameter set: these tests verify the scoring
+# MECHANICS (weight doubling arithmetic), which is clearest against a 1.0
+# baseline — the §6 grouped defaults are characterized elsewhere.
+EQUAL_WEIGHTS = dict(
+    weight_sma_fast=1.0, weight_sma_mid=1.0, weight_sma_slow=1.0,
+    weight_sma_slope=1.0, weight_macd_cross=1.0, weight_macd_zero=1.0,
+    weight_rsi_zone=1.0, weight_structure=1.0, weight_volume=1.0,
+)
+
+
 def test_doubling_a_triggered_weight_raises_the_score_as_expected():
     closes, highs, lows = trending_wave(259)
-    base = score_direction(closes, highs, lows)
+    base = score_direction(closes, highs, lows, params=DirectionalParams(**EQUAL_WEIGHTS))
     # Baseline: the slow-SMA bull component is triggered with weight 1.0.
     slow_bull = next(
         c for c in base.components if c.name == "close_vs_sma_slow" and c.side == "bull"
@@ -238,7 +250,8 @@ def test_doubling_a_triggered_weight_raises_the_score_as_expected():
     assert slow_bull.triggered and slow_bull.weight == 1.0
 
     doubled = score_direction(
-        closes, highs, lows, params=DirectionalParams(weight_sma_slow=2.0)
+        closes, highs, lows,
+        params=DirectionalParams(**{**EQUAL_WEIGHTS, "weight_sma_slow": 2.0}),
     )
     bull_hit = sum(c.weight for c in base.components if c.side == "bull" and c.triggered)
     bull_total = sum(c.weight for c in base.components if c.side == "bull")
@@ -253,14 +266,15 @@ def test_doubling_a_triggered_weight_raises_the_score_as_expected():
 
 def test_doubling_an_untriggered_weight_lowers_the_score_as_expected():
     closes, highs, lows = trending_wave(259)
-    base = score_direction(closes, highs, lows)
+    base = score_direction(closes, highs, lows, params=DirectionalParams(**EQUAL_WEIGHTS))
     # Baseline: RSI is overbought in this trend, so rsi_zone is untriggered
     # on both sides with weight 1.0.
     rsi_comps = [c for c in base.components if c.name == "rsi_zone"]
     assert all(not c.triggered and c.weight == 1.0 for c in rsi_comps)
 
     doubled = score_direction(
-        closes, highs, lows, params=DirectionalParams(weight_rsi_zone=2.0)
+        closes, highs, lows,
+        params=DirectionalParams(**{**EQUAL_WEIGHTS, "weight_rsi_zone": 2.0}),
     )
     bull_hit = sum(c.weight for c in base.components if c.side == "bull" and c.triggered)
     bull_total = sum(c.weight for c in base.components if c.side == "bull")

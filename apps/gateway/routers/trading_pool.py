@@ -6,7 +6,7 @@ Hard rules enforced here (development plan §4.3, rules 6 & 18):
 - only USER actions may promote/remove/toggle.
 
 Promotion readiness checks (§4.3): before a symbol enters the pool it is
-evaluated against MIN_HISTORY / BACKTEST_COMPLETED / OOS_STATS / LIQUIDITY.
+evaluated against MIN_HISTORY / BACKTEST_COMPLETED / BACKTEST_TRADES / LIQUIDITY.
 Any failure blocks with 422 UNLESS the user explicitly acknowledges the risk
 characteristics (``acknowledge_risks``) — and either way the full check
 results and the acknowledged flag land in the TRADING_POOL_ADD audit details,
@@ -18,6 +18,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from libs.trading_core.models import ActorType, AuditAction, InstrumentType
+from libs.trading_core.risk.liquidity import (
+    LiquidityLimits,
+    evaluate_underlying_liquidity,
+    liquidity_report_detail,
+)
 from libs.trading_core.signals import RegimeParams
 
 from .. import audit
@@ -52,10 +57,12 @@ PERMITTED_STRATEGIES = {
 # never a duplicated constant (plan §6.2).
 MIN_HISTORY_BARS = RegimeParams().sma_slow
 
-# §4.3 LIQUIDITY: a documented placeholder until real market data exists.
-LIQUIDITY_STUB_DETAIL = (
-    "stub data — real liquidity checks arrive with the Massive integration"
-)
+# §4.3 LIQUIDITY (risk-engine audit §7.3 / §10 B0): the SAME pure evaluation
+# the §10 gate chain runs — ADV20 from the stored daily volumes; no order size
+# (readiness is not an order) and no live quote here — in REPORT mode:
+# research defaults, UNVALIDATED, so the check still passes and the detail
+# carries the measured numbers + the hypothetical verdict until promoted.
+LIQUIDITY_LIMITS = LiquidityLimits()
 
 
 async def promotion_checks(session: AsyncSession, ticker: str) -> list[dict]:
@@ -66,10 +73,11 @@ async def promotion_checks(session: AsyncSession, ticker: str) -> list[dict]:
 
     - MIN_HISTORY: stored daily bars >= ``RegimeParams.sma_slow`` (200);
     - BACKTEST_COMPLETED: at least one COMPLETED backtest exists;
-    - OOS_STATS: the LATEST COMPLETED backtest produced >= 1 out-of-sample
-      trade — 0 trades means the strategy has NO out-of-sample evidence;
-    - LIQUIDITY: always passes at V1 — a documented stub until real market
-      data (Massive) arrives (§4.3).
+    - BACKTEST_TRADES: the LATEST COMPLETED backtest produced >= 1 closed
+      trade — 0 trades means the strategy has no trade evidence at all;
+    - LIQUIDITY: REPORT mode (audit §7.3 / B0) — ADV20 measured from the
+      stored daily volumes via the shared pure evaluator; passes regardless
+      of the hypothetical verdict, which the detail states with the numbers.
     """
     checks: list[dict] = []
 
@@ -115,34 +123,58 @@ async def promotion_checks(session: AsyncSession, ticker: str) -> list[dict]:
     )
 
     if latest is not None:
-        oos_trades = (latest.metrics or {}).get("out_of_sample", {}).get(
-            "num_trades", 0
-        )
+        # IS/OOS segmentation removed 2026-08-16 (user decision): the evidence
+        # bar is now >= 1 closed trade over the whole tested period. Legacy
+        # rows (pre-removal) stored {"full", "in_sample", "out_of_sample"} —
+        # read their full segment; new rows store the flat dict.
+        stored = latest.metrics or {}
+        flat = stored.get("full", stored) if isinstance(stored, dict) else {}
+        trade_count = flat.get("num_trades", 0)
         checks.append(
             {
-                "name": "OOS_STATS",
-                "passed": oos_trades >= 1,
+                "name": "BACKTEST_TRADES",
+                "passed": trade_count >= 1,
                 "detail": (
                     f"latest COMPLETED backtest (id {latest.id}) has "
-                    f"{oos_trades} out-of-sample trade(s)"
-                    + ("" if oos_trades >= 1 else " — no out-of-sample evidence")
+                    f"{trade_count} closed trade(s)"
+                    + ("" if trade_count >= 1 else " — no trade evidence")
                 ),
             }
         )
     else:
         checks.append(
             {
-                "name": "OOS_STATS",
+                "name": "BACKTEST_TRADES",
                 "passed": False,
                 "detail": (
-                    "0 out-of-sample trades — no COMPLETED backtest to "
-                    "evaluate, so no out-of-sample evidence"
+                    "0 trades — no COMPLETED backtest to evaluate, so no "
+                    "trade evidence"
                 ),
             }
         )
 
+    # LIQUIDITY (REPORT mode): the last `adv_window` stored volumes, oldest
+    # first, through the shared evaluator; fewer bars -> honest UNAVAILABLE.
+    volume_rows = (
+        await session.execute(
+            select(StockBarDaily.volume)
+            .where(StockBarDaily.ticker == ticker)
+            .order_by(StockBarDaily.ts.desc())
+            .limit(LIQUIDITY_LIMITS.adv_window)
+        )
+    ).scalars().all()
+    liquidity = evaluate_underlying_liquidity(
+        list(reversed(volume_rows)), None, None, None, LIQUIDITY_LIMITS
+    )
     checks.append(
-        {"name": "LIQUIDITY", "passed": True, "detail": LIQUIDITY_STUB_DETAIL}
+        {
+            "name": "LIQUIDITY",
+            "passed": True,  # REPORT mode: never blocks until promoted (Q3)
+            "detail": (
+                liquidity_report_detail(liquidity, LIQUIDITY_LIMITS)
+                + " (readiness check: no order size, no live quote)"
+            ),
+        }
     )
     return checks
 

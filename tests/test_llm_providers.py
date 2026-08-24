@@ -465,3 +465,260 @@ def test_registry_knows_openai_and_still_has_no_default(monkeypatch):
             get_recommendation_provider("")
     finally:
         get_settings.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# The analysis call gets its OWN timeout (Settings.llm_analysis_timeout_seconds)
+#
+# THE LIVE FAILURE THIS PINS. A gpt-5.6-sol event analysis took 51 seconds to
+# answer; the next one hit httpx.ReadTimeout at the shared 60s budget and was
+# stored as a FAILED analysis having already paid for the inference. The
+# analysis prompt carries the whole evidence bundle and asks for a long
+# structured note, so it is simply a different shape of request from the
+# discovery calls — and raising THEIR timeout instead would let a hung
+# recommendations refresh hold a request open for four minutes.
+# ---------------------------------------------------------------------------
+
+
+def _record_client_timeouts(monkeypatch) -> list:
+    """Record the ``timeout=`` every ``httpx.Client`` in libs.llm is built with.
+
+    Patched at the constructor rather than sniffed off the transport because
+    the timeout is a property of the CLIENT — a transport-level assertion
+    would keep passing if the adapter stopped passing a timeout at all, which
+    is the exact regression this guards.
+    """
+    seen: list = []
+    real_client = httpx.Client
+
+    class RecordingClient(real_client):
+        def __init__(self, *args, **kwargs):
+            seen.append(kwargs.get("timeout"))
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", RecordingClient)
+    return seen
+
+
+def _analysis_body() -> dict:
+    """A schema-complete analysis body — the adapters parse before returning,
+    so a stub that only satisfied the timeout assertion would raise first."""
+    scenario = {
+        "conditions": "c", "guidance_conditions": "g",
+        "why_market_reacts": "w", "evidence_refs": [],
+    }
+    return {
+        "executive_summary": "s", "what_happened_last_time": "s",
+        "what_changed_since": "s", "fundamental_developments": "s",
+        "price_and_positioning": "s", "market_expectations": "s",
+        "key_positive_catalysts": [], "key_negative_catalysts": [],
+        "what_matters_most": "s",
+        "scenarios": {"upside": scenario, "base": scenario, "downside": scenario},
+        "surprise_threshold": {"narrative": "n", "confidence": "NOT_MEANINGFUL"},
+        "key_unknowns": [], "invalidation": "i",
+        "expectations_gap_regime": "INSUFFICIENT_DATA", "confidence": "LOW",
+        "evidence_refs": [], "numbers_quoted": [],
+    }
+
+
+_TIMEOUT_BUNDLE = {"event": {"ticker": "AAPL"}, "fundamentals": {"revenue": 1.0}}
+
+
+def test_openai_analyze_event_uses_the_analysis_timeout_not_the_shared_one(
+    monkeypatch,
+):
+    from libs.llm.openai import OpenAIRecommendationProvider
+
+    seen = _record_client_timeouts(monkeypatch)
+    provider = OpenAIRecommendationProvider(
+        api_key="k",
+        model=OPENAI_MODEL,
+        timeout_seconds=60.0,
+        analysis_timeout_seconds=240.0,
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [
+                                {"type": "output_text",
+                                 "text": json.dumps(_analysis_body())}
+                            ],
+                        }
+                    ]
+                },
+            )
+        ),
+    )
+    provider.analyze_event(_TIMEOUT_BUNDLE, as_of=AS_OF)
+    assert seen == [240.0]
+
+    # ...and the DISCOVERY call is untouched: it keeps the shorter budget, so
+    # a hung refresh does not sit for four minutes.
+    seen.clear()
+    provider.generate(set(), AS_OF, limit=1)
+    assert seen == [60.0]
+
+
+def test_anthropic_analyze_event_uses_the_analysis_timeout_not_the_shared_one(
+    monkeypatch,
+):
+    seen = _record_client_timeouts(monkeypatch)
+    provider = AnthropicRecommendationProvider(
+        api_key="k",
+        model="claude-opus-5",
+        timeout_seconds=60.0,
+        analysis_timeout_seconds=240.0,
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={
+                    "content": [{"type": "text",
+                                 "text": json.dumps(_analysis_body())}]
+                },
+            )
+        ),
+    )
+    provider.analyze_event(_TIMEOUT_BUNDLE, as_of=AS_OF)
+    assert seen == [240.0]
+
+    seen.clear()
+    provider.generate(set(), AS_OF, limit=1)
+    assert seen == [60.0]
+
+
+def test_the_configured_analysis_timeout_reaches_both_factories(monkeypatch):
+    """The setting is only worth having if it travels. An adapter default of
+    240s with a factory that never passes the setting would leave an operator
+    who raised LLM_ANALYSIS_TIMEOUT_SECONDS with no effect and no error."""
+    from libs.common.config import get_settings
+
+    monkeypatch.setenv("LLM_API_KEY", "k")
+    monkeypatch.setenv("LLM_ANALYSIS_TIMEOUT_SECONDS", "321")
+    get_settings.cache_clear()
+    try:
+        assert get_settings().llm_analysis_timeout_seconds == 321.0
+        monkeypatch.setenv("LLM_MODEL", OPENAI_MODEL)
+        get_settings.cache_clear()
+        assert get_recommendation_provider("openai").analysis_timeout_seconds == 321.0
+        assert get_recommendation_provider("anthropic").analysis_timeout_seconds == 321.0
+    finally:
+        get_settings.cache_clear()
+
+
+def test_the_analysis_call_asks_for_more_output_tokens_than_discovery(monkeypatch):
+    """The §48 note has eighteen fields, three scenarios and a numbers_quoted
+    list the prompt now requires at least three entries in. 4096 truncates it
+    mid-JSON, which arrives as an unparseable body and a FAILED row."""
+    from libs.llm.openai import OpenAIRecommendationProvider
+
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured[request.url.path] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "output": [
+                    {"type": "message",
+                     "content": [{"type": "output_text",
+                                  "text": json.dumps(_analysis_body())}]}
+                ]
+            },
+        )
+
+    provider = OpenAIRecommendationProvider(
+        api_key="k", model=OPENAI_MODEL, transport=httpx.MockTransport(handler)
+    )
+    provider.analyze_event(_TIMEOUT_BUNDLE, as_of=AS_OF)
+    assert captured["/v1/responses"]["max_output_tokens"] >= 6000
+
+
+# ---------------------------------------------------------------------------
+# Output language (Settings.llm_output_language)
+# Narrative fields switch language; machine-read fields stay English. The
+# instruction rides the system prompt on BOTH providers and BOTH methods, and
+# "en"/unknown leaves the prompts byte-identical to before the feature.
+# ---------------------------------------------------------------------------
+
+
+def test_language_instruction_zh_and_default():
+    from libs.llm.provider import language_instruction
+
+    zh = language_instruction("zh")
+    assert "简体中文" in zh
+    # Machine-read fields are explicitly pinned to English.
+    for field in ("horizon", "catalyst_type", "reason_codes"):
+        assert field in zh
+    assert language_instruction("en") == ""
+    assert language_instruction("") == ""
+    assert language_instruction("fr") == ""  # unknown = no addendum, never a guess
+
+
+def test_openai_zh_output_language_reaches_both_wire_prompts():
+    from libs.llm.openai import OpenAIRecommendationProvider
+    from libs.llm.provider import GroundingArticle
+
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.setdefault("instructions", []).append(
+            json.loads(request.content)["instructions"]
+        )
+        return httpx.Response(200, json=_openai_response([VALID_ENTRY]))
+
+    provider = OpenAIRecommendationProvider(
+        api_key="test-key",
+        model=OPENAI_MODEL,
+        transport=httpx.MockTransport(handler),
+        output_language="zh",
+    )
+    provider.generate(set(), AS_OF, limit=5)
+    provider.enrich(
+        [
+            GroundingArticle(
+                url="https://example.com/a1",
+                title="Apple earnings beat",
+                publisher="Reuters",
+                published_at="2026-08-09T12:00:00+00:00",
+                tickers=("AAPL",),
+                description="Beat on cloud momentum.",
+            )
+        ],
+        set(),
+        AS_OF,
+        limit=5,
+    )
+    assert len(captured["instructions"]) == 2
+    for instructions in captured["instructions"]:
+        assert "简体中文" in instructions
+
+
+def test_openai_default_language_leaves_prompts_english():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_openai_response([VALID_ENTRY]))
+
+    _openai_provider_with(handler).generate(set(), AS_OF, limit=5)
+    assert "简体中文" not in captured["body"]["instructions"]
+
+
+def test_anthropic_zh_output_language_reaches_system_prompt():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_api_response([VALID_ENTRY]))
+
+    provider = AnthropicRecommendationProvider(
+        api_key="test-key",
+        model="claude-sonnet-5",
+        transport=httpx.MockTransport(handler),
+        output_language="zh",
+    )
+    provider.generate(set(), AS_OF, limit=5)
+    assert "简体中文" in captured["body"]["system"]

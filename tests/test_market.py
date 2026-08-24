@@ -35,7 +35,12 @@ async def test_market_regime_is_computed_from_spy_bars(client):
 
     # The stub is deterministic per symbol and end date, so recomputing the
     # regime through the shared library must give the served value exactly.
-    bars = StubProvider().get_daily_bars("SPY", 600)
+    # The platform stores COMPLETE trading days only (today's bar is still
+    # forming — ensure_daily_bars drops it and fetches one extra), so the
+    # expected series applies the same trim.
+    from apps.gateway.routers.analysis import _complete_days_only
+
+    bars = _complete_days_only(StubProvider().get_daily_bars("SPY", 602))[-600:]
     expected = classify_regime(
         [b.close for b in bars],
         [b.high for b in bars],
@@ -67,3 +72,75 @@ def test_stub_provider_deterministic_within_minute():
     assert [(q.symbol, q.price, q.change_pct) for q in a] == [
         (q.symbol, q.price, q.change_pct) for q in b
     ]
+
+
+# ---------------------------------------------------------------------------
+# GET /api/market/capabilities (guide §16) — probed, cached, honest.
+# ---------------------------------------------------------------------------
+
+
+def _reset_capabilities_cache():
+    from apps.gateway.routers import market
+
+    market._capabilities_cache.update(
+        {"at": None, "provider": None, "payload": None}
+    )
+
+
+async def test_capabilities_503_when_unconfigured(unconfigured_client):
+    _reset_capabilities_cache()
+    r = await unconfigured_client.get("/api/market/capabilities")
+    assert r.status_code == 503
+    assert r.json()["detail"]["code"] == "MARKET_DATA_NOT_CONFIGURED"
+
+
+async def test_capabilities_honest_null_for_probeless_provider(client):
+    """The stub has no plan to detect: capabilities must be null with a
+    message — never a fabricated all-true verdict."""
+    _reset_capabilities_cache()
+    r = await client.get("/api/market/capabilities")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["provider"] == "stub"
+    assert body["capabilities"] is None
+    assert "does not support capability probing" in body["message"]
+
+
+async def test_capabilities_probed_and_cached(client, monkeypatch):
+    """A probing provider's verdicts pass through verbatim; the probe runs
+    once per TTL window and again on ?refresh=true."""
+    _reset_capabilities_cache()
+    calls = {"n": 0}
+
+    class Probing:
+        def probe_capabilities(self):
+            calls["n"] += 1
+            return {
+                "stock_history": True,
+                "stock_realtime": True,
+                "option_chain": False,
+            }
+
+    monkeypatch.setattr(
+        "apps.gateway.routers.market.get_provider", lambda name: Probing()
+    )
+
+    r = await client.get("/api/market/capabilities")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["capabilities"] == {
+        "stock_history": True,
+        "stock_realtime": True,
+        "option_chain": False,
+    }
+    assert body["message"] is None
+    assert calls["n"] == 1
+
+    # Within the TTL the cached verdict is served — no second probe.
+    await client.get("/api/market/capabilities")
+    assert calls["n"] == 1
+
+    # refresh=true re-probes (e.g. right after a plan upgrade).
+    await client.get("/api/market/capabilities", params={"refresh": "true"})
+    assert calls["n"] == 2
+    _reset_capabilities_cache()

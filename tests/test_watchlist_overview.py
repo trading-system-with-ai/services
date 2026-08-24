@@ -13,6 +13,8 @@ ROW_KEYS = {
     "bear_score",
     "directional_edge",
     "bias",
+    "edge_class",
+    "tradeability",
     "opportunity_status",
     "backtest_status",
     "last_backtest_id",

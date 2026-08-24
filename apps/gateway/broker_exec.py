@@ -160,6 +160,146 @@ async def submit_and_poll(
     return await _poll_for_settlement(broker, client_order_id, submitted), False
 
 
+async def submit_mleg_and_poll(
+    broker: BrokerProvider,
+    client_order_id: str,
+    legs: list,
+    quantity: int,
+) -> tuple[BrokerOrder, bool]:
+    """The mleg counterpart of :func:`submit_and_poll` (roadmap Phase 1).
+
+    Same adopt-by-client_order_id idempotency and worker-thread execution;
+    the adapter's submit_mleg_order enforces the defined-risk shape guard
+    before any I/O. Raises AttributeError-free: a broker without the
+    capability raises BrokerError with a named reason (never a silent
+    single-leg fallback, §33).
+    """
+    submit = getattr(broker, "submit_mleg_order", None)
+    if submit is None:
+        raise BrokerError(
+            "this broker adapter does not implement multi-leg orders "
+            "(submit_mleg_order) — spreads cannot be executed at this venue"
+        )
+    existing = await asyncio.to_thread(broker.get_order, client_order_id)
+    if existing is not None:
+        logger.info(
+            "adopting existing broker mleg order %s for client_order_id %s "
+            "(status %s) — not submitting again",
+            existing.broker_order_id, client_order_id, existing.raw_status,
+        )
+        return await _poll_for_settlement(broker, client_order_id, existing), True
+
+    submitted = await asyncio.to_thread(submit, client_order_id, legs, quantity)
+    return await _poll_for_settlement(broker, client_order_id, submitted), False
+
+
+async def submit_short_open_and_poll(
+    broker: BrokerProvider,
+    client_order_id: str,
+    option_symbol: str,
+    quantity: int,
+    covered_by: str,
+) -> tuple[BrokerOrder, bool]:
+    """Collateral-attested short open (Phase 2) with the same
+    adopt-by-client_order_id idempotency as every submission wrapper."""
+    submit = getattr(broker, "submit_short_open_order", None)
+    if submit is None:
+        raise BrokerError(
+            "this broker adapter does not implement collateralized short "
+            "opens (submit_short_open_order)"
+        )
+    existing = await asyncio.to_thread(broker.get_order, client_order_id)
+    if existing is not None:
+        logger.info(
+            "adopting existing short-open order %s for client_order_id %s",
+            existing.broker_order_id, client_order_id,
+        )
+        return await _poll_for_settlement(broker, client_order_id, existing), True
+    submitted = await asyncio.to_thread(
+        submit, client_order_id, option_symbol, quantity, covered_by
+    )
+    return await _poll_for_settlement(broker, client_order_id, submitted), False
+
+
+async def submit_short_close_and_poll(
+    broker: BrokerProvider,
+    client_order_id: str,
+    option_symbol: str,
+    quantity: int,
+) -> tuple[BrokerOrder, bool]:
+    """Buyback (BUY_TO_CLOSE) with adopt + poll — risk-reducing only."""
+    submit = getattr(broker, "submit_short_close_order", None)
+    if submit is None:
+        raise BrokerError(
+            "this broker adapter does not implement short buybacks "
+            "(submit_short_close_order)"
+        )
+    existing = await asyncio.to_thread(broker.get_order, client_order_id)
+    if existing is not None:
+        logger.info(
+            "adopting existing buyback order %s for client_order_id %s",
+            existing.broker_order_id, client_order_id,
+        )
+        return await _poll_for_settlement(broker, client_order_id, existing), True
+    submitted = await asyncio.to_thread(
+        submit, client_order_id, option_symbol, quantity
+    )
+    return await _poll_for_settlement(broker, client_order_id, submitted), False
+
+
+async def submit_stock_short_and_poll(
+    broker: BrokerProvider,
+    client_order_id: str,
+    symbol: str,
+    quantity: int,
+    margin_attested_by: str,
+) -> tuple[BrokerOrder, bool]:
+    """Margin-attested STOCK short open (Phase 3) with adopt + poll."""
+    submit = getattr(broker, "submit_stock_short_order", None)
+    if submit is None:
+        raise BrokerError(
+            "this broker adapter does not implement margin-backed stock "
+            "shorts (submit_stock_short_order)"
+        )
+    existing = await asyncio.to_thread(broker.get_order, client_order_id)
+    if existing is not None:
+        logger.info(
+            "adopting existing stock-short order %s for client_order_id %s",
+            existing.broker_order_id, client_order_id,
+        )
+        return await _poll_for_settlement(broker, client_order_id, existing), True
+    submitted = await asyncio.to_thread(
+        submit, client_order_id, symbol, quantity, margin_attested_by
+    )
+    return await _poll_for_settlement(broker, client_order_id, submitted), False
+
+
+async def submit_stock_cover_and_poll(
+    broker: BrokerProvider,
+    client_order_id: str,
+    symbol: str,
+    quantity: int,
+) -> tuple[BrokerOrder, bool]:
+    """Buy-to-cover short stock (Phase 3) with adopt + poll — risk-reducing."""
+    submit = getattr(broker, "submit_stock_cover_order", None)
+    if submit is None:
+        raise BrokerError(
+            "this broker adapter does not implement short-stock covers "
+            "(submit_stock_cover_order)"
+        )
+    existing = await asyncio.to_thread(broker.get_order, client_order_id)
+    if existing is not None:
+        logger.info(
+            "adopting existing cover order %s for client_order_id %s",
+            existing.broker_order_id, client_order_id,
+        )
+        return await _poll_for_settlement(broker, client_order_id, existing), True
+    submitted = await asyncio.to_thread(
+        submit, client_order_id, symbol, quantity
+    )
+    return await _poll_for_settlement(broker, client_order_id, submitted), False
+
+
 def broker_order_details(order: BrokerOrder, *, adopted: bool = False) -> dict:
     """The audit ``details`` block describing one broker order (§38, rule 12).
 

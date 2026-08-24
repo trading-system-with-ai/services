@@ -84,6 +84,13 @@ class ExitParams:
     atr_period: int = 14
     premium_hard_stop_pct: float = 0.45
     dte_exit_threshold: int = 21
+    # SHORT-PREMIUM management (Phase 2 — covered calls / cash-secured
+    # puts; the most widely cited mechanical standards):
+    # - close at 50% of max profit (buy back once mid <= 50% of the credit);
+    # - stop the loss once mid >= 2x the credit received;
+    # - never hold short premium into the §11.7 gamma zone (same 21 DTE).
+    short_profit_capture_pct: float = 0.50
+    short_loss_multiple: float = 2.0
 
     def __post_init__(self) -> None:
         if self.atr_trail_k <= 0.0:
@@ -107,6 +114,16 @@ class ExitParams:
             raise ValueError(
                 "dte_exit_threshold must be an integer >= 0, got "
                 f"{self.dte_exit_threshold!r}"
+            )
+        if not (0.0 < self.short_profit_capture_pct < 1.0):
+            raise ValueError(
+                "short_profit_capture_pct must be in (0, 1), got "
+                f"{self.short_profit_capture_pct!r}"
+            )
+        if self.short_loss_multiple <= 1.0:
+            raise ValueError(
+                "short_loss_multiple must be > 1, got "
+                f"{self.short_loss_multiple!r}"
             )
 
 
@@ -136,6 +153,27 @@ class PositionState:
     entry_edge: float
     bars_held: int
     highest_close_since_entry: float
+    #: Which way the position PROFITS ("BULL" for long stock/calls/call
+    #: spreads, "BEAR" for long puts/put spreads). Every underlying signal
+    #: rule mirrors on it: SIGNAL_FLIP fires on the OPPOSING bias,
+    #: SIGNAL_DECAY on the position-favorable edge falling, ATR_TRAIL
+    #: trails ABOVE the trough for BEAR, TIME_STOP measures the favorable
+    #: move. Default BULL = pre-2026-08-17 behavior, byte-identical.
+    direction: str = "BULL"
+    #: Running LOWEST close since entry — the BEAR trail anchor (mirror of
+    #: ``highest_close_since_entry``); REQUIRED when direction == "BEAR".
+    lowest_close_since_entry: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.direction not in ("BULL", "BEAR"):
+            raise ValueError(
+                f"direction must be 'BULL' or 'BEAR', got {self.direction!r}"
+            )
+        if self.direction == "BEAR" and self.lowest_close_since_entry is None:
+            raise ValueError(
+                "BEAR positions require lowest_close_since_entry (the trail "
+                "anchor mirrors to the trough)"
+            )
 
 
 @dataclass
@@ -270,13 +308,28 @@ def _underlying_evaluations(
     edge = direction.directional_edge
     current_edge = edge if signal_ready else None
 
+    # Direction mirror (2026-08-17): every rule below is expressed in the
+    # POSITION's frame. favorable_edge is +edge for BULL, -edge for BEAR;
+    # the opposing bias flips the position; the trail hangs below the peak
+    # (BULL) or above the trough (BEAR — the industry-standard short-side
+    # trailing stop); the time stop measures the FAVORABLE move.
+    bear = state.direction == "BEAR"
+    favorable_edge = -edge if bear else edge
+    opposing_bias = DirectionalBias.BULL if bear else DirectionalBias.BEAR
+
     # --- ATR for the trail and the time stop (plan §11.5 / §11.6) ----------
     atr_last = atr(highs, lows, closes, period=params.atr_period)[-1]
-    trail_price = (
-        state.highest_close_since_entry - params.atr_trail_k * atr_last
-        if atr_last is not None
-        else None
-    )
+    if atr_last is None:
+        trail_price = None
+    elif bear:
+        trail_price = (
+            (state.lowest_close_since_entry or 0.0)
+            + params.atr_trail_k * atr_last
+        )
+    else:
+        trail_price = (
+            state.highest_close_since_entry - params.atr_trail_k * atr_last
+        )
     time_stop_remaining = max(0, params.time_stop_bars - state.bars_held)
 
     evaluations: list[tuple[str, bool, str]] = []
@@ -291,12 +344,13 @@ def _underlying_evaluations(
                 f"evaluable on {n} bars; not triggered",
             )
         )
-    elif direction.bias is DirectionalBias.BEAR:
+    elif direction.bias is opposing_bias:
         evaluations.append(
             (
                 "SIGNAL_FLIP",
                 True,
-                f"SIGNAL_FLIP: bias BEAR, edge {edge:.1f} (bull "
+                f"SIGNAL_FLIP: bias {direction.bias.value} opposes this "
+                f"{state.direction} position, edge {edge:.1f} (bull "
                 f"{direction.bull_score:.1f} vs bear {direction.bear_score:.1f})",
             )
         )
@@ -320,12 +374,13 @@ def _underlying_evaluations(
                 f"evaluable on {n} bars; not triggered",
             )
         )
-    elif edge < params.exit_edge_threshold:
+    elif favorable_edge < params.exit_edge_threshold:
         evaluations.append(
             (
                 "SIGNAL_DECAY",
                 True,
-                f"SIGNAL_DECAY: edge {edge:.1f} < exit threshold "
+                f"SIGNAL_DECAY: {state.direction}-favorable edge "
+                f"{favorable_edge:.1f} < exit threshold "
                 f"{params.exit_edge_threshold:.1f} (entry edge "
                 f"{state.entry_edge:.1f}; exit easier than entry, plan §11.1)",
             )
@@ -335,7 +390,8 @@ def _underlying_evaluations(
             (
                 "SIGNAL_DECAY",
                 False,
-                f"OK: SIGNAL_DECAY: edge {edge:.1f} >= exit threshold "
+                f"OK: SIGNAL_DECAY: {state.direction}-favorable edge "
+                f"{favorable_edge:.1f} >= exit threshold "
                 f"{params.exit_edge_threshold:.1f}",
             )
         )
@@ -351,17 +407,27 @@ def _underlying_evaluations(
             )
         )
     else:
-        trail_detail = (
-            f"(peak {state.highest_close_since_entry:.4f} - "
-            f"{params.atr_trail_k:.2f} * atr{params.atr_period} {atr_last:.4f})"
-        )
-        if close < trail_price:
+        if bear:
+            trail_detail = (
+                f"(trough {state.lowest_close_since_entry:.4f} + "
+                f"{params.atr_trail_k:.2f} * atr{params.atr_period} {atr_last:.4f})"
+            )
+            triggered = close > trail_price
+            relation = ">" if triggered else "<="
+        else:
+            trail_detail = (
+                f"(peak {state.highest_close_since_entry:.4f} - "
+                f"{params.atr_trail_k:.2f} * atr{params.atr_period} {atr_last:.4f})"
+            )
+            triggered = close < trail_price
+            relation = "<" if triggered else ">="
+        if triggered:
             evaluations.append(
                 (
                     "ATR_TRAIL",
                     True,
-                    f"ATR_TRAIL: close {close:.4f} < trail {trail_price:.4f} "
-                    f"{trail_detail}",
+                    f"ATR_TRAIL: close {close:.4f} {relation} trail "
+                    f"{trail_price:.4f} {trail_detail}",
                 )
             )
         else:
@@ -369,7 +435,7 @@ def _underlying_evaluations(
                 (
                     "ATR_TRAIL",
                     False,
-                    f"OK: ATR_TRAIL: close {close:.4f} >= trail "
+                    f"OK: ATR_TRAIL: close {close:.4f} {relation} trail "
                     f"{trail_price:.4f} {trail_detail}",
                 )
             )
@@ -387,7 +453,8 @@ def _underlying_evaluations(
             )
         )
     else:
-        move = close - state.entry_price
+        # Favorable move in the POSITION's frame: up for BULL, down for BEAR.
+        move = (state.entry_price - close) if bear else (close - state.entry_price)
         min_move = params.min_move_atr * atr_last
         if state.bars_held >= params.time_stop_bars and move < min_move:
             evaluations.append(
@@ -495,27 +562,40 @@ def evaluate_exit(
         raise ValueError(f"stop_distance must be > 0, got {state.stop_distance!r}")
 
     close = closes[-1]
-    stop_price = state.entry_price - state.stop_distance
+    # Phase 3 (2026-08-17): BEAR = SHORT_STOCK — the hard stop MIRRORS to
+    # sit ABOVE the entry (a short is stopped by the price RISING through
+    # entry + stop_distance). Every other §11 rule mirrors inside the
+    # shared evaluations. Long stock (BULL) is byte-identical to before.
+    if state.direction == "BEAR":
+        stop_price = state.entry_price + state.stop_distance
+    else:
+        stop_price = state.entry_price - state.stop_distance
     shared = _underlying_evaluations(
         state, closes, highs, lows, volumes, params, directional_params
     )
 
     # (1) HARD_STOP (§11.3) — raw prices only, immune to data gaps.
+    bear_stock = state.direction == "BEAR"
     stop_detail = (
-        f"entry {state.entry_price:.4f} - stop_distance {state.stop_distance:.4f}"
+        f"entry {state.entry_price:.4f} "
+        + ("+" if bear_stock else "-")
+        + f" stop_distance {state.stop_distance:.4f}"
     )
-    if close <= stop_price:
+    breached = close >= stop_price if bear_stock else close <= stop_price
+    rel_hit = ">=" if bear_stock else "<="
+    rel_ok = "<" if bear_stock else ">"
+    if breached:
         hard_stop = (
             "HARD_STOP",
             True,
             f"HARD_STOP: stop {stop_price:.4f} breached: close "
-            f"{close:.4f} <= {stop_detail}",
+            f"{close:.4f} {rel_hit} {stop_detail}",
         )
     else:
         hard_stop = (
             "HARD_STOP",
             False,
-            f"OK: HARD_STOP: close {close:.4f} > stop {stop_price:.4f} "
+            f"OK: HARD_STOP: close {close:.4f} {rel_ok} stop {stop_price:.4f} "
             f"({stop_detail})",
         )
 
@@ -648,3 +728,168 @@ def evaluate_option_exit(
     evaluations.extend(shared.evaluations)
 
     return _decide(evaluations, shared, premium_stop)
+
+
+@dataclass(frozen=True)
+class ShortPremiumState:
+    """One open COLLATERALIZED short-premium position (Phase 2).
+
+    - ``entry_credit``: premium RECEIVED per share at open.
+    - ``current_mid``: the short contract's current mid per share; ``None``
+      when unquoted (honest null — value rules report "insufficient data").
+    - ``dte``: calendar days to expiry; ``None`` when unknown.
+    - ``strike`` / ``spot``: for the assignment-risk warning (ITM check);
+      ``right`` is "C" (covered call) or "P" (cash-secured put).
+    """
+
+    entry_credit: float
+    current_mid: float | None
+    dte: int | None
+    strike: float
+    spot: float | None
+    right: str
+
+    def __post_init__(self) -> None:
+        if self.entry_credit <= 0.0:
+            raise ValueError(f"entry_credit must be > 0, got {self.entry_credit!r}")
+        if self.right not in ("C", "P"):
+            raise ValueError(f"right must be 'C' or 'P', got {self.right!r}")
+
+
+def evaluate_short_premium_exit(
+    state: ShortPremiumState,
+    params: ExitParams = ExitParams(),
+) -> ExitDecision:
+    """Mechanical management for a collateralized SHORT premium leg
+    (Phase 2 — covered call / cash-secured put), industry-standard rules
+    in priority order:
+
+    1. PREMIUM_LOSS_STOP — ``mid >= short_loss_multiple * credit`` (the
+       position moved against the seller; defend before assignment risk
+       compounds).
+    2. DTE_EXIT — ``dte <= dte_exit_threshold`` (§11.7 gamma-zone rule,
+       identical for sellers).
+    3. PROFIT_CAPTURE — ``mid <= (1 - short_profit_capture_pct) * credit``
+       (the standard "close at 50% of max profit").
+
+    An ITM short (assignment risk) adds a LOUD advisory line but does not
+    itself trigger — assignment economics on a COVERED position are
+    defined, and the human decides. Buying back is the only action any of
+    these can lead to (BUY_TO_CLOSE); nothing here can open exposure.
+    """
+    evaluations: list[tuple[str, bool, str]] = []
+    credit = state.entry_credit
+
+    if state.current_mid is None:
+        evaluations.append(
+            (
+                "PREMIUM_LOSS_STOP",
+                False,
+                "PREMIUM_LOSS_STOP: insufficient data: the short contract "
+                "has no current mid; not triggered",
+            )
+        )
+        evaluations.append(
+            (
+                "PROFIT_CAPTURE",
+                False,
+                "PROFIT_CAPTURE: insufficient data: no current mid; "
+                "not triggered",
+            )
+        )
+    else:
+        loss_level = params.short_loss_multiple * credit
+        if state.current_mid >= loss_level:
+            evaluations.append(
+                (
+                    "PREMIUM_LOSS_STOP",
+                    True,
+                    f"PREMIUM_LOSS_STOP: mid {state.current_mid:.4f} >= "
+                    f"{params.short_loss_multiple:.1f}x credit {credit:.4f} "
+                    f"= {loss_level:.4f}",
+                )
+            )
+        else:
+            evaluations.append(
+                (
+                    "PREMIUM_LOSS_STOP",
+                    False,
+                    f"OK: PREMIUM_LOSS_STOP: mid {state.current_mid:.4f} < "
+                    f"{loss_level:.4f}",
+                )
+            )
+        capture_level = (1.0 - params.short_profit_capture_pct) * credit
+        if state.current_mid <= capture_level:
+            evaluations.append(
+                (
+                    "PROFIT_CAPTURE",
+                    True,
+                    f"PROFIT_CAPTURE: mid {state.current_mid:.4f} <= "
+                    f"{1.0 - params.short_profit_capture_pct:.0%} of credit "
+                    f"{credit:.4f} — {params.short_profit_capture_pct:.0%} "
+                    "of max profit captured (standard management)",
+                )
+            )
+        else:
+            evaluations.append(
+                (
+                    "PROFIT_CAPTURE",
+                    False,
+                    f"OK: PROFIT_CAPTURE: mid {state.current_mid:.4f} > "
+                    f"{capture_level:.4f}",
+                )
+            )
+
+    if state.dte is None:
+        evaluations.append(
+            ("DTE_EXIT", False, "DTE_EXIT: insufficient data: dte unknown; not triggered")
+        )
+    elif state.dte <= params.dte_exit_threshold:
+        evaluations.append(
+            (
+                "DTE_EXIT",
+                True,
+                f"DTE_EXIT: {state.dte} DTE <= threshold "
+                f"{params.dte_exit_threshold} (plan §11.7: gamma/theta zone "
+                "— identical for premium sellers)",
+            )
+        )
+    else:
+        evaluations.append(
+            ("DTE_EXIT", False, f"OK: DTE_EXIT: {state.dte} DTE > threshold {params.dte_exit_threshold}")
+        )
+
+    # Assignment-risk advisory (§37): loud, never a trigger by itself.
+    reasons = []
+    if state.spot is not None:
+        itm = (
+            state.spot > state.strike
+            if state.right == "C"
+            else state.spot < state.strike
+        )
+        if itm:
+            reasons.append(
+                f"ADVISORY: short {state.right} {state.strike:g} is ITM "
+                f"(spot {state.spot:.4f}) — assignment possible; economics "
+                "are DEFINED on a collateralized position, human decides."
+            )
+
+    # Priority: loss stop -> DTE -> profit capture.
+    order = ("PREMIUM_LOSS_STOP", "DTE_EXIT", "PROFIT_CAPTURE")
+    triggered = next(
+        (name for name in order for (n, hit, _r) in evaluations if n == name and hit),
+        None,
+    )
+    reasons.extend(r for (_n, _hit, r) in evaluations)
+    capture_level = (
+        (1.0 - params.short_profit_capture_pct) * credit
+    )
+    return ExitDecision(
+        should_exit=triggered is not None,
+        triggered_rule=triggered,
+        reasons=reasons,
+        current_edge=None,  # mechanical management: no signal engine here
+        stop_price=params.short_loss_multiple * credit,
+        trail_price=None,
+        time_stop_remaining=None,
+    )

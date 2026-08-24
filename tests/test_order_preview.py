@@ -3,23 +3,31 @@
 "No rejected ticker may produce an order" (§42): a symbol failing any gate
 must come back with risk null (or REJECT), a non-empty why_not_trade, and the
 veto recorded in exactly one SYSTEM RISK_DECISION audit event (§38).
+
+RESEARCH MODE (upgrade 2026-08-12 §15/§16): preview is the RESEARCH chain —
+TRADING_POOL_AUTHORIZATION is not a research gate; pool/kill-switch facts are
+reported in ``execution_authorization`` and enforced only by the approve path
+(pinned in test_orders_execution.py, which stays execution-mode).
 """
 import json
 
+# The §16 research gate chain — no TRADING_POOL_AUTHORIZATION (upgrade §15).
 GATE_ORDER = [
-    "TRADING_POOL_AUTHORIZATION",
     "DATA_QUALITY",
     "REGIME",
     "DIRECTIONAL_SIGNAL",
     "VOLATILITY",
     "INSTRUMENT",
+    "SQUEEZE_RISK",
     "LIQUIDITY",
     "CONTRACT_SELECTION",
     "RISK_APPROVAL",
 ]
 SKIP_EARLIER_FAIL = "not evaluated: earlier gate failed"
-SKIP_NO_OPTION_DATA = "no option/quote data yet — arrives with the Massive integration"
 SKIP_STOCK_ORDER = "stock order — no contract selection needed"
+# Gate 7 (underlying LIQUIDITY) runs in REPORT mode (risk-engine audit §7.3 /
+# B0): PASS with the measured numbers + hypothetical verdict in the detail.
+LIQUIDITY_REPORT_PREFIX = "underlying liquidity (REPORT mode, research limits): "
 
 # The stub provider is deterministic per symbol (RNG seeded by the symbol
 # name, so the price PATH is identical for any end date): GOOGL yields a bull
@@ -71,14 +79,41 @@ def assert_contract_shape(body, ticker):
     assert set(body) == {
         "ticker",
         "as_of",
+        "mode",
+        "execution_authorization",
         "gates",
         "signal",
         "proposed",
         "risk",
+        "exit_plan",
         "why_trade",
         "why_not_trade",
     }
+    # §24: the exit plan rides on EVERY preview — the user sees how a
+    # position would be exited before any Apply.
+    exit_plan = body["exit_plan"]
+    assert exit_plan["signal_invalidation"]
+    assert exit_plan["atr_trail"]
+    assert exit_plan["time_stop"]
+    assert exit_plan["profit_target"] is None  # V1: honest null, not invented
     assert body["ticker"] == ticker
+    assert body["mode"] == "research"
+    auth = body["execution_authorization"]
+    assert set(auth) == {
+        "authorized",
+        "in_trading_pool",
+        "symbol_trading_enabled",
+        "global_trading_enabled",
+        "missing",
+    }
+    # §20: authorized is the conjunction of the three facts, and every
+    # missing authorization is named.
+    assert auth["authorized"] == (
+        auth["in_trading_pool"]
+        and auth["symbol_trading_enabled"]
+        and auth["global_trading_enabled"]
+    )
+    assert auth["authorized"] == (auth["missing"] == [])
     assert [g["name"] for g in body["gates"]] == GATE_ORDER
     for g in body["gates"]:
         assert set(g) == {"name", "status", "detail"}
@@ -94,6 +129,7 @@ def assert_contract_shape(body, ticker):
         "vol_regime",
         "instrument_rationale",
         "contract",
+        "spread",
         "entry_price",
         "stop_distance",
         "quantity_requested",
@@ -118,8 +154,10 @@ def assert_contract_shape(body, ticker):
     assert isinstance(body["why_not_trade"], list)
 
 
-async def test_watchlist_only_symbol_vetoed_at_gate_one(client):
-    """Not in the pool -> gate 1 FAIL, everything later SKIPPED, risk null."""
+async def test_watchlist_only_symbol_gets_full_research_chain(client):
+    """Upgrade §15/§45: a Watchlist symbol generates its complete research
+    plan — the chain starts at DATA_QUALITY and pool membership is reported
+    as an unmet EXECUTION authorization, never a research veto."""
     r = await client.post("/api/watchlist", json={"ticker": "NVDA"})
     assert r.status_code == 201
 
@@ -127,48 +165,54 @@ async def test_watchlist_only_symbol_vetoed_at_gate_one(client):
     assert_contract_shape(body, "NVDA")
 
     gates = body["gates"]
-    assert gates[0]["name"] == "TRADING_POOL_AUTHORIZATION"
-    assert gates[0]["status"] == "FAIL"
-    assert "not in the Trading Pool" in gates[0]["detail"]
-    for g in gates[1:]:
-        assert g["status"] == "SKIPPED"
-        assert g["detail"] == SKIP_EARLIER_FAIL
+    assert gates[0]["name"] == "DATA_QUALITY"
+    assert gates[0]["status"] == "PASS"  # research ran — not skipped
 
-    assert body["risk"] is None
-    assert body["signal"] == {"edge": None, "bias": None, "strength": None}
-    assert body["why_not_trade"]  # "No rejected ticker may produce an order" (§42)
+    auth = body["execution_authorization"]
+    assert auth["authorized"] is False
+    assert auth["in_trading_pool"] is False
+    assert any("not in the Trading Pool" in m for m in auth["missing"])
+
+    # The research verdict is whatever the market evidence says — but it WAS
+    # computed: the signal block carries real numbers, not nulls.
+    assert body["signal"]["edge"] is not None
+    assert body["signal"]["bias"] is not None
 
     event = await get_single_risk_decision_event(client, "NVDA")
-    assert event["details"]["decision"] == "VETOED"
-    assert event["details"]["veto_gate"] == "TRADING_POOL_AUTHORIZATION"
+    assert event["details"]["mode"] == "research"
+    assert event["details"]["execution_authorized"] is False
+    assert event["details"]["veto_gate"] != "TRADING_POOL_AUTHORIZATION"
 
 
-async def test_pool_symbol_with_trading_disabled_fails_gate_one(client):
-    """Promotion is authorization, not activation: disabled symbol is vetoed."""
+async def test_pool_symbol_with_trading_disabled_still_researches(client):
+    """Promotion is authorization, not activation (§20): a disabled symbol
+    still gets research; the missing enablement is named in the auth block."""
     await authorize(client, "NVDA", enable_symbol=False, resume=True)
 
     body = await preview(client, "NVDA")
-    gates = body["gates"]
-    assert gates[0]["status"] == "FAIL"
-    assert "not enabled for NVDA" in gates[0]["detail"]
-    assert body["risk"] is None
-    assert body["why_not_trade"]
+    auth = body["execution_authorization"]
+    assert auth["authorized"] is False
+    assert auth["in_trading_pool"] is True
+    assert auth["symbol_trading_enabled"] is False
+    assert any("not enabled for NVDA" in m for m in auth["missing"])
+    assert body["gates"][0]["name"] == "DATA_QUALITY"
+    assert body["gates"][0]["status"] == "PASS"
     await get_single_risk_decision_event(client, "NVDA")
 
 
-async def test_global_kill_switch_paused_fails_gate_one(client):
-    """Kill switch has priority (§18): gate 1 FAIL names the kill switch."""
+async def test_global_kill_switch_pauses_execution_not_research(client):
+    """Kill switch pauses TRADING system-wide (§18) — research remains
+    available; the pause is reported in the authorization block and §43's
+    no-bypass rule is enforced by the approve path (execution mode)."""
     await authorize(client, "NVDA", enable_symbol=True, resume=False)
 
     body = await preview(client, "NVDA")
-    gates = body["gates"]
-    assert gates[0]["status"] == "FAIL"
-    assert "kill switch" in gates[0]["detail"]
-    for g in gates[1:]:
-        assert g["status"] == "SKIPPED"
-        assert g["detail"] == SKIP_EARLIER_FAIL
-    assert body["risk"] is None
-    assert body["why_not_trade"]
+    auth = body["execution_authorization"]
+    assert auth["authorized"] is False
+    assert auth["global_trading_enabled"] is False
+    assert any("kill switch" in m for m in auth["missing"])
+    assert body["gates"][0]["name"] == "DATA_QUALITY"
+    assert body["gates"][0]["status"] == "PASS"
     await get_single_risk_decision_event(client, "NVDA")
 
 
@@ -182,7 +226,7 @@ async def test_fully_authorized_chain_runs_to_risk_or_fails_legitimately(client)
 
     gates = body["gates"]
     by_name = {g["name"]: g for g in gates}
-    assert by_name["TRADING_POOL_AUTHORIZATION"]["status"] == "PASS"
+    assert body["execution_authorization"]["authorized"] is True
     assert by_name["DATA_QUALITY"]["status"] == "PASS"  # stub data always passes
 
     first_fail = next((g["name"] for g in gates if g["status"] == "FAIL"), None)
@@ -190,12 +234,15 @@ async def test_fully_authorized_chain_runs_to_risk_or_fails_legitimately(client)
         # Chain reached the risk engine. VOLATILITY is now a REAL §7
         # classification off the stub chain summary (GOOGL deterministically
         # classifies NORMAL and the §8 matrix keeps LONG_STOCK for it);
-        # LIQUIDITY stays the exact V1 skip and CONTRACT_SELECTION skips for
-        # a stock order.
+        # LIQUIDITY is the REPORT-mode underlying check (audit §7.3 / B0):
+        # PASS, with ADV20 measured off the stored bars and the hypothetical
+        # verdict spelled out; CONTRACT_SELECTION skips for a stock order.
         assert by_name["VOLATILITY"]["status"] == "PASS"
         assert "vol regime" in by_name["VOLATILITY"]["detail"]
-        assert by_name["LIQUIDITY"]["status"] == "SKIPPED"
-        assert by_name["LIQUIDITY"]["detail"] == SKIP_NO_OPTION_DATA
+        assert by_name["LIQUIDITY"]["status"] == "PASS"
+        assert by_name["LIQUIDITY"]["detail"].startswith(LIQUIDITY_REPORT_PREFIX)
+        assert "would " in by_name["LIQUIDITY"]["detail"]  # PASS or FAIL, stated
+        assert "Massive" not in by_name["LIQUIDITY"]["detail"]
         assert by_name["INSTRUMENT"]["status"] == "PASS"
         assert "§8" in by_name["INSTRUMENT"]["detail"]
         assert by_name["CONTRACT_SELECTION"]["status"] == "SKIPPED"

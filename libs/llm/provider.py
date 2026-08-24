@@ -14,7 +14,10 @@ API action can promote a recommendation into anything actionable.
 """
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from .event_analysis import EventAnalysisResult
 
 
 class ProviderError(Exception):
@@ -27,6 +30,28 @@ LLM_NOT_CONFIGURED_MESSAGE = (
     "LLM provider is not configured — set LLM_PROVIDER and the corresponding "
     "credentials"
 )
+
+#: Output-language addendum appended to every provider system prompt
+#: (Settings.llm_output_language). NARRATIVE fields only: machine-read fields
+#: (horizon, catalyst_type, reason_codes, tickers, urls, timestamps) stay
+#: English regardless — downstream filtering/analytics key on them, and a
+#: mixed-language enum column would be silent data corruption. "en"/unknown →
+#: no addendum (English is the prompts' native language).
+OUTPUT_LANGUAGE_INSTRUCTIONS: dict[str, str] = {
+    "zh": (
+        "\nOutput language: write the NARRATIVE fields — summary and every "
+        "evidence snippet — in Simplified Chinese (简体中文), in the register "
+        "of a professional sell-side research note. Keep machine-read fields "
+        "in English exactly as specified: ticker, company (official English "
+        "name), horizon, catalyst_type, reason_codes, every url and "
+        "timestamp."
+    ),
+}
+
+
+def language_instruction(output_language: str) -> str:
+    """The prompt addendum for `output_language`; "" when none applies."""
+    return OUTPUT_LANGUAGE_INSTRUCTIONS.get(output_language, "")
 
 
 class LLMProviderNotConfigured(ProviderError):
@@ -43,7 +68,24 @@ class LLMProviderNotConfigured(ProviderError):
         super().__init__(message)
 
 
-@dataclass
+@dataclass(frozen=True)
+class GroundingArticle:
+    """One REAL stored news article handed to the LLM as grounding material.
+
+    The ONLY information a provider's ``enrich`` may use. ``url`` doubles as
+    the citation key: every evidence item a draft returns must carry one of
+    these urls in its "source" field, or the router drops the draft.
+    """
+
+    url: str
+    title: str
+    publisher: str
+    published_at: str  # ISO-8601
+    tickers: tuple[str, ...]
+    description: str
+
+
+@dataclass(frozen=True)
 class RecommendationDraft:
     """One LLM-proposed candidate, matching the plan §4.1 recommendation schema.
 
@@ -95,5 +137,50 @@ class RecommendationProvider(Protocol):
 
         `as_of` is the information cut-off: evidence must be published strictly
         before it (plan §20.3).
+        """
+        ...
+
+    def enrich(
+        self,
+        articles: list[GroundingArticle],
+        exclude_tickers: set[str],
+        as_of: datetime,
+        limit: int = 5,
+    ) -> list[RecommendationDraft]:
+        """Drafts grounded EXCLUSIVELY in `articles` (Phase 8 enrichment).
+
+        Every evidence item must cite one of the given articles by its url in
+        "source"; a draft's ticker must appear in a cited article's ticker
+        list. The router re-validates both and DROPS violations — a citation
+        that is not in the stored news table never reaches the user.
+        """
+        ...
+
+    def analyze_event(
+        self,
+        bundle_json: dict,
+        *,
+        as_of: datetime,
+    ) -> "EventAnalysisResult":
+        """Pre-event research note for ONE catalyst (event spec §46-§52).
+
+        `bundle_json` is the deterministic Evidence Bundle
+        (``libs.trading_core.events.evidence.bundle_to_json``): the sole
+        information source. The provider must not fetch anything, and the
+        model must not compute numbers (§47) — every number in the returned
+        narrative has to be copied from the bundle and listed in
+        ``numbers_quoted`` with its dotted fact path.
+
+        Returns an :class:`~libs.llm.event_analysis.EventAnalysisResult`. The
+        implementation returns it UNVALIDATED (``violations`` empty) except
+        where it can cheaply tell; the caller runs
+        ``event_analysis.validate_analysis`` against the bundle's fact index
+        and persists the violations, so the enforcement lives in one place
+        for every provider.
+
+        Raises :class:`ProviderError` on transport/HTTP failure and on a model
+        refusal — unlike ``generate``/``enrich`` there is no "fewer results"
+        degradation available for a single-event note; the caller records the
+        failure and still serves the bundle.
         """
         ...

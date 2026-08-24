@@ -1,11 +1,12 @@
 """§4.3 promotion readiness checks on POST /api/trading-pool.
 
 The check ladder for one ticker (NVDA — the stub provider deterministically
-yields a backtest with out-of-sample trades for it):
+yields a backtest with closed trades for it):
 
 1. fresh (no bars, no backtest) -> 422 with MIN_HISTORY / BACKTEST_COMPLETED
-   / OOS_STATS failed (with honest counts) and LIQUIDITY passed (documented
-   stub);
+   / BACKTEST_TRADES failed (with honest counts) and LIQUIDITY passed in
+   REPORT mode (audit §7.3 / B0: ADV20 unmeasurable with 0 bars -> honest
+   UNAVAILABLE, never a block);
 2. after analysis backfills 600 bars -> MIN_HISTORY passes, backtest checks
    still fail;
 3. after a real COMPLETED backtest -> all checks pass -> 201, checks in the
@@ -15,10 +16,10 @@ yields a backtest with out-of-sample trades for it):
 """
 
 TICKER = "NVDA"
-CHECK_ORDER = ["MIN_HISTORY", "BACKTEST_COMPLETED", "OOS_STATS", "LIQUIDITY"]
-LIQUIDITY_STUB_DETAIL = (
-    "stub data — real liquidity checks arrive with the Massive integration"
-)
+CHECK_ORDER = ["MIN_HISTORY", "BACKTEST_COMPLETED", "BACKTEST_TRADES", "LIQUIDITY"]
+# REPORT-mode LIQUIDITY readiness detail prefix (audit §7.3 / B0) — the shared
+# evaluator's audit-exact wording, rendered verbatim by the UI.
+LIQUIDITY_REPORT_PREFIX = "underlying liquidity (REPORT mode, research limits): "
 
 
 def by_name(checks):
@@ -60,13 +61,20 @@ async def test_fresh_ticker_fails_three_checks_with_honest_details(client):
     assert checks["BACKTEST_COMPLETED"]["passed"] is False
     assert "no COMPLETED backtest" in checks["BACKTEST_COMPLETED"]["detail"]
 
-    # OOS_STATS: 0 trades = no out-of-sample evidence.
-    assert checks["OOS_STATS"]["passed"] is False
-    assert "0 out-of-sample trades" in checks["OOS_STATS"]["detail"]
+    # BACKTEST_TRADES: 0 trades = no trade evidence.
+    assert checks["BACKTEST_TRADES"]["passed"] is False
+    assert "0 trades" in checks["BACKTEST_TRADES"]["detail"]
 
-    # LIQUIDITY: always passes at V1 — a DOCUMENTED placeholder (§4.3).
+    # LIQUIDITY: REPORT mode (audit §7.3 / B0) — with 0 stored bars nothing
+    # is measurable, so the detail says UNAVAILABLE honestly, and the check
+    # still passes (never a block until promoted).
     assert checks["LIQUIDITY"]["passed"] is True
-    assert checks["LIQUIDITY"]["detail"] == LIQUIDITY_STUB_DETAIL
+    liq = checks["LIQUIDITY"]["detail"]
+    assert liq.startswith(LIQUIDITY_REPORT_PREFIX)
+    assert "ADV20 n/a" in liq
+    assert "verdict UNAVAILABLE" in liq
+    assert "0 stored volume(s), need 20" in liq
+    assert "Massive" not in liq  # the stale stub text is gone
 
     # A blocked promotion changes nothing: pool stays empty, no audit row.
     assert (await client.get("/api/trading-pool")).json() == []
@@ -87,7 +95,18 @@ async def test_backfilled_history_passes_min_history_only(client):
     assert "600 stored daily bars" in checks["MIN_HISTORY"]["detail"]
     # Bars alone are not evidence — the backtest checks still fail.
     assert checks["BACKTEST_COMPLETED"]["passed"] is False
-    assert checks["OOS_STATS"]["passed"] is False
+    assert checks["BACKTEST_TRADES"]["passed"] is False
+    # LIQUIDITY (REPORT mode): with 600 stored bars ADV20 IS measured (the
+    # stub's synthetic volume centre is 1,000,000 sh, far above the 100,000
+    # research floor) and the hypothetical verdict is stated; the order and
+    # spread components stay honestly n/a for a readiness check.
+    liq = checks["LIQUIDITY"]["detail"]
+    assert checks["LIQUIDITY"]["passed"] is True
+    assert liq.startswith(LIQUIDITY_REPORT_PREFIX)
+    assert "ADV20 n/a" not in liq
+    assert "would PASS" in liq
+    assert "order n/a; quote spread n/a" in liq
+    assert "(readiness check: no order size, no live quote)" in liq
 
 
 async def test_completed_backtest_passes_all_checks_and_audits_them(client):
@@ -98,8 +117,8 @@ async def test_completed_backtest_passes_all_checks_and_audits_them(client):
     body = r.json()
     assert body["status"] == "COMPLETED"
     backtest_id = body["id"]
-    oos_trades = body["metrics"]["out_of_sample"]["num_trades"]
-    assert oos_trades >= 1  # the stub's NVDA series produces OOS trades
+    trade_count = body["metrics"]["num_trades"]
+    assert trade_count >= 1  # the stub's NVDA series produces trades
 
     r = await promote(client)
     assert r.status_code == 201
@@ -107,7 +126,7 @@ async def test_completed_backtest_passes_all_checks_and_audits_them(client):
     checks = by_name(out["promotion_checks"])
     assert all(c["passed"] for c in checks.values())
     assert str(backtest_id) in checks["BACKTEST_COMPLETED"]["detail"]
-    assert str(oos_trades) in checks["OOS_STATS"]["detail"]
+    assert str(trade_count) in checks["BACKTEST_TRADES"]["detail"]
     assert out["risks_acknowledged"] is False
     assert out["trading_enabled"] is False  # promotion is never a purchase
 
@@ -134,5 +153,5 @@ async def test_acknowledged_override_records_failed_checks_in_audit(client):
     audited = by_name(details["promotion_checks"])
     assert audited["MIN_HISTORY"]["passed"] is False
     assert audited["BACKTEST_COMPLETED"]["passed"] is False
-    assert audited["OOS_STATS"]["passed"] is False
+    assert audited["BACKTEST_TRADES"]["passed"] is False
     assert audited["LIQUIDITY"]["passed"] is True

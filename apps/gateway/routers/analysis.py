@@ -2,8 +2,8 @@
 
 Serves `GET /api/watchlist/{ticker}/analysis`: stored daily bars plus the full
 technical read — indicators, market-regime classification, and directional
-scoring. Historical data may exist ONLY for Watchlist symbols (plan §4.2), so
-non-watchlist tickers 404; the sole exception is the system reference indices
+scoring. Research surfaces are OPEN to any ticker (2026-08-20, §4.2 amended):
+bars lazily backfill on first read; the system reference indices remain
 used by the Market Regime Engine (ADR-005, see routers/market.py).
 
 Bars are lazily backfilled from the configured MarketDataProvider on first
@@ -12,7 +12,9 @@ share one transaction (rule 12, ADR-003). All analytics come exclusively from
 libs.trading_core (features + signals), so backtest and live share this exact
 code (plan §21).
 """
-from datetime import datetime, timezone
+import logging
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
@@ -34,14 +36,25 @@ from libs.trading_core.signals import (
     RegimeParams,
     RegimeResult,
     classify_regime,
+    edge_legend,
     score_direction,
 )
+from libs.trading_core.tradeability import assess_tradeability
 
 from .. import audit
-from ..db import BacktestRecord, StockBarDaily, WatchlistItem, get_session
+from ..db import (
+    BacktestRecord,
+    NewsArticleRow,
+    Recommendation,
+    StockBarDaily,
+    WatchlistItem,
+    get_session,
+)
 from ..deps import market_data_unavailable, require_market_data_provider
 
 router = APIRouter(prefix="/api/watchlist", tags=["analysis"])
+
+logger = logging.getLogger(__name__)
 
 # Tunable parameters (plan §6.2: parameters, never hardcoded truths).
 BACKFILL_DAYS = 600  # bars fetched on first request; > sma_slow(200) + warmup
@@ -59,23 +72,91 @@ MACD_SIGNAL = 9
 REALIZED_VOL_PERIOD = 20
 
 
+#: Bars are COMPLETE trading days only. A bar whose Eastern date is today may
+#: still be forming while the market trades; storing it would freeze a
+#: provisional number as history (and nothing ever rewrites a stored bar).
+EASTERN = ZoneInfo("America/New_York")
+
+#: How long to wait between refresh ATTEMPTS per symbol. A market holiday
+#: looks exactly like a missing bar — the provider legitimately has nothing
+#: newer — and without a throttle every request that day would re-ask.
+REFRESH_ATTEMPT_SECONDS = 30 * 60
+
+#: Bars fetched on a refresh: enough to cover any realistic gap (vacation,
+#: paused deployment) with buffer; the insert dedupes against stored dates.
+REFRESH_FETCH_DAYS = 15
+
+# ticker -> last refresh attempt (UTC). In-process; a restart just retries.
+_refresh_attempts: dict[str, datetime] = {}
+
+
+def _complete_days_only(bars: list) -> list:
+    """Drop any bar dated today-or-later in Eastern time (still forming)."""
+    today_eastern = datetime.now(EASTERN).date()
+    return [b for b in bars if b.ts < today_eastern]
+
+
+def _last_expected_trading_date(today_eastern: date) -> date:
+    """The most recent WEEKDAY strictly before today (Eastern).
+
+    Holidays are not modeled: on one, this expects a bar the provider will
+    not have, the refresh finds nothing new, and the attempt throttle keeps
+    that harmless. Never a fabricated calendar — just Mon–Fri arithmetic.
+    """
+    d = today_eastern - timedelta(days=1)
+    while d.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
+        d -= timedelta(days=1)
+    return d
+
+
+def _stale_trading_days(newest_bar: date, today_eastern: date) -> int:
+    """WEEKDAYS the newest stored bar lags the last expected trading day.
+
+    0 = current. Same Mon–Fri arithmetic (and the same unmodeled-holiday
+    honesty) as :func:`_last_expected_trading_date`; the tradeability
+    layer's ``max_stale_trading_days`` tolerance absorbs single holidays.
+    """
+    expected = _last_expected_trading_date(today_eastern)
+    d, lag = newest_bar, 0
+    while d < expected:
+        d += timedelta(days=1)
+        if d.weekday() < 5:
+            lag += 1
+    return lag
+
+
 async def ensure_daily_bars(
     session: AsyncSession,
     ticker: str,
     provider_name: str,
     days: int = BACKFILL_DAYS,
 ) -> list[StockBarDaily]:
-    """Return stored daily bars for `ticker` (oldest first), lazily backfilling.
+    """Return stored daily bars for `ticker` (oldest first), lazily backfilled
+    and kept fresh.
 
-    On first request for a symbol — no stored bars — the configured provider's
-    `get_daily_bars` history is bulk-inserted together with a SYSTEM-attributed
-    DATA_BACKFILL audit event in the SAME transaction (rule 12, ADR-003), then
-    committed. Subsequent calls read the stored bars and write nothing, so a
-    symbol is backfilled exactly once.
+    FIRST request for a symbol — no stored bars — bulk-inserts the configured
+    provider's history with a SYSTEM DATA_BACKFILL audit event in the SAME
+    transaction (rule 12, ADR-003). LATER requests serve the stored bars, and
+    when the newest stored bar is older than the last expected trading day
+    (weekday arithmetic, Eastern) the missing tail is fetched and APPENDED —
+    same audit action with ``mode: "refresh"``. Without this, every signal,
+    regime read and backtest would run forever on data frozen at first fetch,
+    and the data-quality gate would eventually (correctly) refuse to trade on
+    it. Refresh attempts are throttled per symbol (REFRESH_ATTEMPT_SECONDS)
+    so a market holiday — indistinguishable from a missing bar — does not
+    re-ask the provider on every request.
 
-    Watchlist gating (plan §4.2) is the CALLER's responsibility — the market
-    overview path uses this same function for the exempt system reference
-    symbols (ADR-005).
+    COMPLETE DAYS ONLY: bars dated today (Eastern) are dropped before storing
+    — an intraday daily bar is provisional, and stored bars are never
+    rewritten. A refresh failure serves the stored bars rather than failing
+    the request: yesterday's real close beats no answer, and the gap is
+    logged loudly.
+
+    Membership gating is the CALLER's responsibility, and since 2026-08-20
+    (§4.2 amended) backtests.py is the ONLY caller that gates: research reads
+    backfill for any symbol. First-fetch is deliberately unthrottled (the
+    refresh throttle covers only the stored-bars branch), so storage/audit
+    growth is driven by browsing breadth, not watchlist size.
 
     UNCONFIGURED PROVIDER: when `provider_name` is blank the registry raises
     :class:`ProviderNotConfigured` and this function re-raises it as the
@@ -92,13 +173,17 @@ async def ensure_daily_bars(
     )
     stored = list(rows.scalars().all())
     if stored:
-        return stored
+        return await _refresh_if_stale(session, ticker, provider_name, stored)
 
     try:
         provider = get_provider(provider_name)
     except ProviderNotConfigured as exc:
         raise market_data_unavailable(exc) from exc
-    fetched = provider.get_daily_bars(ticker, days)
+    # Fetch two extra: a provider series can include today's still-forming bar
+    # AND run one date ahead of the Eastern trading day (a UTC-dated series
+    # just after midnight UTC). Both get dropped as incomplete; the trim below
+    # still stores exactly `days` COMPLETE days.
+    fetched = _complete_days_only(provider.get_daily_bars(ticker, days + 2))[-days:]
     if not fetched:
         raise HTTPException(
             status_code=502, detail=f"provider {provider_name!r} returned no bars for {ticker}"
@@ -133,8 +218,82 @@ async def ensure_daily_bars(
     return orm_bars
 
 
+async def _refresh_if_stale(
+    session: AsyncSession,
+    ticker: str,
+    provider_name: str,
+    stored: list[StockBarDaily],
+) -> list[StockBarDaily]:
+    """Append missing complete trading days to `stored`; serve stored on fail.
+
+    Append-only by construction: only bars strictly NEWER than the newest
+    stored date are inserted — a stored bar is real data already served and
+    is never rewritten (§44 rule 18).
+    """
+    newest = stored[-1].ts
+    today_eastern = datetime.now(EASTERN).date()
+    if newest >= _last_expected_trading_date(today_eastern):
+        return stored
+
+    now = datetime.now(timezone.utc)
+    last_attempt = _refresh_attempts.get(ticker)
+    if (
+        last_attempt is not None
+        and (now - last_attempt).total_seconds() < REFRESH_ATTEMPT_SECONDS
+    ):
+        return stored  # holiday or recent failure — do not hammer the provider
+    _refresh_attempts[ticker] = now
+
+    try:
+        provider = get_provider(provider_name)
+        gap_days = max((today_eastern - newest).days + 5, REFRESH_FETCH_DAYS)
+        fetched = _complete_days_only(provider.get_daily_bars(ticker, gap_days))
+    except ProviderNotConfigured:
+        # Stored real bars still serve (see docstring); nothing to fetch with.
+        return stored
+    except Exception:
+        logger.exception("bar_refresh_failed", extra={"extra_fields": {"ticker": ticker}})
+        return stored
+
+    new_bars = [b for b in fetched if b.ts > newest]
+    if not new_bars:
+        return stored  # holiday / provider not yet updated — honest no-op
+
+    orm_bars = [
+        StockBarDaily(
+            ticker=ticker,
+            ts=b.ts,
+            open=b.open,
+            high=b.high,
+            low=b.low,
+            close=b.close,
+            volume=b.volume,
+        )
+        for b in new_bars
+    ]
+    session.add_all(orm_bars)
+    await audit.record(
+        session,
+        actor_type=ActorType.SYSTEM,
+        action=AuditAction.DATA_BACKFILL,
+        entity_type="stock_bars_daily",
+        entity_id=ticker,
+        details={
+            "mode": "refresh",
+            "bars": len(new_bars),
+            "provider": provider_name,
+            "first": new_bars[0].ts.isoformat(),
+            "last": new_bars[-1].ts.isoformat(),
+            "previous_newest": newest.isoformat(),
+        },
+    )
+    await session.commit()
+    return stored + orm_bars
+
+
 # The Market Regime Engine reads the broad-market index (plan §6.1). SPY is a
-# system reference symbol, exempt from the watchlist-only data rule (ADR-005).
+# system reference symbol (ADR-005) — always maintained regardless of what
+# anyone browses (the watchlist-only READ rule itself ended 2026-08-20).
 REGIME_REFERENCE_SYMBOL = "SPY"
 
 
@@ -224,6 +383,16 @@ async def get_watchlist_overview(
     directional_params = DirectionalParams()
 
     rows = await session.execute(select(WatchlistItem).order_by(WatchlistItem.ticker))
+
+    # One SPY read for all rows (§9 market-regime input); best-effort — a
+    # fault degrades every row's tradeability honestly, never the endpoint.
+    try:
+        market_regime = (await market_regime_from_spy(session)).classification
+    except Exception:
+        logger.exception("market_regime_read_failed")
+        market_regime = None
+
+    today_eastern = datetime.now(EASTERN).date()
     overview: list[dict] = []
     for item in rows.scalars().all():
         bars = await ensure_daily_bars(session, item.ticker, settings.market_data_provider)
@@ -238,6 +407,14 @@ async def get_watchlist_overview(
         )
         status = _opportunity_status(
             len(bars), regime.classification, signal, regime_params, directional_params
+        )
+        tradeability = assess_tradeability(
+            bar_count=len(bars),
+            stale_trading_days=_stale_trading_days(bars[-1].ts, today_eastern),
+            market_regime=market_regime,
+            symbol_regime=regime.classification,
+            vol_regime=None,
+            vol_unavailable_reason="ATM IV not evaluated in the overview",
         )
 
         latest = await session.execute(
@@ -257,6 +434,8 @@ async def get_watchlist_overview(
                 "bear_score": signal.bear_score,
                 "directional_edge": signal.directional_edge,
                 "bias": signal.bias.value,
+                "edge_class": signal.classification.value,
+                "tradeability": tradeability.state.value,
                 "opportunity_status": status.value,
                 "backtest_status": (
                     last_backtest.status if last_backtest is not None else "NONE"
@@ -275,24 +454,18 @@ async def get_symbol_analysis(
 ) -> dict:
     """Full technical analysis for one Watchlist symbol (plan §6).
 
-    404s for tickers not on the Watchlist: historical data may exist only for
-    Watchlist symbols (plan §4.2). 503 ``MARKET_DATA_NOT_CONFIGURED`` when no
+    OPEN to any ticker (2026-08-20, §4.2 amended): bars lazily backfill on
+    first request; watchlist membership means continuous tracking + backtest
+    eligibility, not read access. 503 ``MARKET_DATA_NOT_CONFIGURED`` when no
     market data provider is configured — every number here is market data or
     computed from it, so there is nothing honest to serve (§44 rule 18).
     """
     require_market_data_provider()
     ticker = ticker.upper()
-    row = await session.execute(
-        select(WatchlistItem).where(WatchlistItem.ticker == ticker)
-    )
-    if row.scalar_one_or_none() is None:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"{ticker} is not on the watchlist; historical data exists "
-                "only for Watchlist symbols"
-            ),
-        )
+    # 2026-08-20 user decision (DEVLOG 40): research surfaces are OPEN to any
+    # ticker — watchlist membership now means continuous tracking + backtest
+    # eligibility, NOT read access. ensure_daily_bars lazily backfills for any
+    # symbol; only backtests remain member-only.
 
     settings = get_settings()
     bars = await ensure_daily_bars(session, ticker, settings.market_data_provider)
@@ -312,6 +485,29 @@ async def get_symbol_analysis(
 
     regime = classify_regime(closes, highs, lows)
     signal = score_direction(closes, highs, lows, volumes=volumes)
+
+    # Layer 2 — tradeability (§9/§10): direction-agnostic environment verdict.
+    # Market regime read is best-effort here: an SPY fetch fault must not take
+    # the symbol analysis down, and a missing read honestly degrades the
+    # verdict to DATA_INSUFFICIENT instead of pretending an answer.
+    try:
+        market_regime = (await market_regime_from_spy(session)).classification
+    except Exception:
+        logger.exception("market_regime_read_failed")
+        market_regime = None
+    tradeability = assess_tradeability(
+        bar_count=len(bars),
+        stale_trading_days=_stale_trading_days(
+            dates[-1], datetime.now(EASTERN).date()
+        ),
+        market_regime=market_regime,
+        symbol_regime=regime.classification,
+        vol_regime=None,
+        vol_unavailable_reason=(
+            "ATM IV is not evaluated in this view — the volatility regime is "
+            "classified on the Options/Trade Plan paths"
+        ),
+    )
 
     tail = bars[-SERIES_BARS:]
     offset = len(bars) - len(tail)
@@ -342,17 +538,38 @@ async def get_symbol_analysis(
             "classification": regime.classification.value,
             "features": regime.features,
         },
+        "tradeability": {
+            "state": tradeability.state.value,
+            "reasons": tradeability.reasons,
+            "checks": [
+                {"name": c.name, "status": c.status, "detail": c.detail}
+                for c in tradeability.checks
+            ],
+            "version": tradeability.version,
+        },
         "signal": {
+            # Deterministic market-data calculation — no LLM is involved in
+            # this score (upgrade §3). The UI labels the panel from this flag
+            # rather than inventing its own provenance claim.
+            "deterministic": True,
             "bull_score": signal.bull_score,
             "bear_score": signal.bear_score,
             "directional_edge": signal.directional_edge,
             "bias": signal.bias.value,
+            "classification": signal.classification.value,
+            "weights_version": signal.weights_version,
+            "classification_version": signal.classification_version,
+            # §8 threshold legend, derived from the classifier's own params —
+            # displayed bands can never drift from the classification code.
+            "edge_legend": edge_legend(),
             "components": [
                 {
                     "name": c.name,
                     "side": c.side,
                     "triggered": c.triggered,
                     "weight": c.weight,
+                    "contribution": c.contribution,
+                    "max_contribution": c.max_contribution,
                     "detail": c.detail,
                 }
                 for c in signal.components
@@ -367,6 +584,101 @@ async def get_symbol_analysis(
     }
 
 
+@router.get("/{ticker}/catalyst")
+async def get_symbol_catalyst(
+    ticker: str, session: AsyncSession = Depends(get_session)
+) -> dict:
+    """LLM catalyst context for one Watchlist symbol (upgrade §11/§38 —
+    Phase E). READ-ONLY over stored data: the latest stored LLM
+    interpretation for the ticker plus the stored news articles citing it.
+    Never calls the LLM (generation happens on the recommendations refresh
+    path) and never mixes market-derived numbers in (§25: this payload is
+    interpretation + citations, nothing else).
+
+    Honest empties: ``llm: null`` when no interpretation was ever generated
+    for the symbol; ``articles: []`` when no stored news cites it. OPEN to
+    any ticker (2026-08-20, §4.2 amended).
+    """
+    ticker = ticker.upper()
+    # 2026-08-20 user decision (DEVLOG 40): research surfaces are OPEN to any
+    # ticker — watchlist membership now means continuous tracking + backtest
+    # eligibility, NOT read access. ensure_daily_bars lazily backfills for any
+    # symbol; only backtests remain member-only.
+
+    latest = (
+        await session.execute(
+            select(Recommendation)
+            .where(Recommendation.ticker == ticker)
+            .order_by(Recommendation.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+    articles = (
+        (
+            await session.execute(
+                select(NewsArticleRow)
+                .order_by(NewsArticleRow.published_at.desc())
+                .limit(200)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    cited = [a for a in articles if ticker in (a.tickers or [])][:10]
+
+    latest_source: str | None = None
+    published = [a.published_at for a in cited]
+    if latest is not None:
+        for ev in latest.evidence or []:
+            ts = ev.get("published_at")
+            if ts:
+                try:
+                    published.append(datetime.fromisoformat(ts))
+                except ValueError:
+                    pass
+    if published:
+        latest_source = max(published).isoformat()
+
+    return {
+        "ticker": ticker,
+        # §25/§11: this block is INTERPRETIVE, generated by the LLM from the
+        # cited articles — the UI labels it LLM-GENERATED off this flag and
+        # must never style it as market data.
+        "generated": True,
+        "llm": (
+            {
+                "generated_at": latest.ts.isoformat(),
+                "model": latest.llm_model,  # "" = pre-upgrade row, unknown
+                "status": latest.status,
+                "sentiment": latest.sentiment,
+                "impact": latest.impact,
+                "novelty": latest.novelty,
+                "source_reliability": latest.source_reliability,
+                "horizon": latest.horizon,
+                "catalyst_type": latest.catalyst_type,
+                "reason_codes": latest.reason_codes,
+                "summary": latest.summary,
+                "evidence": latest.evidence,
+            }
+            if latest is not None
+            else None
+        ),
+        "articles": [
+            {
+                "title": a.title,
+                "publisher": a.publisher,
+                "published_at": a.published_at.isoformat(),
+                "url": a.url,
+            }
+            for a in cited
+        ],
+        # §38 freshness: the newest source timestamp across citations and
+        # stored articles — never implied to be live market data.
+        "latest_source_published_at": latest_source,
+    }
+
+
 @router.get("/{ticker}/bars")
 async def get_symbol_bars(
     ticker: str,
@@ -375,9 +687,8 @@ async def get_symbol_bars(
 ) -> dict:
     """Raw daily OHLCV bars for one Watchlist symbol (plan §33, Price tab).
 
-    Returns the most recent `limit` stored bars, oldest first. Watchlist-gated
-    exactly like the analysis endpoint — historical data may exist only for
-    Watchlist symbols (plan §4.2) — and shares the same lazy-backfill path, so
+    Returns the most recent `limit` stored bars, oldest first. OPEN to any
+    ticker (2026-08-20, §4.2 amended) — shares the analysis lazy-backfill path, so
     the first request for a fresh symbol writes its one DATA_BACKFILL audit
     event and later requests are read-only. 503
     ``MARKET_DATA_NOT_CONFIGURED`` when no market data provider is configured:
@@ -385,17 +696,10 @@ async def get_symbol_bars(
     """
     require_market_data_provider()
     ticker = ticker.upper()
-    row = await session.execute(
-        select(WatchlistItem).where(WatchlistItem.ticker == ticker)
-    )
-    if row.scalar_one_or_none() is None:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"{ticker} is not on the watchlist; historical data exists "
-                "only for Watchlist symbols"
-            ),
-        )
+    # 2026-08-20 user decision (DEVLOG 40): research surfaces are OPEN to any
+    # ticker — watchlist membership now means continuous tracking + backtest
+    # eligibility, NOT read access. ensure_daily_bars lazily backfills for any
+    # symbol; only backtests remain member-only.
 
     settings = get_settings()
     bars = await ensure_daily_bars(session, ticker, settings.market_data_provider)

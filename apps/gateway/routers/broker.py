@@ -36,7 +36,7 @@ nowhere in these responses, in any form, ever.
 """
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import select
@@ -47,6 +47,8 @@ from libs.trading_core.models import ActorType, AuditAction
 
 from .. import audit
 from ..db import (
+    Order,
+    Portfolio,
     Position,
     get_or_create_portfolio,
     get_or_create_system_state,
@@ -59,7 +61,10 @@ from ..deps import (
     resolve_broker,
     simulated_broker_mode,
 )
-from .orders import POSITION_OPEN, is_option_position
+from libs.broker.alpaca import occ_option_symbol
+
+from .orders import POSITION_OPEN, execution_lock, is_option_position, is_spread_position
+from .portfolio import is_income_position, is_short_stock_position
 
 router = APIRouter(prefix="/api/broker", tags=["broker"])
 
@@ -80,6 +85,9 @@ MISMATCH_CASH = "CASH_MISMATCH"
 # The kill-switch reason written on a mismatch. Fixed prefix so an operator (or
 # a test) can recognise a reconciliation pause at a glance.
 PAUSE_REASON_PREFIX = "reconciliation mismatch"
+
+# The singleton local-ledger row id (mirrors db.get_or_create_portfolio).
+_PORTFOLIO_ID = 1
 
 
 def _account_payload(account: BrokerAccount) -> dict:
@@ -186,18 +194,70 @@ async def broker_status() -> dict:
 
 
 def _local_open_quantities(positions: list[Position]) -> dict[str, int]:
-    """Local OPEN stock quantities by ticker.
+    """Local OPEN quantities: stock by ticker, options by OCC symbol (§30.13).
 
-    Option positions are excluded: they were opened by the internal simulator
-    (option execution is not wired at the broker) and have no counterpart in
-    the broker's stock positions. Counting them would manufacture a mismatch
-    on every sweep and pause trading for a difference that is expected.
+    Options are broker-executed (BUY_TO_OPEN on the OCC contract symbol), and
+    Alpaca reports option holdings under that same symbol — so they compare
+    exactly like stock, just keyed differently. An option row whose stored
+    contract fields cannot rebuild a symbol is SKIPPED here (it cannot be
+    matched to anything the broker says) — the same malformed row already
+    fails loudly on any close attempt, which is the surface that can name it.
     """
     out: dict[str, int] = {}
     for pos in positions:
-        if is_option_position(pos):
+        if is_spread_position(pos):
+            # Roadmap Phase 1: a spread is TWO broker holdings — the long
+            # leg +qty and the short leg NEGATIVE qty. Registering the short
+            # leg as OURS is what keeps §18 from flagging our own spread as
+            # a foreign short and pausing trading.
+            try:
+                long_key = occ_option_symbol(
+                    pos.ticker,
+                    date.fromisoformat(pos.opt_expiry or ""),
+                    float(pos.opt_strike),
+                    pos.opt_right or "",
+                )
+            except (TypeError, ValueError):
+                continue
+            short_key = pos.short_occ_symbol
+            out[long_key] = out.get(long_key, 0) + pos.quantity
+            if short_key:
+                out[short_key] = out.get(short_key, 0) - pos.quantity
             continue
-        out[pos.ticker] = out.get(pos.ticker, 0) + pos.quantity
+        if is_income_position(pos):
+            # Phase 2: covered calls / CSPs are SHORT contracts at the
+            # broker — register them as OURS with NEGATIVE quantity, the
+            # same claim that keeps §18 from flagging our own book.
+            try:
+                key = occ_option_symbol(
+                    pos.ticker,
+                    date.fromisoformat(pos.opt_expiry or ""),
+                    float(pos.opt_strike),
+                    pos.opt_right or "",
+                )
+            except (TypeError, ValueError):
+                continue
+            out[key] = out.get(key, 0) - pos.quantity
+            continue
+        if is_short_stock_position(pos):
+            # Phase 3: short stock is a NEGATIVE broker holding under the
+            # ticker itself — the same OURS claim that keeps §18 from
+            # flagging our own short as a foreign position.
+            out[pos.ticker] = out.get(pos.ticker, 0) - pos.quantity
+            continue
+        if is_option_position(pos):
+            try:
+                key = occ_option_symbol(
+                    pos.ticker,
+                    date.fromisoformat(pos.opt_expiry or ""),
+                    float(pos.opt_strike),
+                    pos.opt_right or "",
+                )
+            except (TypeError, ValueError):
+                continue
+        else:
+            key = pos.ticker
+        out[key] = out.get(key, 0) + pos.quantity
     return out
 
 
@@ -205,7 +265,7 @@ def _compare(
     broker_positions: list[BrokerPosition],
     local_quantities: dict[str, int],
     broker_cash: float,
-    local_cash: float,
+    local_cash: float | None,
 ) -> list[dict]:
     """Every disagreement between the two ledgers, as ``mismatches`` rows.
 
@@ -264,7 +324,9 @@ def _compare(
                 }
             )
 
-    if abs(broker_cash - local_cash) > CASH_TOLERANCE_USD:
+    # No local ledger row yet: nothing to compare cash against — an absent
+    # ledger is not a disagreement (same principle as the unconfigured case).
+    if local_cash is not None and abs(broker_cash - local_cash) > CASH_TOLERANCE_USD:
         mismatches.append(
             {
                 "kind": MISMATCH_CASH,
@@ -283,7 +345,17 @@ def _compare(
 
 @router.get("/reconcile")
 async def reconcile(session: AsyncSession = Depends(get_session)) -> dict:
+    """Manual trigger for :func:`run_reconciliation` (plan §18)."""
+    return await run_reconciliation(session)
+
+
+async def run_reconciliation(session: AsyncSession) -> dict:
     """Compare broker positions + cash against local rows (plan §18).
+
+    The ONE reconciliation implementation, shared by GET /api/broker/reconcile
+    and the periodic background loop (guide §13 Iteration D, wired in
+    apps/gateway/main.py) — both compare the same ledgers and pull the same
+    kill switch, so cadence never changes semantics.
 
     ``{"as_of", "configured", "broker", "local", "mismatches", "in_sync"}``.
     ``broker`` carries the account snapshot and its positions; ``local`` the
@@ -298,10 +370,28 @@ async def reconcile(session: AsyncSession = Depends(get_session)) -> dict:
     simulated mode, where there IS no broker to compare against) it answers
     ``configured: false`` with null broker data, empty mismatches, and pauses
     NOTHING: an absent ledger is not a disagreement between ledgers.
+
+    IN-FLIGHT ORDERS DEFER THE PAUSE (§11/§18). While a non-terminal order
+    exists (PENDING_SUBMIT/ACCEPTED/PARTIALLY_FILLED) the two ledgers are
+    EXPECTED to disagree transiently — the broker may hold a fill the
+    order-sync sweep has not applied yet. Pausing on that would punish the
+    normal lifecycle. Mismatches are still computed and REPORTED with
+    ``pause_deferred: true``; the kill switch fires only when a divergence is
+    observed with nothing in flight to explain it. Runs under the shared
+    execution lock so it never reads mid-mutation state.
     """
+    async with execution_lock():
+        return await _run_reconciliation_locked(session)
+
+
+async def _run_reconciliation_locked(session: AsyncSession) -> dict:
     as_of = datetime.now(timezone.utc).isoformat()
     reason = broker_unavailable_reason()
-    portfolio = await get_or_create_portfolio(session)
+    # THE PLATFORM KEEPS NO LOCAL COPY OF CASH (user rule: the account is
+    # Alpaca's). There is therefore no cash comparison to make — the broker's
+    # number is definitionally the only number. Reconciliation's job is the
+    # POSITION ledger, which the platform does own.
+    local_cash = None
 
     local_positions = list(
         (
@@ -316,7 +406,7 @@ async def reconcile(session: AsyncSession = Depends(get_session)) -> dict:
     )
     local_quantities = _local_open_quantities(local_positions)
     local_block = {
-        "cash": portfolio.cash,
+        "cash": local_cash,
         "positions": [
             {"symbol": symbol, "quantity": quantity}
             for symbol, quantity in sorted(local_quantities.items())
@@ -363,7 +453,7 @@ async def reconcile(session: AsyncSession = Depends(get_session)) -> dict:
         }
 
     mismatches = _compare(
-        broker_positions, local_quantities, account.cash, portfolio.cash
+        broker_positions, local_quantities, account.cash, local_cash
     )
     broker_block = {
         "account": _account_payload(account),
@@ -388,6 +478,34 @@ async def reconcile(session: AsyncSession = Depends(get_session)) -> dict:
     }
 
     if not mismatches:
+        return result
+
+    # --- In-flight orders explain a transient divergence: report, defer. ---
+    in_flight = (
+        (
+            await session.execute(
+                select(Order).where(
+                    Order.status.in_(
+                        ["PENDING_SUBMIT", "ACCEPTED", "PARTIALLY_FILLED"]
+                    )
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if in_flight:
+        result["pause_deferred"] = True
+        result["message"] = (
+            f"{len(mismatches)} disagreement(s) found, but {len(in_flight)} "
+            "order(s) are in flight ("
+            + ", ".join(f"#{o.id} {o.status}" for o in in_flight[:5])
+            + (", …" if len(in_flight) > 5 else "")
+            + ") — the ledgers are expected to disagree until the order-sync "
+            "sweep settles them. Trading was NOT paused; the divergence is "
+            "re-checked next cycle."
+        )
+        logger.warning("reconciliation_pause_deferred_in_flight_orders")
         return result
 
     # --- MISMATCH: audit + pause (plan §18). No auto-correction. -----------
@@ -416,7 +534,7 @@ async def reconcile(session: AsyncSession = Depends(get_session)) -> dict:
             "provider": broker_mode(),
             "mismatches": mismatches,
             "broker_cash": account.cash,
-            "local_cash": portfolio.cash,
+            "local_cash": local_cash,
             "trading_was_enabled": was_enabled,
             "auto_corrected": False,
             "policy": (
@@ -431,3 +549,23 @@ async def reconcile(session: AsyncSession = Depends(get_session)) -> dict:
     result["paused"] = True
     result["pause_reason"] = pause_reason
     return result
+
+
+@router.post("/sync-orders")
+async def sync_orders(session: AsyncSession = Depends(get_session)) -> dict:
+    """Manually run one order-sync sweep (guide §11 Iteration C).
+
+    Same implementation as the background loop: every non-terminal local
+    order (PENDING_SUBMIT / ACCEPTED / PARTIALLY_FILLED) is looked up at the
+    broker by client_order_id and settled to what actually happened — fill
+    deltas move real cash and position quantity, orphaned submits become
+    REJECTED, disagreements are reported for §18 reconciliation. Answers
+    ``{"checked": 0, "skipped": "NO_REAL_BROKER"}`` when there is no real
+    broker to ask.
+    """
+    # Imported here, not at module top: order_sync imports routers.orders, so
+    # a top-level import from a sibling router would create an import cycle
+    # whose failure depends on package import order.
+    from ..order_sync import run_order_sync
+
+    return await run_order_sync(session)

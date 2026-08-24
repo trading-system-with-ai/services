@@ -24,8 +24,21 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-# Instrument vocabulary for v0 (long-only book, plan §16).
-VALID_INSTRUMENTS = ("LONG_STOCK", "LONG_CALL", "LONG_PUT")
+# Instrument vocabulary (plan §16). Spread rows contribute their NET
+# per-share greeks (Phase 1); income rows their short leg's NEGATED greeks
+# (Phase 2 — this entry was missing until 2026-08-17: an open income
+# position crashed the aggregate view); SHORT_STOCK contributes delta −1
+# per share (Phase 3).
+VALID_INSTRUMENTS = (
+    "LONG_STOCK",
+    "LONG_CALL",
+    "LONG_PUT",
+    "BULL_CALL_SPREAD",
+    "BEAR_PUT_SPREAD",
+    "COVERED_CALL",
+    "CASH_SECURED_PUT",
+    "SHORT_STOCK",
+)
 
 
 @dataclass(frozen=True)

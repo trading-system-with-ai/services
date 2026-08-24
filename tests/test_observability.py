@@ -5,6 +5,9 @@ TEMPLATE labels (cardinality control), /metrics self-exclusion, and the
 §38+§41 correlation closure: an audited action inherits the request's
 X-Request-ID as its correlation_id.
 """
+import os
+from datetime import date, datetime, timezone
+
 from sqlalchemy import select
 
 from apps.gateway import audit
@@ -88,7 +91,11 @@ async def test_metrics_includes_uptime_and_freshness_gauges(client):
 
     assert "# TYPE watchlist_bars_max_age_days gauge" in body
     age = _sample_value(body, "watchlist_bars_max_age_days")
-    assert 0.0 <= age <= 4.0  # stub series ends today or the prior weekday
+    # The stub universe is frozen at STUB_ANCHOR_DATE (conftest), so the
+    # newest stored bar is honestly THAT old against the real clock — the
+    # gauge must report the true age, never a pleasant small number.
+    anchor = date.fromisoformat(os.environ["STUB_ANCHOR_DATE"])
+    assert age == float((datetime.now(timezone.utc).date() - anchor).days)
 
     # honest stub gauge: chains are generated on demand, age pinned to 0 (§41)
     assert "on demand" in _help_line(body, "option_chain_age_seconds").lower()

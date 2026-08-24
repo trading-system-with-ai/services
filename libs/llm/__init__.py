@@ -18,6 +18,15 @@ is an information feature. Recommendations carry zero execution authority.
 """
 from typing import Callable
 
+from .event_analysis import (  # noqa: F401
+    EVENT_ANALYSIS_SCHEMA,
+    EVENT_ANALYSIS_SCHEMA_NAME,
+    EXPECTATIONS_GAP_REGIMES,
+    PROMPT_VERSION,
+    EventAnalysisResult,
+    build_user_message,
+    validate_analysis,
+)
 from .provider import (  # noqa: F401
     LLM_NOT_CONFIGURED_MESSAGE,
     LLMProviderNotConfigured,
@@ -44,6 +53,9 @@ def _make_anthropic() -> RecommendationProvider:
     return AnthropicRecommendationProvider(
         api_key=settings.llm_api_key,
         model=settings.llm_model,
+        output_language=settings.llm_output_language,
+        # analyze_event ONLY — generate/enrich keep the adapter's own 60s.
+        analysis_timeout_seconds=settings.llm_analysis_timeout_seconds,
     )
 
 
@@ -59,6 +71,12 @@ def _make_openai() -> RecommendationProvider:
     return OpenAIRecommendationProvider(
         api_key=settings.llm_api_key,
         model=settings.llm_model,
+        output_language=settings.llm_output_language,
+        # analyze_event ONLY — generate/enrich keep the adapter's own 60s.
+        # The event-analysis prompt carries the whole evidence bundle and a
+        # live run took 51s; at 60s the next one timed out and was stored as
+        # a FAILED analysis that had already paid for the inference.
+        analysis_timeout_seconds=settings.llm_analysis_timeout_seconds,
     )
 
 

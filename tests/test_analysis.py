@@ -1,7 +1,12 @@
 """Tests for GET /api/watchlist/{ticker}/analysis (plan §4.2, §6)."""
 from datetime import date, datetime
 
-from libs.trading_core.models import DirectionalBias, MarketRegime
+from libs.trading_core.models import (
+    DirectionalBias,
+    DirectionalEdgeClass,
+    MarketRegime,
+    TradeabilityState,
+)
 
 CONTRACT_KEYS = {
     "ticker",
@@ -11,6 +16,7 @@ CONTRACT_KEYS = {
     "price",
     "indicators",
     "regime",
+    "tradeability",
     "signal",
     "series",
 }
@@ -26,14 +32,24 @@ INDICATOR_KEYS = {
     "macd_histogram",
     "realized_vol20",
 }
-COMPONENT_KEYS = {"name", "side", "triggered", "weight", "detail"}
+COMPONENT_KEYS = {
+    "name",
+    "side",
+    "triggered",
+    "weight",
+    "contribution",
+    "max_contribution",
+    "detail",
+}
 
 
-async def test_analysis_404_for_non_watchlist_ticker(client):
-    """Historical data may exist ONLY for Watchlist symbols (plan §4.2)."""
+async def test_analysis_open_for_non_watchlist_ticker(client):
+    """2026-08-20 (§4.2 amended): research surfaces are OPEN — analysis
+    serves any ticker via the lazy-backfill path; membership gates only
+    continuous tracking + backtests."""
     r = await client.get("/api/watchlist/NVDA/analysis")
-    assert r.status_code == 404
-    assert "not on the watchlist" in r.json()["detail"]
+    assert r.status_code == 200
+    assert r.json()["ticker"] == "NVDA"
 
 
 async def test_analysis_contract(client):
@@ -65,11 +81,37 @@ async def test_analysis_contract(client):
     assert regime["classification"] in {m.value for m in MarketRegime}
     assert isinstance(regime["features"], dict) and regime["features"]
 
+    # Layer 2 (§9): a verdict with named checks; never a bare state.
+    tradeability = body["tradeability"]
+    assert set(tradeability) == {"state", "reasons", "checks", "version"}
+    assert tradeability["state"] in {s.value for s in TradeabilityState}
+    assert tradeability["version"]
+    check_names = {c["name"] for c in tradeability["checks"]}
+    assert {"DATA_QUALITY", "DATA_FRESHNESS", "MARKET_REGIME",
+            "SYMBOL_REGIME", "VOLATILITY_REGIME"} <= check_names
+    for c in tradeability["checks"]:
+        assert c["status"] in {"PASS", "CONDITION", "BLOCK", "INSUFFICIENT"}
+        assert c["detail"]
+    # Every non-PASS check surfaces as a reason (§10 WHY line).
+    assert len(tradeability["reasons"]) == sum(
+        1 for c in tradeability["checks"] if c["status"] != "PASS"
+    )
+
     signal = body["signal"]
     assert 0.0 <= signal["bull_score"] <= 100.0
     assert 0.0 <= signal["bear_score"] <= 100.0
     assert signal["directional_edge"] == signal["bull_score"] - signal["bear_score"]
     assert signal["bias"] in {b.value for b in DirectionalBias}
+    # Upgrade §3/§7/§8: provenance flag, band classification, versioned
+    # config, and the threshold legend all ride on the same payload.
+    assert signal["deterministic"] is True
+    assert signal["classification"] in {c.value for c in DirectionalEdgeClass}
+    assert signal["weights_version"]
+    assert signal["classification_version"]
+    legend = signal["edge_legend"]
+    assert [band["classification"] for band in legend] == [
+        c.value for c in DirectionalEdgeClass
+    ]
     components = signal["components"]
     assert components  # non-empty
     for c in components:
@@ -77,6 +119,13 @@ async def test_analysis_contract(client):
         assert c["side"] in {"bull", "bear"}
         assert isinstance(c["triggered"], bool)
         assert isinstance(c["detail"], str) and c["detail"]
+        assert (c["contribution"] == c["max_contribution"]) is c["triggered"]
+    # §44 at the wire: displayed contributions sum EXACTLY to the score.
+    for side, score_key in (("bull", "bull_score"), ("bear", "bear_score")):
+        contributions = sum(
+            c["contribution"] for c in components if c["side"] == side
+        )
+        assert contributions == signal[score_key]
 
     series = body["series"]
     assert set(series) == {"dates", "close", "sma20", "sma50"}

@@ -1,0 +1,32 @@
+trading-system-with-ai
+Copyright 2026 The trading-system-with-ai contributors
+
+This product includes software developed by the project contributors and is
+licensed under the Apache License, Version 2.0. See the LICENSE file.
+
+--------------------------------------------------------------------------
+THIS IS RESEARCH SOFTWARE, NOT FINANCIAL ADVICE.
+
+This project analyses market data and generates research notes. It is not a
+recommendation to buy or sell any security, it does not constitute financial,
+investment, legal or tax advice, and its authors are not registered
+investment advisers.
+
+Options trading involves substantial risk of loss and is not suitable for
+every investor. Nothing in this repository has been reviewed by any
+regulator. Historical or backtested results do not predict future returns,
+and this software may contain defects that produce wrong numbers.
+
+If you connect it to a broker, YOU are placing the trades and YOU bear the
+losses. The software ships with its execution kill-switch OFF
+(TRADING_ENABLED=false) and every order requires explicit human approval.
+Turning those safeguards off is a decision you make alone.
+
+See the "Safety model" section of README.md before connecting anything real.
+--------------------------------------------------------------------------
+
+Third-party data sources reached by this software (SEC EDGAR, BLS, BEA, the
+U.S. Treasury, Polymarket, and any market-data, broker, LLM or search vendor
+an operator configures) are governed by their own terms of service and rate
+limits. You are responsible for complying with them, including identifying
+yourself honestly in the User-Agent this software sends.

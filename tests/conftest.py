@@ -30,6 +30,13 @@ provider configuration into the next test.
 """
 import os
 
+# Freeze the stub provider's synthetic universe (see Settings.stub_anchor_date):
+# without this, every date-sensitive verdict (GW = BULL/LOW etc.) rolls daily
+# and the deterministic-ticker tests rot overnight. 2025-11-03 is a date where the
+# suite's characterised tickers (GW strong-bull, GOOGL bull) hold their
+# documented verdicts under the per-date bar generator. Set BEFORE any Settings object exists.
+os.environ.setdefault("STUB_ANCHOR_DATE", "2025-11-03")
+
 # Must be set before any app import so the engine binds to the test database.
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite://"
 
@@ -44,7 +51,29 @@ from libs.common.config import get_settings
 
 # Environment variables this module owns. Saved and restored around every test
 # so provider configuration never leaks between them.
-_PROVIDER_ENV_VARS = ("MARKET_DATA_PROVIDER", "LLM_PROVIDER", "BROKER_PROVIDER")
+_PROVIDER_ENV_VARS = (
+    "MARKET_DATA_PROVIDER",
+    "LLM_PROVIDER",
+    "BROKER_PROVIDER",
+    # Runtime-config keys that PUT /api/config/providers writes into
+    # os.environ via apply_overrides — restored per test so a permission
+    # toggled in one test can never leak into the next.
+    "ALLOW_LONG_STOCK",
+    "ALLOW_LONG_CALL",
+    "ALLOW_LONG_PUT",
+    "ALLOW_DEFINED_RISK_SPREADS",
+    "ALLOW_COVERED_CALL",
+    "ALLOW_CASH_SECURED_PUT",
+    "ALLOW_SHORT_STOCK",
+    "ALLOW_MARGIN",
+    "LLM_OUTPUT_LANGUAGE",
+    # External research providers (Catalyst research upgrade): restored per
+    # test so a research provider configured in one test never leaks into the
+    # next — the same discipline as the three core providers above.
+    "WEB_SEARCH_PROVIDER",
+    "BRAVE_API_KEY",
+    "PREDICTION_MARKETS_PROVIDER",
+)
 
 
 def _apply_provider_env(values: dict[str, str | None]) -> dict[str, str | None]:
@@ -112,6 +141,48 @@ async def unconfigured_client():
     fixture into a configured one.
     """
     async with _client_with_providers(
-        {"MARKET_DATA_PROVIDER": "", "LLM_PROVIDER": "", "BROKER_PROVIDER": ""}
+        {
+            "MARKET_DATA_PROVIDER": "",
+            "LLM_PROVIDER": "",
+            "BROKER_PROVIDER": "",
+            # The research providers belong here for the same reason as the
+            # three above: this fixture IS "a fresh install", and a developer
+            # .env that enables Polymarket or Brave must not leak into it and
+            # quietly turn an unconfigured-path test into a configured one.
+            "WEB_SEARCH_PROVIDER": "",
+            "PREDICTION_MARKETS_PROVIDER": "",
+        }
     ) as c:
         yield c
+
+
+@pytest.fixture(autouse=True)
+def _stub_anchor_bar_age(monkeypatch):
+    """The stub universe is frozen at STUB_ANCHOR_DATE, so stored bars are
+    honestly "old" against the real clock. The data-quality age gate would
+    veto everything; tests that exercise staleness override this themselves."""
+    # Patch where the constant is DEFINED, not where it is re-exported.
+    # ``routers.orders`` re-exports this name from the gate chain, and a
+    # monkeypatch on the re-export rebinds only the router's own reference —
+    # the code reading it lives in execution.gate_chain and would keep the
+    # original value. That failure is silent: the gate simply vetoes
+    # everything for stale bars.
+    from apps.gateway.execution import gate_chain
+    from apps.gateway.routers import plans as plans_router
+
+    monkeypatch.setattr(gate_chain, "MAX_BAR_AGE_DAYS", 100_000)
+    # Same reason for the §42 plan-staleness tolerance: frozen stub bars are
+    # honestly old; staleness-specific tests lower this themselves.
+    monkeypatch.setattr(
+        plans_router, "PLAN_STALENESS_TOLERANCE_TRADING_DAYS", 100_000
+    )
+    # Cache isolation: no test may observe another test's chain build or
+    # OI day-map.
+    from apps.gateway.routers import options as options_router
+    from libs.market_data import alpaca as alpaca_module
+
+    options_router._chain_cache.clear()
+    alpaca_module._OI_DAY_CACHE.clear()
+    yield
+    options_router._chain_cache.clear()
+    alpaca_module._OI_DAY_CACHE.clear()

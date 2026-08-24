@@ -38,7 +38,9 @@ ROW_KEYS = {
     "ask",
     "mid",
     "spread_pct",
+    "price_basis",
     "last",
+    "iv_unreliable",
     "volume",
     "open_interest",
     "iv",
@@ -65,11 +67,10 @@ async def get_options(client, ticker="NVDA", **params):
     return r.json()
 
 
-async def test_options_404_for_non_watchlist_ticker(client):
-    """Historical data may exist ONLY for Watchlist symbols (plan §4.2)."""
+async def test_options_open_for_non_watchlist_ticker(client):
+    """2026-08-20 (§4.2 amended): the chain serves any ticker."""
     r = await client.get("/api/watchlist/NVDA/options")
-    assert r.status_code == 404
-    assert "not on the watchlist" in r.json()["detail"]
+    assert r.status_code == 200
 
 
 async def test_options_rejects_unknown_direction(client):

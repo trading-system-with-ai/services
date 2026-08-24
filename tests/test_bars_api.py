@@ -4,11 +4,11 @@ from datetime import date
 BAR_KEYS = {"date", "open", "high", "low", "close", "volume"}
 
 
-async def test_bars_404_for_non_watchlist_ticker(client):
-    """Same gate as the analysis endpoint (plan §4.2)."""
+async def test_bars_open_for_non_watchlist_ticker(client):
+    """2026-08-20 (§4.2 amended): bars serve any ticker (lazy backfill)."""
     r = await client.get("/api/watchlist/NVDA/bars")
-    assert r.status_code == 404
-    assert "not on the watchlist" in r.json()["detail"]
+    assert r.status_code == 200
+    assert len(r.json()["bars"]) > 0
 
 
 async def test_bars_contract_oldest_first_and_ohlc_sanity(client):

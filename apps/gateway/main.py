@@ -28,8 +28,21 @@ from libs.common.config import get_settings
 from libs.common.logging import setup_logging
 from libs.common.telemetry import REGISTRY, request_id_var
 
-from . import monitor
-from .db import StockBarDaily, WatchlistItem, get_session, init_db
+from . import (
+    event_calendar,
+    market_stream,
+    monitor,
+    order_sync,
+    risk_snapshot,
+    runtime_config,
+)
+from .db import (
+    SessionLocal,
+    StockBarDaily,
+    WatchlistItem,
+    get_session,
+    init_db,
+)
 from .routers import (
     alerts,
     analysis,
@@ -37,16 +50,20 @@ from .routers import (
     backtests,
     broker,
     config,
+    events,
     health,
     market,
     options,
     orders,
+    plans,
     portfolio,
     positions,
     recommendations,
+    risk,
     trading_control,
     trading_pool,
     watchlist,
+    income,
 )
 
 # ---------------------------------------------------------------------------
@@ -54,6 +71,20 @@ from .routers import (
 # endpoint below only ever record into / render this registry.
 # ---------------------------------------------------------------------------
 _PROCESS_START_MONOTONIC = time.monotonic()
+
+#: The WIRE CONTRACT's version, sent as ``X-API-Version`` on every response.
+#:
+#: Not the application's version — the shape of the JSON. Bump the minor when
+#: a field is ADDED (old clients keep working) and the major when one is
+#: removed, renamed or changes meaning (old clients break, and should be told
+#: so rather than left rendering an empty panel).
+#:
+#: This exists because the frontend ships from its own repository and updates
+#: independently. A field that silently disappears reads as ``undefined`` in
+#: TypeScript — the type checker cannot catch it, so the symptom of a version
+#: mismatch is a blank panel rather than an error. A client that compares this
+#: header against what it was built for can say what actually went wrong.
+API_VERSION = "1.0"
 
 HTTP_REQUESTS_TOTAL = REGISTRY.counter(
     "http_requests_total",
@@ -94,27 +125,121 @@ _http_logger = logging.getLogger("http")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_logging()
-    await init_db()
+    # SCHEMA IS VERIFIED, NOT CREATED (see db.init_db). A mismatch raises
+    # SchemaDriftError and the process refuses to start: a wrong schema found
+    # at startup costs a restart, the same schema found at request time can
+    # corrupt a trading decision.
+    #
+    # DB_AUTO_CREATE=true restores the old create-if-absent behaviour for a
+    # genuinely empty development database. It is deliberately opt-in and
+    # deliberately not the default — that default is what let a table exist
+    # here and nowhere else.
+    await init_db(create=get_settings().db_auto_create)
+    # UI-managed provider settings (runtime_config table) override .env —
+    # loaded before anything reads Settings, so the first request already
+    # sees what the user configured in the UI last session.
+    async with SessionLocal() as _rc_session:
+        await runtime_config.apply_overrides(_rc_session)
     # Automated position monitor (plan §26): a background task, started only
     # when the configured interval is > 0 (0 disables it). NOTE: test suites
     # drive the app through httpx ASGITransport, which does NOT run lifespan —
     # the monitor task never starts under tests, GET /api/positions/monitor
     # honestly reports enabled=false there, and the sweep core is tested
     # directly (tests/test_position_monitor_auto.py).
-    monitor_task: asyncio.Task | None = None
-    if get_settings().position_monitor_interval_seconds > 0:
-        monitor_task = asyncio.create_task(monitor.monitor_loop())
+    background_tasks: list[asyncio.Task] = []
+    settings = get_settings()
+    if settings.position_monitor_interval_seconds > 0:
+        background_tasks.append(asyncio.create_task(monitor.monitor_loop()))
+    # Order-sync sweep (guide §11 Iteration C): settles non-terminal broker
+    # orders against the broker's own state. Cheap no-op ticks when no real
+    # broker is configured.
+    if settings.order_sync_interval_seconds > 0:
+        background_tasks.append(asyncio.create_task(order_sync.order_sync_loop()))
+    # Periodic reconciliation (guide §13 Iteration D): compares whole ledgers
+    # on a cadence; a material mismatch pauses trading via the §18 kill
+    # switch — the same code path as GET /api/broker/reconcile.
+    if settings.reconciliation_interval_seconds > 0:
+        background_tasks.append(asyncio.create_task(reconciliation_loop()))
+    # Statistical risk snapshot writer (Risk Engine Upgrade Phase B, contract
+    # §6): persists ONE SCHEDULED snapshot per America/New_York day — the NAV
+    # series live drawdown is measured on. SHADOW; 0 disables it. Same
+    # lifespan caveat as the monitor: tests drive
+    # risk_snapshot.run_scheduled_snapshot() directly.
+    if settings.risk_snapshot_interval_seconds > 0:
+        background_tasks.append(asyncio.create_task(risk_snapshot.risk_snapshot_loop()))
+    # Event calendar ingestion (Catalyst & Event Intelligence Phase B, event
+    # spec §8): fetches the typed event registry from SEC EDGAR, the Federal
+    # Reserve and the exchange calendars, and fires the §11 T-minus alert
+    # exactly once per (event, horizon). 0 disables the background task; POST
+    # /api/events/refresh always works. Same lifespan caveat as the monitor:
+    # tests drive event_calendar.run_calendar_ingest() directly.
+    if settings.event_calendar_interval_seconds > 0:
+        background_tasks.append(
+            asyncio.create_task(event_calendar.event_calendar_loop())
+        )
+    # Alpaca market data stream (data_source.md §5): replaces per-poll REST
+    # snapshot calls with ONE websocket. The supervisor self-disables when
+    # the configured provider is not "alpaca" (checked every cycle, so
+    # runtime provider switches take effect without a restart).
+    background_tasks.append(asyncio.create_task(market_stream.market_stream_loop()))
     try:
         yield
     finally:
-        # Graceful shutdown (§26): cancel and AWAIT the task so an in-flight
+        # Graceful shutdown (§26): cancel and AWAIT each task so an in-flight
         # sweep's cancellation fully unwinds before the process exits.
-        if monitor_task is not None:
-            monitor_task.cancel()
+        for task in background_tasks:
+            task.cancel()
+        for task in background_tasks:
             try:
-                await monitor_task
+                await task
             except asyncio.CancelledError:
                 pass
+
+
+async def reconciliation_loop() -> None:
+    """Sleep -> reconcile forever (guide §13 Iteration D).
+
+    Skips the comparison when there is no real broker (unset or simulated) —
+    an absent ledger is not a disagreement between ledgers. On a material
+    mismatch :func:`routers.broker.run_reconciliation` itself pauses trading
+    and writes the KILL_SWITCH_TRIGGERED audit; this loop only logs the
+    outcome. Transient faults are logged and retried next tick — the loop
+    must outlive any single failure.
+    """
+    from .deps import broker_configured, simulated_broker_mode
+    from .routers.broker import run_reconciliation
+
+    interval = get_settings().reconciliation_interval_seconds
+    logger = logging.getLogger("apps.gateway.reconciliation")
+    logger.info(
+        "reconciliation_loop_started",
+        extra={"extra_fields": {"interval_seconds": interval}},
+    )
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            if not broker_configured() or simulated_broker_mode():
+                continue
+            try:
+                async with SessionLocal() as session:
+                    result = await run_reconciliation(session)
+                if result.get("mismatches"):
+                    logger.error(
+                        "periodic_reconciliation_mismatch",
+                        extra={
+                            "extra_fields": {
+                                "mismatches": result["mismatches"],
+                                "paused": result.get("paused", False),
+                            }
+                        },
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("periodic_reconciliation_failed")
+    except asyncio.CancelledError:
+        logger.info("reconciliation_loop_stopped")
+        raise
 
 
 async def _refresh_freshness_gauges(session: AsyncSession) -> None:
@@ -147,7 +272,13 @@ def create_app() -> FastAPI:
     app = FastAPI(title=settings.app_name, lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:3000"],
+        # LOCALHOST ONLY. The gateway ships with no authentication layer, so
+        # the browser origins it trusts are the local dev servers and nothing
+        # else. 3001 is included because 3000 is a popular default that is
+        # often already taken. Widening this — especially to "*" — would let
+        # any page on the internet drive an authenticated-by-nothing API that
+        # can place orders; put real auth in front of it first.
+        allow_origins=["http://localhost:3000", "http://localhost:3001"],
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -174,6 +305,14 @@ def create_app() -> FastAPI:
             response = await call_next(request)
             status = response.status_code
             response.headers["X-Request-ID"] = request_id
+            # THE WIRE CONTRACT'S VERSION. The frontend ships in its own
+            # repository and updates independently, so the two halves can
+            # legitimately be at different versions — and without a marker the
+            # symptom of a mismatch is an empty panel rather than an error,
+            # because TypeScript cannot catch a field that is simply absent
+            # from the JSON. A client that reads this can say "the API moved"
+            # instead of rendering a blank.
+            response.headers["X-API-Version"] = API_VERSION
             return response
         finally:
             duration_ms = (time.perf_counter() - start) * 1000.0
@@ -219,15 +358,21 @@ def create_app() -> FastAPI:
     app.include_router(analysis.router)
     app.include_router(options.router)
     app.include_router(backtests.router)
+    app.include_router(income.router)
     app.include_router(trading_pool.router)
     app.include_router(market.router)
     app.include_router(trading_control.router)
     app.include_router(portfolio.router)
+    # Phase D (design §8.5): POST /api/risk/stress/run — a user-defined
+    # hypothetical over the current book. SHADOW, read-only, no audit event.
+    app.include_router(risk.router)
     app.include_router(orders.router)
+    app.include_router(plans.router)
     app.include_router(positions.router)
     app.include_router(recommendations.router)
     app.include_router(audit_log.router)
     app.include_router(alerts.router)
+    app.include_router(events.router)
     app.include_router(broker.router)
     app.include_router(config.router)
     return app
